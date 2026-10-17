@@ -1029,6 +1029,24 @@ int coli_v4_hybrid_enabled(void);
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store);
+/* Second-GPU mirror cache (DSV4_CUDA_DEVICE2): experts attached there carry
+ * view->gpu_second and are computed by this group — never by the primary
+ * card's fused MoE or expert group, whose kernels require one device. */
+int coli_v4_gpu_second_present(ColiExpertStore *store);
+/* Mirror-first lookup: when {layer, expert} is already mirrored on a card,
+ * fill a view that carries only the device handles (host data NULL, no
+ * lease) so the decode step computes it from VRAM without reading the
+ * expert record into host memory at all. 0 on a hit, -1 otherwise. */
+int coli_v4_gpu_expert_resident(ColiExpertStore *store, ColiExpertKey key,
+                                ColiExpertView *view);
+extern unsigned long long g_v4_resident_n;
+/* 1 when {layer, expert} is already in the RAM expert cache (no read needed). */
+int coli_v4_expert_store_cached(ColiExpertStore *store, ColiExpertKey key);
+int coli_v4_gpu_second_expert_group(ColiExpertStore *store, void *const *gate,
+                                    void *const *up, void *const *down,
+                                    const float *weights, int count,
+                                    float limit, float *y, const float *x);
+extern unsigned long long g_v4_dev2_n;
 extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
 extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
@@ -1080,6 +1098,11 @@ struct ColiV4Engine {
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
+        /* Second card hosting more decode expert mirrors (DSV4_CUDA_DEVICE2).
+         * second_mode: 0 none, 1 same backend module (joint init), 2 the
+         * other DLL flavour (dsv4_cuda2_* API). */
+        int second_device;
+        int second_mode;
     } gpu;
     struct {
         uint16_t *markov_w1;

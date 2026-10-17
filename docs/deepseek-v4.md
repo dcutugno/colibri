@@ -299,7 +299,45 @@ Where the time goes now: prefill ≈ 35 % expert-bank refill (disk-bound,
 host↔device syncs), ≈ 5 % MoE GEMM, rest indexer/dense/mHC. Decode ≈ 75 %
 routed-expert reads (~230 × 12.6 MB per token from disk at 6 % VRAM hit
 rate), rest GPU stages. More RAM/VRAM (higher expert hit rate) is the only
-lever left below the disk limit; a multi-GPU design exists on paper only.
+lever left below the disk limit — which is what a second card is for (next
+section): it adds VRAM for decode mirrors, not FLOPs.
+
+### Second GPU: more decode mirrors (`DSV4_CUDA_DEVICE2`)
+
+With two NVIDIA cards the engine can host a second expert-mirror cache on
+the other one (`DSV4_CUDA_DEVICE2=auto` = the first other device the runtime
+lists, or an ordinal; unset = one card — opt-in, see the measurement at the
+end of this section). The primary
+card keeps everything else — dense mirrors, attention, the prefill bank, the
+hot set of mirrors that churns — and the second card is the overflow that
+fills once: a miss grows the primary while its VRAM reserve allows, then the
+second card, then recycles the primary's LRU slot. At decode the routed
+experts split by residence: the primary's subset runs its fused MoE/expert
+group, the second card's subset its own expert group, the rest the CPU, and
+the partial sums add (the same order-of-addition class as the hybrid split).
+Mixed generations work: the two DLL flavours load side by side on Windows —
+an RTX 50 runs `coli_cuda_dsv4_dg.dll`, an RTX 30/40 beside it gets
+`coli_cuda_dsv4.dll` as the *secondary backend*, chosen by
+`dsv4_cuda_backend_arch_ok` per device (`COLI_DSV4_DLL2` forces the file).
+On Linux one flavour is linked, so both cards must run it (generic build:
+any sm_80+). Banner: `v4_gpu second-device=1 backend=generic mirrors<=4096
+reserve=600MB`; at exit `v4_gpu second-device=1 mirrors=N hits=H (primary
+mirrors=M hits=… misses=…)`. `DSV4_CUDA_EXPERT_MIRRORS2` /
+`DSV4_CUDA_VRAM_RESERVE2_MB` (600) bound it; there is no prefill bank to
+reserve for there.
+
+Measured (RTX 5080 16 GB + RTX 3080 10 GB, 3278-token prompt, 48 greedy
+tokens, two interleaved runs per config, v1.10.1 + this cache): the second
+card held 706 mirrors and 54 % of attaches hit a mirror (2588 on the 3080,
+2305 on the 5080, 4137 misses), yet decode went **0.79 → 0.90 s/token** and
+prefill was unchanged. Two reasons, both structural: a mirror hit today only
+saves the host→device upload — the expert record is still read from the RAM
+cache or disk before attach, so VRAM mirrors do not reduce disk traffic —
+and the second card's expert group is one more synchronous launch + download
+per layer per token (43 × ~2 ms). The cache is therefore off by default and
+kept for the step that would make it pay: serving mirrored experts *without*
+the host read (a mirror-first lookup ahead of the expert store, for both
+cards), which turns VRAM into a real cache tier instead of an upload saver.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
@@ -340,7 +378,8 @@ is no software path to fall back to.
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
 | generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+| second GPU | any sm_80+ beside the primary, mixed generations allowed (Windows: two DLL flavours) | — | a second expert-mirror cache (`DSV4_CUDA_DEVICE2=auto`, opt-in: measured slower until mirrored experts skip the host read) |
+| 3+ GPUs / expert-parallel prefill | — | single primary today; the second card only hosts decode mirrors | — |
 
 The runtime check `dsv4_cuda_backend_arch_ok` admits sm_60 and up for the
 generic build. It is deliberately independent of what the binary contains: a
@@ -407,7 +446,14 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | var | meaning |
 |---|---|
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
-| `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
+| `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal of the primary card |
+| `DSV4_CUDA_DEVICE2` (unset = off) | second card for decode expert mirrors: `auto` = first other device, or an ordinal; opt-in, see "Second GPU" |
+| `DSV4_CUDA_EXPERT_MIRRORS2` (4096) / `DSV4_CUDA_VRAM_RESERVE2_MB` (600) | the second card's mirror cap and VRAM kept free there |
+| `COLI_DSV4_DLL2` | Windows: force the secondary backend DLL file name (default: the other flavour) |
+| `V4_MIRROR_FIRST` (1) | experts already mirrored in VRAM are computed from there without reading the record into host memory (53 % of a 3k-context token's experts measured); `0` = read first, attach after |
+| `V4_SLAB_SHIFT` (1) | a direct expert read stays where its 4 K-aligned window landed in the slab and the views carry the offset, instead of a 12.6 MB memmove per expert (decode 0.62 -> 0.58 s/token); `0` = memmove |
+| `V4_READ_STRIPE` (off) | `1` = read each expert window as two halves from the two mirror replicas at once (Windows overlapped twins); opt-in, unmeasured — the reference box lost its mirror drive |
+| `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
@@ -552,5 +598,6 @@ disabled.
 
 - Non-greedy sampling and more serving slots.
 - Linux CUDA tier: measure on a native Linux box (WSL2 verified), POSIX host pinning.
-- Multi-GPU expert-parallel tier (design draft, untracked until built).
+- Expert-parallel prefill across GPUs (the second card hosts decode mirrors
+  only today); three or more cards.
 - Shared replacements for the two temporary private quant paths (rows16 cache).

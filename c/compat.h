@@ -288,11 +288,15 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
  * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
  * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
  * e len); richieste non allineate falliscono con -1, mai dati corrotti.
- * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+ * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED).
+ * FILE_FLAG_OVERLAPPED as well: a synchronous handle serves one read at a time
+ * however many threads call it, so the engine's parallel expert reads (the
+ * loader lanes, the bank refill) queued up behind each other — measured on
+ * DeepSeek V4 decode: 1 lane 480 ms/token of waits, 9 lanes 415 ms. */
 static inline int compat_open_direct(const char *path){
     HANDLE h = CreateFileA(path, GENERIC_READ,
                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING|FILE_FLAG_OVERLAPPED, NULL);
     if(h == INVALID_HANDLE_VALUE) return -1;
     int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
     if(fd < 0){ CloseHandle(h); return -1; }

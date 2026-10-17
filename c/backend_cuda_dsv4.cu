@@ -735,6 +735,12 @@ extern "C" long long dsv4_cuda_mem_free_mb(int device){
  * any integrated part): cudaMemGetInfo then reports the system's free memory,
  * not headroom on a card, so a VRAM reserve compared against it says nothing
  * about whether one more mirror fits (#1538). */
+/* Number of CUDA devices the runtime sees (-1 on error): the engine looks
+ * for a second card to host more decode expert mirrors. */
+extern "C" int dsv4_cuda_device_count(void){
+    int n=0;if(cudaGetDeviceCount(&n)!=cudaSuccess){cudaGetLastError();return -1;}return n;
+}
+
 extern "C" int dsv4_cuda_device_unified(int device){
     int integrated=0,host_tables=0;
     if(cudaDeviceGetAttribute(&integrated,cudaDevAttrIntegrated,device)!=cudaSuccess){cudaGetLastError();integrated=0;}

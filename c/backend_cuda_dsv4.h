@@ -68,6 +68,7 @@ long long dsv4_cuda_mem_free_mb(int device);
  * host page tables), where mem_free_mb is the system's free memory rather
  * than headroom on a card. 0 when unknown. */
 int dsv4_cuda_device_unified(int device);
+int dsv4_cuda_device_count(void);
 /* Drain the device's expert stream (hybrid split: async fill DMA is enqueued,
  * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
  * success, 0 when the backend is unavailable. */

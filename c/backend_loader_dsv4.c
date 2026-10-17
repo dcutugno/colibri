@@ -173,6 +173,7 @@ typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
+typedef int             (*fn_device_count)(void);
 typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
@@ -343,6 +344,25 @@ static struct {
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
 } g_dsv4;
+
+/* ---- secondary backend: a second GPU for the decode mirror cache --------
+ * Two cards of different generations may need different DLL flavours: the
+ * DeepGEMM build carries sm_120a kernels only, so an RTX 50 + RTX 30 pair runs
+ * coli_cuda_dsv4_dg.dll on the first card and coli_cuda_dsv4.dll on the
+ * second. dsv4_cuda_secondary_open(device) answers 1 when the primary
+ * module's kernels already run on `device` (the engine then initialises both
+ * devices in one dsv4_cuda_init call and keeps using the primary API), 2 when
+ * the OTHER flavour was loaded for it (its tensor handles belong to that
+ * module and must only ever go through the dsv4_cuda2_* entry points below),
+ * 0 when no backend fits. COLI_DSV4_DLL2=<file name> forces the file. */
+static struct {
+    HMODULE dll; int available; char loaded_name[64];
+    fn_init init; fn_shutdown shutdown; fn_upload_fp4 upload_fp4;
+    fn_tensor_refill_fp4 tensor_refill_fp4; fn_tensor_free tensor_free;
+    fn_expert_group expert_group; fn_stream_drain stream_drain;
+    fn_mem_free_mb mem_free_mb; fn_backend_arch_ok backend_arch_ok;
+    fn_backend_name backend_name; fn_device_unified device_unified;
+} g_dsv4b;
 
 /* One-shot loader: mirror of coli_cuda_load(). The DLL is loaded from the
  * engine's OWN directory by absolute path — never a bare name — so the
@@ -1066,6 +1086,99 @@ long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor *t){
 int dsv4_cuda_tensor_device(const Dsv4CudaTensor *t){
     if(!g_dsv4.available) return -1;
     return g_dsv4.tensor_device(t);
+}
+
+int dsv4_cuda_device_count(void){
+    if(!dsv4_cuda_load()) return -1;
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+    fn_device_count f = (fn_device_count)GetProcAddress(g_dsv4.dll, "dsv4_cuda_device_count");
+    _Pragma("GCC diagnostic pop")
+    return f ? f() : -1;
+}
+
+int dsv4_cuda_secondary_open(int device){
+    if(!dsv4_cuda_load()) return 0;
+    if(g_dsv4.backend_arch_ok ? g_dsv4.backend_arch_ok(device) : 1) return 1;
+    if(g_dsv4b.available)
+        return (g_dsv4b.backend_arch_ok ? g_dsv4b.backend_arch_ok(device) : 1) ? 2 : 0;
+    const char *forced = getenv("COLI_DSV4_DLL2");
+    const char *name = forced && *forced ? forced
+        : strcmp(g_dsv4.loaded_name, DSV4_BACKEND_DLL_DG) == 0 ? DSV4_BACKEND_DLL : DSV4_BACKEND_DLL_DG;
+    if(strcmp(name, g_dsv4.loaded_name) == 0) return 0;   /* same module: already known not to fit */
+    int present = 0;
+    HMODULE dll = dsv4_load_one(name, &present);
+    if(!dll){
+        fprintf(stderr, DSV4_VENDOR_TAG " device %d: %s %s; no secondary backend\n", device, name,
+                present ? "did not load" : "is not in the engine's folder");
+        return 0;
+    }
+    #define RESOLVE2(field, type, sym, mandatory) \
+        _Pragma("GCC diagnostic push") \
+        _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"") \
+        g_dsv4b.field = (type)GetProcAddress(dll, sym); \
+        _Pragma("GCC diagnostic pop") \
+        if(mandatory && !g_dsv4b.field){ \
+            fprintf(stderr, DSV4_VENDOR_TAG " %s missing symbol %s; no secondary backend\n", name, sym); \
+            FreeLibrary(dll); memset(&g_dsv4b, 0, sizeof(g_dsv4b)); return 0; }
+    RESOLVE2(init, fn_init, "dsv4_cuda_init", 1);
+    RESOLVE2(shutdown, fn_shutdown, "dsv4_cuda_shutdown", 1);
+    RESOLVE2(upload_fp4, fn_upload_fp4, "dsv4_cuda_upload_fp4", 1);
+    RESOLVE2(tensor_refill_fp4, fn_tensor_refill_fp4, "dsv4_cuda_tensor_refill_fp4", 1);
+    RESOLVE2(tensor_free, fn_tensor_free, "dsv4_cuda_tensor_free", 1);
+    RESOLVE2(expert_group, fn_expert_group, "dsv4_cuda_expert_group", 1);
+    RESOLVE2(mem_free_mb, fn_mem_free_mb, "dsv4_cuda_mem_free_mb", 1);
+    RESOLVE2(backend_arch_ok, fn_backend_arch_ok, "dsv4_cuda_backend_arch_ok", 0);
+    RESOLVE2(stream_drain, fn_stream_drain, "dsv4_cuda_stream_drain", 0);
+    RESOLVE2(backend_name, fn_backend_name, "dsv4_cuda_backend_name", 0);
+    RESOLVE2(device_unified, fn_device_unified, "dsv4_cuda_device_unified", 0);
+    #undef RESOLVE2
+    if(g_dsv4b.backend_arch_ok && !g_dsv4b.backend_arch_ok(device)){
+        fprintf(stderr, DSV4_VENDOR_TAG " %s does not fit device %d either; no secondary backend\n", name, device);
+        FreeLibrary(dll); memset(&g_dsv4b, 0, sizeof(g_dsv4b)); return 0;
+    }
+    g_dsv4b.dll = dll;
+    snprintf(g_dsv4b.loaded_name, sizeof(g_dsv4b.loaded_name), "%s", name);
+    g_dsv4b.available = 1;
+    fprintf(stderr, DSV4_VENDOR_TAG " secondary backend=%s (%s) for device %d\n", name,
+            g_dsv4b.backend_name ? g_dsv4b.backend_name() : "unknown", device);
+    return 2;
+}
+
+int dsv4_cuda2_init(const int *devices, int count){
+    return g_dsv4b.available ? g_dsv4b.init(devices, count) : 0;
+}
+void dsv4_cuda2_shutdown(void){
+    if(g_dsv4b.available) g_dsv4b.shutdown();
+    if(g_dsv4b.dll) FreeLibrary(g_dsv4b.dll);
+    memset(&g_dsv4b, 0, sizeof(g_dsv4b));
+}
+int dsv4_cuda2_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w, const uint8_t *scale, int O, int I, int device){
+    return g_dsv4b.available ? g_dsv4b.upload_fp4(t, w, scale, O, I, device) : 0;
+}
+int dsv4_cuda2_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
+    return g_dsv4b.available ? g_dsv4b.tensor_refill_fp4(t, w, scale, O, I, sync) : 0;
+}
+void dsv4_cuda2_tensor_free(Dsv4CudaTensor *t){
+    if(g_dsv4b.available) g_dsv4b.tensor_free(t);
+}
+int dsv4_cuda2_expert_group(Dsv4CudaTensor *const *gate, Dsv4CudaTensor *const *up,
+                            Dsv4CudaTensor *const *down, const float *weights, int count, float limit,
+                            float *y, const float *x){
+    return g_dsv4b.available ? g_dsv4b.expert_group(gate, up, down, weights, count, limit, y, x) : 0;
+}
+int dsv4_cuda2_stream_drain(int device){
+    return g_dsv4b.available && g_dsv4b.stream_drain ? g_dsv4b.stream_drain(device) : 0;
+}
+long long dsv4_cuda2_mem_free_mb(int device){
+    return g_dsv4b.available ? g_dsv4b.mem_free_mb(device) : -1;
+}
+int dsv4_cuda2_device_unified(int device){
+    return g_dsv4b.available && g_dsv4b.device_unified ? g_dsv4b.device_unified(device) : 0;
+}
+const char *dsv4_cuda2_backend_name(void){
+    if(!g_dsv4b.available) return "none";
+    return g_dsv4b.backend_name ? g_dsv4b.backend_name() : "unknown";
 }
 
 #endif /* _WIN32 */

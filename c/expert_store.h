@@ -24,6 +24,10 @@ typedef struct {
     ColiTensorView down;
     ColiTensorView up;
     void *lease;
+    /* CUDA tier: 1 when the gate/up/down handles live on the SECOND card's
+     * mirror cache (its device, possibly another backend module), so the
+     * decode step computes them in that card's expert group. */
+    int gpu_second;
 } ColiExpertView;
 
 typedef struct {

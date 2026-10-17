@@ -80,3 +80,4 @@ EXPORTS
     dsv4_cuda_tensor_free
     dsv4_cuda_tensor_bytes
     dsv4_cuda_tensor_device
+    dsv4_cuda_device_count
