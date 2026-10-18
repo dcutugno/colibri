@@ -1042,6 +1042,13 @@ int coli_v4_gpu_expert_resident(ColiExpertStore *store, ColiExpertKey key,
 extern unsigned long long g_v4_resident_n;
 /* 1 when {layer, expert} is already in the RAM expert cache (no read needed). */
 int coli_v4_expert_store_cached(ColiExpertStore *store, ColiExpertKey key);
+/* Decode uploader threads (one per card): queue a missed expert's upload,
+ * join before computing; the view stays in place until the join. */
+int coli_v4_upload_threads_enabled(void);
+int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view);
+void coli_v4_gpu_expert_upload_join(void);
+void coli_v4_gpu_expert_upload_stats(unsigned long long *jobs0,
+                                     unsigned long long *jobs1);
 int coli_v4_gpu_second_expert_group(ColiExpertStore *store, void *const *gate,
                                     void *const *up, void *const *down,
                                     const float *weights, int count,

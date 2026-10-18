@@ -5280,6 +5280,7 @@ unsigned long long g_v4_resident_n;   /* experts served from VRAM, no host read 
 
 /* DSV4_DECODE_PROF: inside the MoE step, per token across layers. */
 static double g_v4_dp_shared, g_v4_dp_loads, g_v4_dp_attach, g_v4_dp_compute;
+static double g_v4_dp_second;   /* second card's expert group, on its thread */
 /* Token-to-token routing overlap per layer: how many of this token's experts
  * the previous token also used at the same layer (one KV slot, so one table). */
 static int g_v4_last_ids[COLI_V4_RESIDENT_MAX_LAYERS][16];
@@ -5362,6 +5363,30 @@ static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n,
     }
     pthread_cond_broadcast(&g_v4_pf.ready);
     pthread_mutex_unlock(&g_v4_pf.mutex);
+}
+
+/* The second card's expert group on a helper thread, so that it runs while
+ * the primary's group (a synchronous launch) does: each backend has its own
+ * device, stream and buffers, and the two partial sums are added afterwards. */
+typedef struct {
+    ColiExpertStore *store;
+    void *const *gate, *const *up, *const *down;
+    const float *weights;
+    int count;
+    float limit;
+    float *y;
+    const float *x;
+    int ok;
+} V4SecondGroupJob;
+
+static void *v4_second_group_thread(void *arg) {
+    V4SecondGroupJob *job = arg;
+    double t0 = v4_wait_clock();
+    job->ok = coli_v4_gpu_second_expert_group(
+        job->store, job->gate, job->up, job->down, job->weights, job->count,
+        job->limit, job->y, job->x);
+    g_v4_dp_second += v4_wait_clock() - t0;
+    return NULL;
 }
 
 /* V4_MIRROR_FIRST=0 restores the old order (host read, then attach). */
@@ -5732,6 +5757,7 @@ static int moe_token_pipeline(float *output,
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
+    int uploads_queued = 0;         /* uploader-thread jobs to join */
 #endif
     if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
                                   weights->plan.layer, selected);
@@ -5767,7 +5793,13 @@ static int moe_token_pipeline(float *output,
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
-                else {
+                else if (coli_v4_upload_threads_enabled() &&
+                         coli_v4_gpu_expert_attach_queued(store, &views[current]) == 0) {
+                    /* Handed to the card's uploader thread (V4_UPLOAD_THREADS):
+                     * the copy runs while the remaining lane reads of this
+                     * layer complete; joined before the partition below. */
+                    uploads_queued = 1;
+                } else {
                     /* Enqueue the upload and keep reading: the remaining
                      * lane reads of this layer overlap the H2D copies
                      * (measured: ~6 ms of serialized uploads per layer per
@@ -5781,18 +5813,13 @@ static int moe_token_pipeline(float *output,
                     if (async_ok &&
                         coli_v4_gpu_expert_attach_async(store, &views[current]) == 0 &&
                         views[current].gate.gpu && views[current].up.gpu &&
-                        views[current].down.gpu && !views[current].gpu_second)
+                        views[current].down.gpu)
                         hybrid_pending_drain = 1;
                     else if (!views[current].gate.gpu)
                         coli_v4_gpu_expert_attach(store, &views[current]);
                 }
             }
             g_v4_dp_attach += v4_wait_clock() - dpt_at;
-#endif
-#ifdef COLI_V4_GPU_TIER
-            if (!views[current].gate.gpu || !views[current].up.gpu ||
-                !views[current].down.gpu || views[current].gpu_second)
-                gpu_compute = 0;
 #endif
 
             int next = current + dual_loader_lanes();
@@ -5829,6 +5856,19 @@ static int moe_token_pipeline(float *output,
     double dpt_c = v4_wait_clock();
     g_v4_dp_loads += dpt_c - dpt_b;
 #ifdef COLI_V4_GPU_TIER
+    if (uploads_queued) {
+        coli_v4_gpu_expert_upload_join();
+        double dpt_j = v4_wait_clock();
+        g_v4_dp_attach += dpt_j - dpt_c;
+        dpt_c = dpt_j;
+    }
+    /* The fused path needs every expert on the primary card; decided here,
+     * once the uploads (inline or threaded) have landed. */
+    if (!result && store->gpu)
+        for (int i = 0; i < selected; i++)
+            if (!views[i].gate.gpu || !views[i].up.gpu ||
+                !views[i].down.gpu || views[i].gpu_second)
+                gpu_compute = 0;
     int hybrid_gpu_count = 0;
     int hybrid_uploads = 0;
     struct timespec hybrid_fill_t0 = {0, 0};
@@ -6027,6 +6067,33 @@ static int moe_token_pipeline(float *output,
                 g_v4_hyb_fill_bw = coli_v4_hybrid_ema(
                     g_v4_hyb_fill_bw, (double)hybrid_uploads / window);
         }
+        /* The second card's group is launched first, on a helper thread,
+         * and joined after the primary's: the two run concurrently. */
+        V4SecondGroupJob sec_job;
+        pthread_t sec_thread;
+        int sec_threaded = 0;
+        if (sec_ok) {
+            int k = 0;
+            for (int i = 0; i < selected; i++)
+                if (views[i].gate.gpu && views[i].up.gpu &&
+                    views[i].down.gpu && views[i].gpu_second) {
+                    sgates[k] = views[i].gate.gpu;
+                    sups[k] = views[i].up.gpu;
+                    sdowns[k] = views[i].down.gpu;
+                    sec_weights[k] = expert_weights[i];
+                    k++;
+                }
+            sec_job = (V4SecondGroupJob){store, sgates, sups, sdowns,
+                                         sec_weights, sec_n,
+                                         config->swiglu_limit, sec_sum,
+                                         input, 0};
+            if (gpu_ok &&
+                pthread_create(&sec_thread, NULL, v4_second_group_thread,
+                               &sec_job) == 0)
+                sec_threaded = 1;
+            else
+                v4_second_group_thread(&sec_job);
+        }
         if (gpu_ok) {
             int k = 0;
             for (int i = 0; i < selected; i++)
@@ -6046,19 +6113,8 @@ static int moe_token_pipeline(float *output,
                 gpu_n, config->swiglu_limit, gpu_sum, input)) gpu_ok = 0;
         }
         if (sec_ok) {
-            int k = 0;
-            for (int i = 0; i < selected; i++)
-                if (views[i].gate.gpu && views[i].up.gpu &&
-                    views[i].down.gpu && views[i].gpu_second) {
-                    sgates[k] = views[i].gate.gpu;
-                    sups[k] = views[i].up.gpu;
-                    sdowns[k] = views[i].down.gpu;
-                    sec_weights[k] = expert_weights[i];
-                    k++;
-                }
-            if (!coli_v4_gpu_second_expert_group(store, sgates, sups, sdowns,
-                    sec_weights, sec_n, config->swiglu_limit, sec_sum, input))
-                sec_ok = 0;
+            if (sec_threaded) pthread_join(sec_thread, NULL);
+            if (!sec_job.ok) sec_ok = 0;
         }
         /* Backend failure on a group: the CPU loop above deliberately
          * skipped that card's experts, so compute them here — degrade, don't
@@ -6229,14 +6285,15 @@ static int block_token_pipeline(float *output_hc,
     if (dprof < 0) dprof = getenv("DSV4_DECODE_PROF") != NULL;
     if (dprof && weights->plan.layer == 0 && dp_layers) {
         fprintf(stderr, "decprof position=%d layers=%d hc=%.0f attn=%.0f moe=%.0f ms "
-                        "(moe: shared=%.0f loads=%.0f of which attach=%.0f compute=%.0f; "
+                        "(moe: shared=%.0f loads=%.0f of which attach=%.0f compute=%.0f second=%.0f; "
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
                         "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu)\n",
                 position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
-                g_v4_dp_compute * 1e3, (unsigned long long)g_v4_dp_read_n,
+                g_v4_dp_compute * 1e3, g_v4_dp_second * 1e3,
+                (unsigned long long)g_v4_dp_read_n,
                 g_v4_dp_read_ns / 1e6,
                 g_v4_dp_read_n ? g_v4_dp_read_ns / 1e6 / (double)g_v4_dp_read_n : 0.0,
                 g_v4_dp_pread_ns / 1e6, g_v4_dp_move_ns / 1e6,
@@ -6247,6 +6304,7 @@ static int block_token_pipeline(float *output_hc,
                 g_v4_pf_enqueued, g_v4_pf_read, g_v4_pf_dropped);
         dp_hc = dp_attn = dp_moe = 0; dp_layers = 0;
         g_v4_dp_shared = g_v4_dp_loads = g_v4_dp_attach = g_v4_dp_compute = 0;
+        g_v4_dp_second = 0;
         g_v4_dp_read_ns = g_v4_dp_read_n = 0;
         g_v4_dp_pread_ns = g_v4_dp_move_ns = g_v4_dp_move_bytes = g_v4_dp_pm_n = 0;
         g_v4_dp_pair_ok = g_v4_dp_pair_fail = 0;
@@ -11425,7 +11483,9 @@ typedef struct {
                         float *, const float *);
     long long (*mem_free_mb)(int);
     int (*device_unified)(int);
+    int (*stream_drain)(int);
 } V4GpuBackendOps;
+extern int dsv4_cuda_stream_drain(int device);
 
 #ifdef _WIN32
 /* Windows loader: the secondary module (backend_loader_dsv4.c). */
@@ -11443,6 +11503,7 @@ int dsv4_cuda2_expert_group(Dsv4CudaTensor *const *gate,
                             int count, float limit, float *y, const float *x);
 long long dsv4_cuda2_mem_free_mb(int device);
 int dsv4_cuda2_device_unified(int device);
+int dsv4_cuda2_stream_drain(int device);
 const char *dsv4_cuda2_backend_name(void);
 #else
 /* One linked backend elsewhere: a second card is usable only when this
@@ -11461,16 +11522,19 @@ static void dsv4_cuda2_shutdown(void) {}
 #define dsv4_cuda2_expert_group dsv4_cuda_expert_group
 #define dsv4_cuda2_mem_free_mb dsv4_cuda_mem_free_mb
 #define dsv4_cuda2_device_unified dsv4_cuda_device_unified
+#define dsv4_cuda2_stream_drain dsv4_cuda_stream_drain
 #define dsv4_cuda2_backend_name dsv4_cuda_backend_name
 #endif
 
 static const V4GpuBackendOps v4_gpu_ops_primary = {
     dsv4_cuda_upload_fp4, dsv4_cuda_tensor_refill_fp4, dsv4_cuda_tensor_free,
-    dsv4_cuda_expert_group, dsv4_cuda_mem_free_mb, dsv4_cuda_device_unified
+    dsv4_cuda_expert_group, dsv4_cuda_mem_free_mb, dsv4_cuda_device_unified,
+    dsv4_cuda_stream_drain
 };
 static const V4GpuBackendOps v4_gpu_ops_second = {
     dsv4_cuda2_upload_fp4, dsv4_cuda2_tensor_refill_fp4, dsv4_cuda2_tensor_free,
-    dsv4_cuda2_expert_group, dsv4_cuda2_mem_free_mb, dsv4_cuda2_device_unified
+    dsv4_cuda2_expert_group, dsv4_cuda2_mem_free_mb, dsv4_cuda2_device_unified,
+    dsv4_cuda2_stream_drain
 };
 
 struct V4GpuExpertMirrorCache {
@@ -11493,7 +11557,25 @@ struct V4GpuExpertMirrorCache {
     int second;
     struct V4GpuExpertMirrorCache *next;
     unsigned long long hits, misses;
+    unsigned split_n;   /* recycled uploads so far, for the V4_DEV2_SPLIT ratio */
 };
+
+/* V4_DEV2_SPLIT=<percent>: once both caches are full, this share of the
+ * fresh uploads is recycled into the second card's cache instead of the
+ * primary's, so a layer's uploads ride both PCIe links at once (each card
+ * then computes its own subset; the partial sums add). Default 50: with the
+ * second card installed both links run x8, i.e. equal. 0 = old behaviour
+ * (the second card fills once and is a static store afterwards). */
+static int v4_dev2_split_percent(void) {
+    static int pct = -1;
+    if (pct < 0) {
+        const char *e = getenv("V4_DEV2_SPLIT");
+        pct = e && *e ? atoi(e) : 50;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+    }
+    return pct;
+}
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_ops(
     int device, int capacity, const V4GpuBackendOps *ops, int second,
@@ -12114,6 +12196,10 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
         v4_gpu_expert_mirrors_free(cache->next);
         cache->next = NULL;
     }
+    if (!cache->second) {
+        unsigned long long up0, up1;   /* prints the uploader threads' report */
+        coli_v4_gpu_expert_upload_stats(&up0, &up1);
+    }
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].gate)
             cache->ops->tensor_free(cache->entries[i].gate);
@@ -12202,11 +12288,11 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
             cache->ops->refill_fp4(
                 cache->entries[found].gate, (const uint8_t *)view->gate.data,
                 (const uint8_t *)view->gate.scales, (int)view->gate.rows,
-                (int)view->gate.columns, 0) &&
+                (int)view->gate.columns, sync >= 2 ? 3 : 0) &&
             cache->ops->refill_fp4(
                 cache->entries[found].up, (const uint8_t *)view->up.data,
                 (const uint8_t *)view->up.scales, (int)view->up.rows,
-                (int)view->up.columns, 0) &&
+                (int)view->up.columns, sync >= 2 ? 3 : 0) &&
             cache->ops->refill_fp4(
                 cache->entries[found].down, (const uint8_t *)view->down.data,
                 (const uint8_t *)view->down.scales, (int)view->down.rows,
@@ -12307,14 +12393,20 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     }
     cache->misses++;
     /* Placement: grow the primary while its reserve allows, then the second
-     * card, then recycle the primary's LRU — the churning hot set stays on
-     * the card that also runs attention and the dense matvecs; the second
-     * card is the overflow that fills once. Its uploads are synchronous: no
-     * drain reaches that stream. */
+     * card; once both are full, recycle the LRU of one or the other by the
+     * V4_DEV2_SPLIT ratio, so the uploads of one layer go down both PCIe
+     * links concurrently instead of queueing on the primary's. The second
+     * card's uploads are as asynchronous as the primary's: the drain
+     * (coli_v4_gpu_expert_drain) covers every cache in the chain. */
     if (!cache->next)
         return v4_gpu_mirror_place(cache, view, sync, 1);
     if (v4_gpu_mirror_place(cache, view, sync, 0) == 0) return 0;
-    if (v4_gpu_mirror_place(cache->next, view, 1, 0) == 0) return 0;
+    if (v4_gpu_mirror_place(cache->next, view, sync, 0) == 0) return 0;
+    int pct = v4_dev2_split_percent();
+    unsigned k = cache->split_n++ % 100u;
+    if (pct > 0 && k < (unsigned)pct &&
+        v4_gpu_mirror_place(cache->next, view, sync, 1) == 0)
+        return 0;
     return v4_gpu_mirror_place(cache, view, sync, 1);
 }
 
@@ -12322,6 +12414,150 @@ int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_cached_ex(
         (V4GpuExpertMirrorCache *)store->gpu, view, 1);
+}
+
+/* ---- decode uploader threads (V4_UPLOAD_THREADS) --------------------------
+ * One thread per card. The decode lane loop hands each missed expert to the
+ * uploader of the card the V4_DEV2_SPLIT ratio picks and goes on consuming
+ * lane reads; the uploader places the mirror on its own card (grow, else
+ * recycle its LRU), falling back to the other card, with a synchronous copy
+ * — so the job is complete when the join returns and no stream drain is
+ * involved. Measured on the reference box (RTX 5080 + RTX 3080, both PCIe
+ * gen4 x8 once two cards share the lanes): from the main thread the enqueue
+ * of a 12.6 MB pinned copy costs its link time (~0.7 ms) under WDDM, which
+ * delayed the next lane read and serialised the two links. */
+typedef struct {
+    ColiExpertView *view;
+    V4GpuExpertMirrorCache *own, *other;
+} V4UploadJob;
+
+#define V4_UPLOAD_QUEUE 64
+typedef struct {
+    pthread_t thread;
+    int started;
+    pthread_mutex_t mutex;
+    pthread_cond_t ready, done;
+    V4UploadJob queue[V4_UPLOAD_QUEUE];
+    unsigned head, tail;
+    int busy;
+    unsigned long long jobs, placed;
+    double seconds;   /* time spent placing, cumulative */
+} V4Uploader;
+static V4Uploader g_v4_up[2];
+static unsigned g_v4_up_split;
+
+static double v4_up_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+int coli_v4_upload_threads_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_UPLOAD_THREADS");
+        on = !e || !*e || atoi(e) != 0;
+    }
+    return on;
+}
+
+static void *v4_uploader_main(void *arg) {
+    V4Uploader *u = arg;
+    for (;;) {
+        pthread_mutex_lock(&u->mutex);
+        while (u->head == u->tail)
+            pthread_cond_wait(&u->ready, &u->mutex);
+        V4UploadJob job = u->queue[u->head % V4_UPLOAD_QUEUE];
+        u->head++;
+        pthread_mutex_unlock(&u->mutex);
+        /* sync=2: the backend copies on its aux stream and drains only
+         * that, never the compute stream's queued kernels. */
+        double t0 = v4_up_clock();
+        int ok = v4_gpu_mirror_place(job.own, job.view, 2, 1) == 0;
+        if (!ok && job.other)
+            ok = v4_gpu_mirror_place(job.other, job.view, 2, 1) == 0;
+        double dt = v4_up_clock() - t0;
+        pthread_mutex_lock(&u->mutex);
+        u->seconds += dt;
+        if (ok) u->placed++;
+        u->busy--;
+        pthread_cond_broadcast(&u->done);
+        pthread_mutex_unlock(&u->mutex);
+    }
+    return NULL;
+}
+
+static int v4_uploader_start(V4Uploader *u) {
+    if (u->started) return u->started > 0;
+    pthread_mutex_init(&u->mutex, NULL);
+    pthread_cond_init(&u->ready, NULL);
+    pthread_cond_init(&u->done, NULL);
+    if (pthread_create(&u->thread, NULL, v4_uploader_main, u) != 0) {
+        u->started = -1;
+        return 0;
+    }
+    pthread_detach(u->thread);
+    u->started = 1;
+    return 1;
+}
+
+/* Lookup, and on a miss hand the upload to a card's uploader. Returns 0 when
+ * the expert is (or will be, after the join) on a card; -1 when the queues
+ * are full or the threads could not start — the caller then attaches the
+ * old way. The view must stay in place until coli_v4_gpu_expert_upload_join. */
+int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view) {
+    if (!store || !view || !store->gpu) return -1;
+    if (coli_v4_gpu_expert_peek(store, view) == 0) return 0;
+    V4GpuExpertMirrorCache *primary = (V4GpuExpertMirrorCache *)store->gpu;
+    if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
+        view->down.block_rows != 1 || primary->capacity < 8)
+        return -1;
+    primary->misses++;
+    int card = 0;
+    if (primary->next) {
+        int pct = v4_dev2_split_percent();
+        unsigned k = g_v4_up_split++ % 100u;
+        card = pct > 0 && k < (unsigned)pct;
+    }
+    V4Uploader *u = &g_v4_up[card];
+    if (!v4_uploader_start(u)) return -1;
+    V4UploadJob job = { view, card ? primary->next : primary,
+                        card ? primary : primary->next };
+    pthread_mutex_lock(&u->mutex);
+    if (u->tail - u->head >= V4_UPLOAD_QUEUE) {
+        pthread_mutex_unlock(&u->mutex);
+        return -1;
+    }
+    u->queue[u->tail % V4_UPLOAD_QUEUE] = job;
+    u->tail++;
+    u->busy++;
+    u->jobs++;
+    pthread_cond_signal(&u->ready);
+    pthread_mutex_unlock(&u->mutex);
+    return 0;
+}
+
+/* Wait until every queued upload has been placed (or refused). */
+void coli_v4_gpu_expert_upload_join(void) {
+    for (int i = 0; i < 2; i++) {
+        V4Uploader *u = &g_v4_up[i];
+        if (u->started <= 0) continue;
+        pthread_mutex_lock(&u->mutex);
+        while (u->busy > 0)
+            pthread_cond_wait(&u->done, &u->mutex);
+        pthread_mutex_unlock(&u->mutex);
+    }
+}
+
+void coli_v4_gpu_expert_upload_stats(unsigned long long *jobs0,
+                                     unsigned long long *jobs1) {
+    *jobs0 = g_v4_up[0].jobs;
+    *jobs1 = g_v4_up[1].jobs;
+    for (int i = 0; i < 2; i++)
+        if (g_v4_up[i].jobs)
+            fprintf(stderr, "v4_gpu uploader[%d] jobs=%llu placed=%llu avg=%.2f ms\n",
+                    i, g_v4_up[i].jobs, g_v4_up[i].placed,
+                    1e3 * g_v4_up[i].seconds / (double)g_v4_up[i].jobs);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -12336,11 +12572,14 @@ int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
         (V4GpuExpertMirrorCache *)store->gpu, view, 0);
 }
 
-extern int dsv4_cuda_stream_drain(int device);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
     if (!store || !store->gpu) return 0;
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
-    return dsv4_cuda_stream_drain(cache->device) ? 0 : -1;
+    int result = 0;
+    for (V4GpuExpertMirrorCache *c = (V4GpuExpertMirrorCache *)store->gpu; c;
+         c = c->next)
+        if (!c->ops->stream_drain || !c->ops->stream_drain(c->device))
+            result = -1;
+    return result;
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
@@ -17177,9 +17416,13 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
                         "(cumulative)\n",
                 g_v4_hyb_gpu_n, g_v4_hyb_cpu_n, g_v4_hyb_upload_n,
                 g_v4_hyb_skip_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
-    if (g_v4_dev2_n || g_v4_resident_n)
+    if (g_v4_dev2_n || g_v4_resident_n) {
+        unsigned long long up0 = 0, up1 = 0;
+        coli_v4_gpu_expert_upload_stats(&up0, &up1);
         fprintf(stderr, "v4_gpu mirror-first resident=%llu second-device=%llu "
-                        "(experts, cumulative)\n", g_v4_resident_n, g_v4_dev2_n);
+                        "uploads primary=%llu second=%llu (experts, cumulative)\n",
+                g_v4_resident_n, g_v4_dev2_n, up0, up1);
+    }
 #endif
 #ifdef COLI_VULKAN
     v4_vk_tier_report("turn", (unsigned long long)hits, (unsigned long long)misses);

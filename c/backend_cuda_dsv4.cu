@@ -1325,10 +1325,17 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
     if(!t||!w||!s||t->fmt!=4||t->O!=O||t->I!=I||!t->own_w||!t->own_scale||!t->w||!t->scale)return 0;
     Dev*c=ctx(t->device);if(!c||!ok(cudaSetDevice(t->device),"select refill device"))return 0;
     size_t wb=(size_t)O*I/2,sb=(size_t)O*I/32;
+    /* sync>=2: the decode uploader threads. Their copies ride the aux stream
+     * (3 = enqueue only, 2 = enqueue and drain it), so a synchronous refill
+     * never waits behind the attention/dense kernels queued on the compute
+     * stream (measured: that wait made a 0.7 ms pinned copy cost 2.3 ms from
+     * the uploader thread). */
+    cudaStream_t cs=sync>=2?c->aux:c->stream;
+    if(sync==3)sync=0;
     if(host_pinned(w,wb)&&host_pinned(s,sb)){
-        if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
-           !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
-        if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
+        if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,cs),"refill weight upload")||
+           !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,cs),"refill scale upload"))return 0;
+        if(sync&&!ok(cudaStreamSynchronize(cs),"refill drain"))return 0;
     }else{
         if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"refill weight upload")||
            !ok(cudaMemcpy(t->scale,s,sb,cudaMemcpyHostToDevice),"refill scale upload"))return 0;
