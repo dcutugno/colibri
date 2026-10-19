@@ -12163,12 +12163,16 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_ops(
 }
 
 /* VRAM reserve kept free while mirrors grow on the primary card: the
- * transient prefill expert bank (~2.2 GiB, COLI_CUDA_MOE_BATCH) plus attention
- * buffers. DSV4_CUDA_VRAM_RESERVE_MB overrides; the default only reserves the
- * bank when that path is enabled, so small cards can still mirror. */
+ * attention buffers. The transient prefill expert bank (COLI_CUDA_MOE_BATCH)
+ * is NOT reserved any more: decode mirrors grow into its space and the bank
+ * reclaims it when the next large prefill creates it
+ * (coli_v4_gpu_expert_mirrors_make_room). Measured (RTX 5080, 3.3k-token
+ * context): reserving the bank held the cache at 386 mirrors; 2800 -> 600 MB
+ * gave 18 % fewer uploads and decode 20.8 -> 19.8 s / 36 tokens, text
+ * identical. DSV4_CUDA_VRAM_RESERVE_MB overrides. */
 static long long v4_gpu_primary_reserve_mb(void) {
     const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
-    return env ? atoll(env) : (coli_v4_gpu_moe_batch_wanted() ? 2800 : 600);
+    return env ? atoll(env) : 600;
 }
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
@@ -12640,6 +12644,38 @@ int coli_v4_gpu_expert_resident(ColiExpertStore *store, ColiExpertKey key,
     return -1;
 }
 
+/* Free the primary card's least-recently-used mirrors until need_mb of VRAM
+ * is free (the prefill bank's allocation, between tokens: no decode view
+ * references a mirror then). Returns the number of mirrors released. */
+int coli_v4_gpu_expert_mirrors_make_room(ColiExpertStore *store, long long need_mb) {
+    if (!store || !store->gpu) return 0;
+    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    int released = 0;
+    pthread_mutex_lock(&cache->mutex);
+    if (!cache->unified || cache->unified < 0) {
+        for (;;) {
+            long long free_mb = cache->ops->mem_free_mb(cache->device);
+            if (free_mb < 0 || free_mb >= need_mb || cache->count == 0) break;
+            int victim = 0;
+            for (int i = 1; i < cache->count; i++)
+                if (cache->entries[i].clock < cache->entries[victim].clock)
+                    victim = i;
+            if (cache->entries[victim].gate) cache->ops->tensor_free(cache->entries[victim].gate);
+            if (cache->entries[victim].up) cache->ops->tensor_free(cache->entries[victim].up);
+            if (cache->entries[victim].down) cache->ops->tensor_free(cache->entries[victim].down);
+            cache->entries[victim] = cache->entries[cache->count - 1];
+            cache->count--;
+            released++;
+        }
+        cache->last_free_mb = -1;   /* the growth guard re-probes */
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    if (released)
+        fprintf(stderr, "v4_gpu mirror-cache: released %d mirrors for the prefill "
+                        "bank (%d left)\n", released, cache->count);
+    return released;
+}
+
 int coli_v4_gpu_second_present(ColiExpertStore *store) {
     return store && store->gpu &&
            ((V4GpuExpertMirrorCache *)store->gpu)->next != NULL;
@@ -12726,6 +12762,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #include "deepseek_v4_bank_pair.h"
 
 static Dsv4CudaExpertSet *v4_moe_bank;
+/* 256 experts x (3 fp4 matrices of 2048x4096 + scales) = 3.3 GiB */
+#define V4_MOE_BANK_MB 3400
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
 static unsigned char v4_moe_bank_valid[256];
@@ -12894,6 +12932,9 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     int device = dsv4_cuda_tensor_device(gate);
     if (device < 0) return -1;
     if (!bank) {
+        /* The bank (256 experts, ~3.3 GiB) takes the VRAM the decode mirrors
+         * grew into since the last prefill: release LRU mirrors first. */
+        coli_v4_gpu_expert_mirrors_make_room(store, V4_MOE_BANK_MB + 600);
         bank = dsv4_cuda_expert_bank_create(256, 4096, 2048, device, sg, su, sd);
         if (!bank) {
             /* Out of VRAM, or shared-mirror shapes off: remember instead of
@@ -12935,6 +12976,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 1, bank_layer, config->num_hidden_layers);
             if (next >= 0) {
                 if (!v4_moe_bank2) {
+                    coli_v4_gpu_expert_mirrors_make_room(store, V4_MOE_BANK_MB + 600);
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
                         256, 4096, 2048, device, sg, su, sd);
                     if (!v4_moe_bank2) {
