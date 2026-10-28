@@ -197,6 +197,7 @@ typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_device_count)(void);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_group_fence)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -345,6 +346,7 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_group_fence group_fence;                  /* optional: upload fence inside the expert group */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -390,7 +392,7 @@ static struct {
     HMODULE dll; int available; char loaded_name[64];
     fn_init init; fn_shutdown shutdown; fn_upload_fp4 upload_fp4;
     fn_tensor_refill_fp4 tensor_refill_fp4; fn_tensor_free tensor_free;
-    fn_expert_group expert_group; fn_stream_drain stream_drain;
+    fn_expert_group expert_group; fn_stream_drain stream_drain; fn_group_fence group_fence;
     fn_mem_free_mb mem_free_mb; fn_backend_arch_ok backend_arch_ok;
     fn_backend_name backend_name; fn_device_unified device_unified;
 } g_dsv4b;
@@ -578,6 +580,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.group_fence = (fn_group_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_group_fence");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
@@ -990,6 +993,11 @@ int dsv4_cuda_stream_drain(int device){
     if(!g_dsv4.stream_drain) return 0;
     return g_dsv4.stream_drain(device);
 }
+int dsv4_cuda_group_fence(int device){
+    /* 0 without the export: the engine then keeps draining its uploads. */
+    if(!g_dsv4.available||!g_dsv4.group_fence) return 0;
+    return g_dsv4.group_fence(device);
+}
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,
                              int count, int window, int dim){
@@ -1233,6 +1241,7 @@ int dsv4_cuda_secondary_open(int device){
     RESOLVE2(mem_free_mb, fn_mem_free_mb, "dsv4_cuda_mem_free_mb", 1);
     RESOLVE2(backend_arch_ok, fn_backend_arch_ok, "dsv4_cuda_backend_arch_ok", 0);
     RESOLVE2(stream_drain, fn_stream_drain, "dsv4_cuda_stream_drain", 0);
+    RESOLVE2(group_fence, fn_group_fence, "dsv4_cuda_group_fence", 0);
     RESOLVE2(backend_name, fn_backend_name, "dsv4_cuda_backend_name", 0);
     RESOLVE2(device_unified, fn_device_unified, "dsv4_cuda_device_unified", 0);
     #undef RESOLVE2
@@ -1272,6 +1281,9 @@ int dsv4_cuda2_expert_group(Dsv4CudaTensor *const *gate, Dsv4CudaTensor *const *
 }
 int dsv4_cuda2_stream_drain(int device){
     return g_dsv4b.available && g_dsv4b.stream_drain ? g_dsv4b.stream_drain(device) : 0;
+}
+int dsv4_cuda2_group_fence(int device){
+    return g_dsv4b.available && g_dsv4b.group_fence ? g_dsv4b.group_fence(device) : 0;
 }
 long long dsv4_cuda2_mem_free_mb(int device){
     return g_dsv4b.available ? g_dsv4b.mem_free_mb(device) : -1;

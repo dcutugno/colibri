@@ -55,6 +55,10 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
 struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+    /* decode expert group: the upload fence event, pinned staging for its
+     * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
+    cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
+    double kp_dev,kp_host; int kp_n;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -2401,6 +2405,133 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
        !bok(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,&bs,sizeof(bs)),"TC B scale"))return 0;float alpha=1,beta=0;
     return bok(cublasLtMatmul(c->lt,p->op,&alpha,c->tcw,p->a,c->tcx,p->b,&beta,y,p->c,y,p->d,&p->algo.algo,c->tc_workspace,32<<20,c->stream),"TC matvec");}
 #endif /* COLI_DSV4_TC */
+/* Upload fence: the decode uploader threads enqueue their mirror refills on
+ * the aux stream and return without draining (V4_UPLOAD_FENCE); the expert
+ * group orders its kernels after those copies on the device, instead of the
+ * host joining the DMA and only then launching. Cheap when nothing is
+ * pending. Exported too, so the engine can probe for it. */
+static int group_fence(Dev*c){
+    if(!c->upfence&&!ok(cudaEventCreateWithFlags(&c->upfence,cudaEventDisableTiming),"upload fence event"))return 0;
+    return ok(cudaEventRecord(c->upfence,c->aux),"upload fence record")&&ok(cudaStreamWaitEvent(c->stream,c->upfence,0),"upload fence wait");
+}
+extern "C" int dsv4_cuda_group_fence(int device){
+    Dev*c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select fence device"))return 0;return group_fence(c);
+}
+/* Pinned staging for the group's small host<->device copies: a pageable
+ * cudaMemcpyAsync stages synchronously and, on WDDM, flushes the command
+ * buffer per copy (four of them per group call). DSV4_MOE_PINNED=0 keeps
+ * the pageable copies. The descriptors of all three matrices and the
+ * weights go up in ONE copy: gate/up at [0,2n), down at [GRP_DOWN,+n). */
+enum{GRP_DOWN=32,GRP_DESC=48,GRP_W=16};
+/* Decode matvecs, bandwidth-shaped (DSV4_MOE_MV, on): one warp per row,
+ * 16-byte weight loads (32 fp4 or 16 fp8 values per lane per step), the
+ * input vector in shared memory padded one float per lane-chunk so the
+ * lanes' strided reads hit distinct banks, scales and values decoded with
+ * bit arithmetic instead of table lookups, warp-shuffle reduction. The
+ * mv / mv_fp4_grouped kernels read one byte per lane per step and ran at
+ * ~15 % of the card's bandwidth (1.1 ms per decode layer for ~100 MB).
+ * The summation order differs from theirs: DSV4_MOE_MV=0 restores them. */
+__device__ __forceinline__ float f4_bits(uint32_t q){uint32_t e=(q>>1)&3u,m=q&1u,sg=(q&8u)<<28;
+    uint32_t b=e?(((e+126u)<<23)|(m<<22)):(m?0x3f000000u:0u);return __uint_as_float(b|sg);}
+__device__ __forceinline__ float e8_bits(uint32_t b){return b?__uint_as_float(b<<23):__uint_as_float(1u<<22);}
+__device__ __forceinline__ float e4m3_bits(uint32_t v){uint32_t sg=(v&0x80u)<<24,e=(v>>3)&15u,m=v&7u;
+    float r=e?__uint_as_float(((e+120u)<<23)|(m<<20)):(float)m*(1.f/512.f);return __uint_as_float(__float_as_uint(r)|sg);}
+template<int RW> __global__ void __launch_bounds__(256) mv_fp4_dec(const MvDesc*desc,int count,int O,int I){
+    extern __shared__ float xs[];
+    int matrix=blockIdx.y;if(matrix>=count)return;MvDesc d=desc[matrix];
+    for(int e=threadIdx.x;e<I;e+=blockDim.x)xs[e+(e>>5)]=d.x[e];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,chunks=I>>5;
+    int row0=(blockIdx.x*(blockDim.x>>5)+warp)*RW;
+    #pragma unroll
+    for(int r=0;r<RW;r++){int o=row0+r;if(o>=O)break;
+        const uint4*wr=(const uint4*)(d.w+(size_t)o*(I>>1));const uint8_t*sr=d.scale+(size_t)o*chunks;float sum=0.f;
+        for(int c=lane;c<chunks;c+=32){uint4 w=__ldg(wr+c);float sc=e8_bits(__ldg(sr+c));const float*xp=xs+c*33;float part=0.f;
+            uint32_t ws[4]={w.x,w.y,w.z,w.w};
+            #pragma unroll
+            for(int k=0;k<4;k++){uint32_t v=ws[k];
+                #pragma unroll
+                for(int n=0;n<8;n++)part+=xp[k*8+n]*f4_bits((v>>(4*n))&15u);}
+            sum+=part*sc;}
+        #pragma unroll
+        for(int off=16;off;off>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,off);
+        if(!lane)d.y[o]=sum;}
+}
+template<int RW> __global__ void __launch_bounds__(256) mv_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I){
+    extern __shared__ float xs[];
+    for(int e=threadIdx.x;e<I;e+=blockDim.x)xs[e+(e>>4)]=x[e];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,chunks=I>>4,sb=(I+127)/128;
+    int row0=(blockIdx.x*(blockDim.x>>5)+warp)*RW;
+    #pragma unroll
+    for(int r=0;r<RW;r++){int o=row0+r;if(o>=O)break;
+        const uint4*wr=(const uint4*)(w+(size_t)o*I);const uint8_t*srow=sc+(size_t)(o/128)*sb;float sum=0.f;
+        for(int c=lane;c<chunks;c+=32){uint4 v=__ldg(wr+c);float s=e8_bits(__ldg(srow+(c>>3)));const float*xp=xs+c*17;float part=0.f;
+            uint32_t ws[4]={v.x,v.y,v.z,v.w};
+            #pragma unroll
+            for(int k=0;k<4;k++){uint32_t b=ws[k];
+                #pragma unroll
+                for(int n=0;n<4;n++)part+=xp[k*4+n]*e4m3_bits((b>>(8*n))&255u);}
+            sum+=part*s;}
+        #pragma unroll
+        for(int off=16;off;off>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,off);
+        if(!lane)y[o]=sum;}
+}
+static unsigned float_bits_host(float f){unsigned u;memcpy(&u,&f,4);return u;}
+static int g_mv_dec=-1;
+static int mv_dec_on(void){if(g_mv_dec<0){const char*e=getenv("DSV4_MOE_MV");g_mv_dec=!e||!*e||*e!='0';}return g_mv_dec;}
+/* grouped fp4 matvecs of `count` matrices, each O rows by I (I % 32 == 0) */
+static void run_fp4_dec(const MvDesc*desc,int count,int O,int I,cudaStream_t st){
+    mv_fp4_dec<4><<<dim3((O+31)/32,count),256,(size_t)(I+(I>>5))*sizeof(float),st>>>(desc,count,O,I);}
+static void run_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,cudaStream_t st){
+    mv_fp8_dec<4><<<(O+31)/32,256,(size_t)(I+(I>>4))*sizeof(float),st>>>(w,sc,x,y,O,I);}
+static int group_stage(Dev*c,size_t xb){
+    if(c->grp_pinned<0)return 0;
+    if(c->grp_pinned>0)return xb<=c->grp_hcap;
+    static int want=-1;if(want<0){const char*e=getenv("DSV4_MOE_PINNED");want=!e||!*e||*e!='0';}
+    if(!want){c->grp_pinned=-1;return 0;}
+    size_t pb=GRP_DESC*sizeof(MvDesc)+GRP_W*sizeof(float);
+    if(!ok(cudaHostAlloc(&c->grp_hparams,pb,cudaHostAllocPortable),"group params staging")||
+       !ok(cudaHostAlloc((void**)&c->hx_pin,xb,cudaHostAllocPortable),"group x staging")||
+       !ok(cudaHostAlloc((void**)&c->hy_pin,xb,cudaHostAllocPortable),"group y staging")||
+       !buf(&c->grp_params,&c->grp_paramscap,pb)){c->grp_pinned=-1;return 0;}
+    c->grp_hcap=xb;c->grp_pinned=1;return 1;
+}
+static int group_params(Dev*c,int pinned,Dsv4CudaTensor*const*gate,Dsv4CudaTensor*const*up,Dsv4CudaTensor*const*down,
+        const float*weights,int count,int I,int H,MvDesc**dd,float**dw){
+    MvDesc hl[GRP_DESC]={};float wl[GRP_W]={0};
+    MvDesc*hd=pinned?(MvDesc*)c->grp_hparams:hl;float*hw=pinned?(float*)((char*)c->grp_hparams+GRP_DESC*sizeof(MvDesc)):wl;
+    for(int e=0;e<count;e++){
+        hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};
+        hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};
+        hd[GRP_DOWN+e]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
+        hw[e]=weights[e];}
+    size_t pb=GRP_DESC*sizeof(MvDesc)+GRP_W*sizeof(float);
+    if(pinned){if(!ok(cudaMemcpyAsync(c->grp_params,c->grp_hparams,pb,cudaMemcpyHostToDevice,c->stream),"expert params upload"))return 0;
+        *dd=(MvDesc*)c->grp_params;*dw=(float*)((char*)c->grp_params+GRP_DESC*sizeof(MvDesc));return 1;}
+    if(!buf((void**)&c->mvdesc,&c->mvdesccap,GRP_DESC*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,GRP_W*sizeof(float))||
+       !ok(cudaMemcpyAsync(c->mvdesc,hl,GRP_DESC*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"expert descriptors upload")||
+       !ok(cudaMemcpyAsync(c->expert_weights,wl,GRP_W*sizeof(float),cudaMemcpyHostToDevice,c->stream),"expert weights upload"))return 0;
+    *dd=c->mvdesc;*dw=c->expert_weights;return 1;
+}
+/* DSV4_MOE_KPROF=1: device time of the group's kernels vs the call's host
+ * wall (which includes the fence wait for pending uploads), per card. */
+struct GroupProf{Dev*c;int on;cudaEvent_t e0,e1;std::chrono::steady_clock::time_point t0;
+    GroupProf(Dev*d):c(d){static int k=-1;if(k<0){const char*e=getenv("DSV4_MOE_KPROF");k=e&&*e&&*e!='0';}on=k;
+        if(on){t0=std::chrono::steady_clock::now();cudaEventCreate(&e0);cudaEventCreate(&e1);cudaEventRecord(e0,c->stream);}}};
+static int group_finish(Dev*c,GroupProf&gp,int pinned,float*y,size_t yb,const char*what){
+    if(gp.on)cudaEventRecord(gp.e1,c->stream);
+    float*ys=pinned?c->hy_pin:y;char msg[64];
+    snprintf(msg,sizeof msg,"%s result download",what);
+    if(!ok(cudaMemcpyAsync(ys,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),msg))return 0;
+    snprintf(msg,sizeof msg,"%s sync",what);
+    if(!ok(cudaStreamSynchronize(c->stream),msg))return 0;
+    if(pinned)memcpy(y,c->hy_pin,yb);
+    if(gp.on){float ms=0;cudaEventElapsedTime(&ms,gp.e0,gp.e1);cudaEventDestroy(gp.e0);cudaEventDestroy(gp.e1);
+        c->kp_dev+=ms;c->kp_host+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-gp.t0).count();
+        if(++c->kp_n%430==0)fprintf(stderr,"moekprof device=%d calls=%d kernels=%.3f host=%.3f ms/call pinned=%d\n",c->id,c->kp_n,c->kp_dev/c->kp_n,c->kp_host/c->kp_n,pinned);}
+    return 1;
+}
 extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
@@ -2410,7 +2541,8 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
        !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
-    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"expert-group activation upload"))return 0;
+    if(!group_fence(c))return 0;int pinned=group_stage(c,xb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,xb);xs=c->hx_pin;}
+    if(!ok(cudaMemcpyAsync(c->dx,xs,xb,cudaMemcpyHostToDevice,c->stream),"expert-group activation upload"))return 0;GroupProf gp(c);
 #if COLI_DSV4_TC
     static int tc=-1;if(tc<0)tc=getenv("DSV4_CUDA_TC")?atoi(getenv("DSV4_CUDA_TC")):0;
     if(tc){for(int e=0;e<count;e++){if(!tc_prepare_x(c,c->dx,H)||!tc_fp4_matvec(c,gate[e],c->p1+(long long)e*I)||!tc_fp4_matvec(c,up[e],c->p2+(long long)e*I))return 0;
@@ -2420,19 +2552,11 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
         return ok(cudaGetLastError(),"TC expert-group launch")&&ok(cudaMemcpyAsync(y,c->dy,(size_t)H*4,cudaMemcpyDeviceToHost,c->stream),"TC expert-group result download")&&ok(cudaStreamSynchronize(c->stream),"TC expert-group sync");}
 #endif /* COLI_DSV4_TC */
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
-    if(batched){MvDesc hd[32];for(int e=0;e<count;e++){
-            hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};
-            hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
-        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(*hd))||
-           !buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
-           !ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)2*count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"expert descriptors upload")||
-           !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"expert weights upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(c->mvdesc,2*count,I,H);
-        expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);
+    if(batched){MvDesc*dd;float*dw;if(!group_params(c,pinned,gate,up,down,weights,count,I,H,&dd,&dw))return 0;int dec=mv_dec_on()&&H%32==0&&I%32==0;
+        if(dec)run_fp4_dec(dd,2*count,I,H,c->stream);else mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(dd,2*count,I,H);
+        expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,dw,limit,count,I);
         fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
-        for(int e=0;e<count;e++)hd[e]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
-        if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"down descriptors upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(c->mvdesc,count,H,I);
+        if(dec)run_fp4_dec(dd+GRP_DOWN,count,H,I,c->stream);else mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(dd+GRP_DOWN,count,H,I);
     }else for(int e=0;e<count;e++){
         run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);
         run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);
@@ -2441,7 +2565,7 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
         run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);
     }
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
-    return ok(cudaGetLastError(),"expert-group launch")&&ok(cudaMemcpyAsync(y,c->dy,(size_t)H*4,cudaMemcpyDeviceToHost,c->stream),"expert-group result download")&&ok(cudaStreamSynchronize(c->stream),"expert-group sync");
+    return ok(cudaGetLastError(),"expert-group launch")&&group_finish(c,gp,pinned,y,(size_t)H*4,"expert-group");
 }
 extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4CudaTensor *down,float limit,float *y,const float *x){
     Dev*c=gate?ctx(gate->device):nullptr;if(!c||!up||!down||gate->fmt!=8||up->fmt!=8||down->fmt!=8||
@@ -2467,21 +2591,35 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
     for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
     size_t hb=(size_t)H*4,ib=(size_t)count*I*4,parts=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
-       !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
-       !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
+       !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts))return 0;
+    if(!group_fence(c))return 0;int pinned=group_stage(c,hb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,hb);xs=c->hx_pin;}
+    if(!ok(cudaMemcpyAsync(c->dx,xs,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;GroupProf gp(c);
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
-    if(batched){MvDesc hd[32];for(int e=0;e<count;e++){hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
-        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(*hd))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
-           !ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)2*count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload")||!ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(c->mvdesc,2*count,I,H);expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
-        for(int e=0;e<count;e++)hd[e]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(c->mvdesc,count,H,I);
+    int dec=mv_dec_on()&&H%32==0&&I%32==0;
+    if(batched){MvDesc*dd;float*dw;if(!group_params(c,pinned,gate,up,down,weights,count,I,H,&dd,&dw))return 0;
+        if(dec)run_fp4_dec(dd,2*count,I,H,c->stream);else mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(dd,2*count,I,H);
+        expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,dw,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+        if(dec)run_fp4_dec(dd+GRP_DOWN,count,H,I,c->stream);else mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(dd+GRP_DOWN,count,H,I);
     }else for(int e=0;e<count;e++){run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3+(long long)e*I,1,I);run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);}
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
-    run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);
-    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);run_mv<8>((uint8_t*)sd->w,sd->scale,c->p3,c->p4,H,I,1,c->stream);
+    if(dec){run_fp8_dec((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,c->stream);run_fp8_dec((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,c->stream);}
+    else{run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);}
+    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);
+    if(dec)run_fp8_dec((uint8_t*)sd->w,sd->scale,c->p3,c->p4,H,I,c->stream);else run_mv<8>((uint8_t*)sd->w,sd->scale,c->p3,c->p4,H,I,1,c->stream);
     moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
-    return ok(cudaGetLastError(),"MoE launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&ok(cudaStreamSynchronize(c->stream),"MoE sync");
+    if(!(ok(cudaGetLastError(),"MoE launch")&&group_finish(c,gp,pinned,y,hb,"MoE")))return 0;
+    /* DSV4_MOE_MV_VERIFY=1: the same call through the old kernels, compared */
+    static int verify=-1;static int in_verify=0;
+    if(verify<0){const char*e=getenv("DSV4_MOE_MV_VERIFY");verify=e&&*e&&*e!='0';}
+    if(verify&&dec&&!in_verify){in_verify=1;g_mv_dec=0;float*y2=(float*)malloc(hb);int r=y2&&dsv4_cuda_moe(gate,up,down,weights,count,sg,su,sd,limit,y2,x);g_mv_dec=1;in_verify=0;
+        if(r){static int calls,off1,off2,maxulp;static double maxabs;double ma=0;
+            for(int i=0;i<H;i++){double dlt=fabs((double)y[i]-y2[i]);if(dlt>ma)ma=dlt;
+                /* distance in bf16 ulps (the outputs are bf16-rounded): sign-magnitude codes */
+                unsigned a=float_bits_host(y[i]),b2=float_bits_host(y2[i]);int ca=(a>>16)&0x7fff,cb=(b2>>16)&0x7fff;if(a>>31)ca=-ca;if(b2>>31)cb=-cb;
+                int u=abs(ca-cb);if(u>maxulp)maxulp=u;if(u>=1)off1++;if(u>=2)off2++;}
+            if(ma>maxabs)maxabs=ma;if(++calls%43==0)fprintf(stderr,"moemv verify calls=%d maxabs=%.3g max_ulp=%d elements: 1ulp=%d >=2ulp=%d of %lld\n",calls,maxabs,maxulp,off1-off2,off2,(long long)calls*H);}
+        free(y2);}
+    return 1;
 }
 extern "C" int dsv4_cuda_rmsnorm(Dsv4CudaActivation*x,Dsv4CudaTensor*w,float eps,int elements){
     Dev*c=x?ctx(x->device):nullptr;
@@ -2665,7 +2803,7 @@ static bool host_pinned(const void*p,size_t len){
 extern "C" int dsv4_cuda_stream_drain(int device){
     Dev*c=ctx(device);if(!c)return 0;
     if(!ok(cudaSetDevice(device),"select drain device"))return 0;
-    return ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
+    return ok(cudaStreamSynchronize(c->aux),"aux drain")&&ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
 }
 
 static int bank_upload_stream(Dsv4CudaExpertSet*set,int e,

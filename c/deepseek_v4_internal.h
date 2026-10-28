@@ -1140,6 +1140,8 @@ int coli_v4_expert_store_cached(ColiExpertStore *store, ColiExpertKey key);
 /* Decode uploader threads (one per card): queue a missed expert's upload,
  * join before computing; the view stays in place until the join. */
 int coli_v4_upload_threads_enabled(void);
+/* V4_UPLOAD_FENCE: queued uploads are enqueue-only, the expert group fences on the device */
+int coli_v4_upload_fence_on(ColiExpertStore *store);
 /* DSV4_DECODE_PROF: the decode attention's stages, per token across layers. */
 extern double g_v4_ap_qa, g_v4_ap_comp, g_v4_ap_qb, g_v4_ap_kv, g_v4_ap_sattn, g_v4_ap_wo;
 extern double g_v4_ap_comp_c, g_v4_ap_comp_a;

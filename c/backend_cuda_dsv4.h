@@ -107,6 +107,8 @@ int dsv4_cuda_device_count(void);
  * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
  * success, 0 when the backend is unavailable. */
 int dsv4_cuda_stream_drain(int device);
+/* the expert group orders itself after the aux-stream uploads (decode uploader threads); 1 when supported */
+int dsv4_cuda_group_fence(int device);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,

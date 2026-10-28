@@ -515,7 +515,41 @@ parity had two causes that are now fixed or understood.
    token at 688 mirrors: 131 misses × 12.75 MiB, ≈150 ms on a gen4 x8 link)
    and the same bytes off the two NVMe, so each further mirror pays in
    proportion; the 6.3 GB of dense/attention mirrors on the primary are the
-   remaining VRAM to trade.
+   remaining VRAM to trade. (Moving the attention mirrors to the second
+   card is not a lever: its VRAM is already full of expert mirrors, and the
+   two cards behave as one LRU over their sum.)
+
+Third measurement (2026-10-28, later): what was left per decode layer after
+the reads was a host-side tail — the join on the last expert's upload and a
+~1.1 ms expert-group round trip. `DSV4_MOE_KPROF` showed the group's
+*kernels* were the 1.1 ms: `mv_fp4_grouped` / `mv<8>` read one byte per
+lane per step and decode through table lookups, ~15 % of the card's
+bandwidth for the ~100 MB a layer's six experts plus the shared expert
+weigh. Two changes:
+
+1. `V4_UPLOAD_FENCE` (on): the uploader threads only enqueue their copies
+   on the card's aux stream; the expert group records an event there and
+   makes its compute stream wait on it (`dsv4_cuda_group_fence`), so the
+   host neither joins the DMA nor launches after it. The group's small
+   copies (x, descriptors + weights in one transfer, y) go through pinned
+   staging (`DSV4_MOE_PINNED`). One card, 36 tokens: MoE 327 → 318 ms/token.
+2. `DSV4_MOE_MV` (on): bandwidth-shaped decode matvecs — one warp per
+   row, 16-byte weight loads, the input vector in padded shared memory,
+   bit-arithmetic fp4/fp8/UE8M0 decode, shuffle reduction. Group kernels
+   1.14 → 0.29 ms per layer on the 5080 (0.71 → 0.40 on the 3080). Its
+   summation order differs from the old kernels: `DSV4_MOE_MV_VERIFY=1`
+   compares every fused call against them (36 tokens: max |Δ| 0.0625 = one
+   bf16 ulp at the output's magnitude, 0.1 % of elements one ulp off); the
+   36-token greedy texts are unchanged on both configurations, the
+   300-token ones differ as any reordering does.
+
+   Steady state (last 100 of 300 tokens, 3.3k context, `--ram 16`): one
+   card **376 → 327 ms/token** (MoE 294 → 246), two cards **331 → 306**
+   (MoE 249 → 226); 300 tokens after the first: 131.4 → 117.2 s and
+   120.0 → 111.6 s. What remains per layer on two cards (~5.2 ms of MoE):
+   reads 2.7 (NVMe-bound: the 9100 PRO on C: and the 990 PRO on D: read
+   6.4 and 5.4 GB/s here, 10 GB/s striped), upload tail 1.1, group 1.0
+   (0.17 ms of kernels; the rest is the WDDM round trip), shared 0.25.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
@@ -523,6 +557,8 @@ Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 vs CPU, bitwise: `idxproj`, `idxverify`, `idxfused`), `DSV4_IDX_KPROF=1`
 (device time per stage of the fused selection), `DSV4_WO_VERIFY=1` /
 `DSV4_WO_KPROF=1` (the decode attention tail chain: bitwise check, stage times),
+`DSV4_MOE_KPROF=1` / `DSV4_MOE_MV_VERIFY=1` (the decode expert group: kernel
+time vs host wall per card, the new matvecs vs the old in bf16 ulps),
 `V4_PREFIX_LOG=1` (checkpoint/hint decisions), `v4_mirror` per-drive I/O
 telemetry after each request.
 
@@ -636,6 +672,11 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DEV2_EARLY` (1) | with a second card, launch its expert group at routing time (its experts are resident there, nothing to read) and join it after this layer's reads and uploads; `0` = launch it at the partition, after them (measured: +22 ms/token at 3.3k context) |
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
+| `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
+| `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
+| `DSV4_MOE_MV` (1, `.cu`) | decode expert group / fused MoE: bandwidth-shaped fp4 and fp8 matvecs (one warp per row, 16-byte loads; kernels 1.14 → 0.29 ms per layer on the 5080); `0` = the byte-per-lane `mv_fp4_grouped` / `mv<8>` kernels (a different summation order) |
+| `DSV4_MOE_MV_VERIFY` (0, `.cu`) | every fused MoE call recomputed through the old kernels and compared (`moemv verify`: max abs diff, bf16-ulp histogram) |
+| `DSV4_MOE_KPROF` (0, `.cu`) | per card: device time of the group's kernels vs the call's host wall (`moekprof`, every 430 calls) |
 | `V4_UPLOAD_THREADS` (1) | decode attach on one uploader thread per card (aux-stream copies, joined before compute); `0` = attach inline from the lane loop |
 | `V4_READ_STRIPE` (off) | `1` = read each expert window as two halves from the two mirror replicas at once (Windows overlapped twins). Measured with `COLI_MODEL_MIRROR` on a second NVMe (826-token prompt, 60 tokens): decode 24.2 -> 21.3 s (-12 %), prefill 52.4 -> 44.6 s (-15 %), text identical; needs a real second drive — two copies on one drive gain nothing |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |

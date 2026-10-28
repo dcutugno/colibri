@@ -6341,6 +6341,9 @@ static int moe_token_pipeline(float *output,
     int gpu_compute = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
     int uploads_queued = 0;         /* uploader-thread jobs to join */
+    int uploads_fenced = 0;         /* enqueue-only uploads: the group fences them */
+    int group_synced = 0;           /* a group synced every card's stream */
+    (void)uploads_fenced; (void)group_synced;
 #endif
     if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
                                   weights->plan.layer, selected);
@@ -6438,6 +6441,7 @@ static int moe_token_pipeline(float *output,
         double dpt_j = v4_wait_clock();
         g_v4_dp_attach += dpt_j - dpt_c;
         dpt_c = dpt_j;
+        uploads_fenced = coli_v4_upload_fence_on(store);
     }
     /* The fused path needs every expert on the primary card; decided here,
      * once the uploads (inline or threaded) have landed. */
@@ -6578,6 +6582,7 @@ static int moe_token_pipeline(float *output,
                 for (int i = 0; i < d; i++)
                     output[i] = coli_bf16_round(expert_output[i]);
         }
+        if (!result) group_synced = 1;
         free(gates); free(ups); free(downs);
     } else if (!result && (hybrid_gpu_count > 0 || second_count > 0) &&
                store->gpu) {
@@ -6709,6 +6714,10 @@ static int moe_token_pipeline(float *output,
             if (sec_threaded) pthread_join(sec_thread, NULL);
             if (!sec_job.ok) sec_ok = 0;
         }
+        /* every card that received an upload this layer ran (and synced)
+         * its group: the primary's when gpu_n > 0, the second's late group
+         * when sec_n > 0 (the early group ran before this layer's uploads) */
+        group_synced = (gpu_n == 0 || gpu_ok) && (sec_n == 0 || sec_ok);
         /* Backend failure on a group: the CPU loop above deliberately
          * skipped that card's experts, so compute them here — degrade, don't
          * drop (nor fail the token). */
@@ -6782,7 +6791,8 @@ static int moe_token_pipeline(float *output,
      * fill DMA was still enqueued, drain before releasing the host slabs the
      * copies read from. (The fused kernels sync internally, so this is only
      * ever a wait on already-finished work — never a correctness gamble.) */
-    if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+    if (hybrid_pending_drain || (uploads_fenced && !group_synced))
+        coli_v4_gpu_expert_drain(store);
 #endif
     g_v4_dp_compute += v4_wait_clock() - dpt_c;
     for (int current = 0; views && current < selected; current++)
@@ -12430,8 +12440,10 @@ typedef struct {
     long long (*mem_free_mb)(int);
     int (*device_unified)(int);
     int (*stream_drain)(int);
+    int (*group_fence)(int);   /* optional: 1 when the expert group fences the aux-stream uploads */
 } V4GpuBackendOps;
 extern int dsv4_cuda_stream_drain(int device);
+extern int dsv4_cuda_group_fence(int device);
 
 #ifdef _WIN32
 /* Windows loader: the secondary module (backend_loader_dsv4.c). */
@@ -12450,6 +12462,7 @@ int dsv4_cuda2_expert_group(Dsv4CudaTensor *const *gate,
 long long dsv4_cuda2_mem_free_mb(int device);
 int dsv4_cuda2_device_unified(int device);
 int dsv4_cuda2_stream_drain(int device);
+int dsv4_cuda2_group_fence(int device);
 const char *dsv4_cuda2_backend_name(void);
 #else
 /* One linked backend elsewhere: a second card is usable only when this
@@ -12469,18 +12482,19 @@ static void dsv4_cuda2_shutdown(void) {}
 #define dsv4_cuda2_mem_free_mb dsv4_cuda_mem_free_mb
 #define dsv4_cuda2_device_unified dsv4_cuda_device_unified
 #define dsv4_cuda2_stream_drain dsv4_cuda_stream_drain
+#define dsv4_cuda2_group_fence dsv4_cuda_group_fence
 #define dsv4_cuda2_backend_name dsv4_cuda_backend_name
 #endif
 
 static const V4GpuBackendOps v4_gpu_ops_primary = {
     dsv4_cuda_upload_fp4, dsv4_cuda_tensor_refill_fp4, dsv4_cuda_tensor_free,
     dsv4_cuda_expert_group, dsv4_cuda_mem_free_mb, dsv4_cuda_device_unified,
-    dsv4_cuda_stream_drain
+    dsv4_cuda_stream_drain, dsv4_cuda_group_fence
 };
 static const V4GpuBackendOps v4_gpu_ops_second = {
     dsv4_cuda2_upload_fp4, dsv4_cuda2_tensor_refill_fp4, dsv4_cuda2_tensor_free,
     dsv4_cuda2_expert_group, dsv4_cuda2_mem_free_mb, dsv4_cuda2_device_unified,
-    dsv4_cuda2_stream_drain
+    dsv4_cuda2_stream_drain, dsv4_cuda2_group_fence
 };
 
 struct V4GpuExpertMirrorCache {
@@ -13499,6 +13513,31 @@ int coli_v4_upload_threads_enabled(void) {
     return on;
 }
 
+/* V4_UPLOAD_FENCE (1): the uploader threads only enqueue their copies on
+ * the card's aux stream and return; the expert group orders its kernels
+ * after them on the device (the backend's group_fence) instead of the host
+ * joining the DMA and launching only then (measured: the join and the
+ * launch after it were ~1.5 ms per layer on the decode critical path).
+ * Needs the fence in every backend module in use; without it, or with
+ * V4_UPLOAD_FENCE=0, the uploads are drained as before. */
+static int v4_upload_fence_on(V4GpuExpertMirrorCache *cache) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_UPLOAD_FENCE");
+        int want = !e || !*e || atoi(e) != 0;
+        int fenced = cache != NULL;
+        for (V4GpuExpertMirrorCache *c = cache; c; c = c->next)
+            if (!c->ops->group_fence || !c->ops->group_fence(c->device))
+                fenced = 0;
+        on = want && fenced;
+    }
+    return on;
+}
+int coli_v4_upload_fence_on(ColiExpertStore *store) {
+    if (!store || !store->gpu) return 0;
+    return v4_upload_fence_on((V4GpuExpertMirrorCache *)store->gpu);
+}
+
 static void *v4_uploader_main(void *arg) {
     V4Uploader *u = arg;
     for (;;) {
@@ -13511,9 +13550,12 @@ static void *v4_uploader_main(void *arg) {
         /* sync=2: the backend copies on its aux stream and drains only
          * that, never the compute stream's queued kernels. */
         double t0 = v4_up_clock();
-        int ok = v4_gpu_mirror_place(job.own, job.view, 2, 1) == 0;
+        /* sync 3: enqueue only, the expert group fences (V4_UPLOAD_FENCE) */
+        V4GpuExpertMirrorCache *prim = job.own->second && job.other ? job.other : job.own;
+        int sync = v4_upload_fence_on(prim) ? 3 : 2;
+        int ok = v4_gpu_mirror_place(job.own, job.view, sync, 1) == 0;
         if (!ok && job.other)
-            ok = v4_gpu_mirror_place(job.other, job.view, 2, 1) == 0;
+            ok = v4_gpu_mirror_place(job.other, job.view, sync, 1) == 0;
         double dt = v4_up_clock() - t0;
         pthread_mutex_lock(&u->mutex);
         u->seconds += dt;
