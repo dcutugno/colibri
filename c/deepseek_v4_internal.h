@@ -1025,6 +1025,11 @@ int coli_v4_gpu_indexer_score_batch(
  * weights and keys. prepare uploads a layer's weights at mirror time; select
  * scores tokens x max_count (optional verify downloads of the prepared
  * queries and head weights); keys_reset drops the layer's resident keys. */
+/* n bf16 projection mirrors (keys) over the same inputs in one round trip;
+ * outs[i] gets batch x rows(i). -1 when any mirror is missing. */
+int coli_v4_gpu_bf16_project_multi(
+    const ColiDeepSeekV4LayerWeights *weights, const char *const *keys, int n,
+    float *const *outs, const float *inputs, int batch);
 int coli_v4_gpu_indexer_fused_wanted(void);
 int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights, int device);
 int coli_v4_gpu_indexer_select_fused(

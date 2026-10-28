@@ -2389,8 +2389,23 @@ static int attention_token_impl(float *output,
          * bf16 loop over 8-16 MB per layer: measured 75 ms of a 3.3k-context
          * token's 129 ms of attention went to it and the indexer's. */
         float comp_kv[1024], comp_gate[1024];
+        float idx_kv[256], idx_gate[256];
+        int idx_proj = 0;
         int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
+        int idx_rows = 2 * config->index_head_dim;
+        /* The indexer-compressor's pair rides in the same round trip (one
+         * upload of the input, four launches, one sync) when the layer has
+         * an indexer; a refusal leaves each pair to its own call. */
         if (!result && v4_decode_gpu_proj_on() && comp_rows <= 1024 &&
+            state->indexer && idx_rows <= 256) {
+            static const char *const keys4[4] = {
+                "attn.compressor.wkv", "attn.compressor.wgate",
+                "attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
+            float *const outs4[4] = {comp_kv, comp_gate, idx_kv, idx_gate};
+            if (coli_v4_gpu_bf16_project_multi(weights, keys4, 4, outs4, input, 1) == 0)
+                gpu_proj = idx_proj = 1;
+        }
+        if (!result && !gpu_proj && v4_decode_gpu_proj_on() && comp_rows <= 1024 &&
             coli_v4_gpu_compressor_project_batch(
                 weights, "attn.compressor.wkv", "attn.compressor.wgate",
                 comp_rows, comp_kv, comp_gate, input, 1) == 0)
@@ -2415,13 +2430,12 @@ static int attention_token_impl(float *output,
                  * per-token loops (~6 ms per indexer layer at 3k context). */
                 const float *idx_kv_p = NULL, *idx_gate_p = NULL;
 #ifdef COLI_V4_GPU_TIER
-                float idx_kv[256], idx_gate[256];
-                int idx_rows = 2 * config->index_head_dim;
-                if (v4_decode_gpu_proj_on() && idx_rows <= 256 &&
-                    coli_v4_gpu_compressor_project_batch(
-                        weights, "attn.indexer.compressor.wkv",
-                        "attn.indexer.compressor.wgate", idx_rows,
-                        idx_kv, idx_gate, input, 1) == 0) {
+                if (idx_proj ||
+                    (v4_decode_gpu_proj_on() && idx_rows <= 256 &&
+                     coli_v4_gpu_compressor_project_batch(
+                         weights, "attn.indexer.compressor.wkv",
+                         "attn.indexer.compressor.wgate", idx_rows,
+                         idx_kv, idx_gate, input, 1) == 0)) {
                     idx_kv_p = idx_kv;
                     idx_gate_p = idx_gate;
                 }
@@ -14661,6 +14675,19 @@ int coli_v4_gpu_indexer_score_batch(
     return dsv4_cuda_indexer_score_batch(device, queries, keys, head_w, counts,
                                          tokens, heads, dim, count, scores)
         ? 0 : -1;
+}
+
+int coli_v4_gpu_bf16_project_multi(
+    const ColiDeepSeekV4LayerWeights *weights, const char *const *keys, int n,
+    float *const *outs, const float *inputs, int batch) {
+    Dsv4CudaTensor *ts[8];
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !keys || !outs ||
+        !inputs || n < 1 || n > 8 || batch < 1) return -1;
+    for (int i = 0; i < n; i++) {
+        ts[i] = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, keys[i]);
+        if (!ts[i] || !outs[i]) return -1;
+    }
+    return dsv4_cuda_matmul_bf16_multi(ts, n, inputs, batch, outs) ? 0 : -1;
 }
 
 /* V4_IDX_FUSED (1): the indexer selection as one device round trip over

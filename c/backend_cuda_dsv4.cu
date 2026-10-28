@@ -1757,6 +1757,30 @@ extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int to
            ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"bf16 batch download")&&
            ok(cudaStreamSynchronize(c->stream),"bf16 batch sync");
 }
+/* Several bf16 matmuls over the same x in one round trip: one upload, one
+ * launch each, one download each, one sync. Same kernel as the single call. */
+extern "C" int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens,float*const*ys){
+    if(!ts||!ys||n<1||n>8||!x||tokens<1)return 0;
+    Dev*c=ctx(ts[0]->device);
+    if(!c||!ok(cudaSetDevice(ts[0]->device),"select bf16 multi device"))return 0;
+    size_t xb=(size_t)tokens*ts[0]->I*4,yb=0;
+    for(int i=0;i<n;i++){
+        if(!ts[i]||!ys[i]||ts[i]->fmt!=16||ts[i]->device!=ts[0]->device||ts[i]->I!=ts[0]->I)return 0;
+        yb+=(size_t)tokens*ts[i]->O*4;
+    }
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 multi upload"))return 0;
+    size_t off=0;
+    for(int i=0;i<n;i++){
+        size_t ob=(size_t)tokens*ts[i]->O*4;
+        float*dy=(float*)((char*)c->dy+off);
+        mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
+        if(!ok(cudaGetLastError(),"bf16 multi launch")||
+           !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;
+        off+=ob;
+    }
+    return ok(cudaStreamSynchronize(c->stream),"bf16 multi sync");
+}
 __device__ __forceinline__ int decode_pos(const int *state){return state[1];}
 __device__ __forceinline__ int compression_ready(const int *state,int ratio){return ratio&&decode_pos(state)%ratio==ratio-1;}
 __global__ void rope_heads_dynamic(float*x,int heads,int dim,int rope,const int*state,int delta,int inverse,int predicate,const float*cs,const float*sn){if(predicate&&!compression_ready(state,predicate))return;int pos=decode_pos(state)+delta,p=blockIdx.x*blockDim.x+threadIdx.x,pairs=rope/2;if(p<heads*pairs){int h=p/pairs,k=p%pairs,off=h*dim+dim-rope+2*k;float s=inverse?-sn[(long long)pos*pairs+k]:sn[(long long)pos*pairs+k],u=x[off],v=x[off+1];x[off]=__bfloat162float(__float2bfloat16(u*cs[(long long)pos*pairs+k]-v*s));x[off+1]=__bfloat162float(__float2bfloat16(u*s+v*cs[(long long)pos*pairs+k]));}}
