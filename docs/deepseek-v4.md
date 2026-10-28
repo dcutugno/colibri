@@ -478,6 +478,45 @@ Kept opt-in; it does cut disk traffic by ~30 % if that matters. The lever
 that would pay on such a box is the primary's link — a second card in the
 other CPU slot costs the primary half its lanes (x16 → x8, uploads 2× slower).
 
+Second measurement (2026-10-28, after the decode-attention work): the
+parity had two causes that are now fixed or understood.
+
+1. The second card's group was launched at the partition, after this
+   layer's reads and uploads, so its whole runtime (~1 ms per layer on the
+   3080's generic kernels) sat on the critical path. Its experts are known
+   to be resident there at routing time (nothing to read), so `V4_DEV2_EARLY`
+   (on) launches the group right after routing, on its thread, and joins it
+   once the reads and uploads are done: at 3.3k context, 36 tokens, MoE
+   341 → 319 ms/token.
+2. Long decodes ran the *primary* out of memory after ~50 tokens
+   (`[DSV4 CUDA] weight allocation: out of memory`, `refill ... upload: out
+   of memory`, then `block computation failed`) with 1.2 GB of VRAM still
+   free. The cause is Windows commit charge, not VRAM: the sampled free
+   commit sat at 0.3–0.7 GB for the whole run while the system-managed page
+   file grew from 43 to 77 GB, and the WDDM driver backs device allocations
+   with system commit. The second card's 8.7 GB of mirrors is that much more
+   commit on a 32 GB box. With `--ram 16` (the planner's budget; the RAM
+   expert cache shrinks from 8.6 to 7.5 GiB) 300 tokens ran clean.
+
+   Steady state (last 100 of 300 tokens, 3.3k context, `--ram 16` on both):
+   one card 376 ms/token (MoE 294), two cards **331 ms/token** (MoE 249:
+   reads 160 → 134, join 92 → 82, the second card's ~45 ms of compute
+   hidden under the loads) — **−12 %**. serve.ps1 on the reference box runs
+   `DSV4_CUDA_DEVICE2=auto` with `--ram 16` for this reason.
+
+   Where the rest goes: an expert trace (`V4_EXPERT_TRACE=1`, one line per
+   decode layer with each routed expert's VRAM/RAM state; simulator
+   `tools/v4_expert_cache_sim.py`) over 300 tokens shows the policy is
+   not the lever — LFU with decay equals LRU (52.7 % vs 51.4 % at 688
+   mirrors), a static hot set is worse (44 %) — only capacity is: LRU hits
+   53 % at 688 mirrors, 64 % at 1200, 71 % at 1600, 80 % at 2400; the
+   primary + the second card behave as LRU over their sum (misses 47 → 32 %).
+   Decode is bound by the bytes that cross into the primary (~1.7 GB per
+   token at 688 mirrors: 131 misses × 12.75 MiB, ≈150 ms on a gen4 x8 link)
+   and the same bytes off the two NVMe, so each further mirror pays in
+   proportion; the 6.3 GB of dense/attention mirrors on the primary are the
+   remaining VRAM to trade.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -594,6 +633,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_DSV4_DLL2` | Windows: force the secondary backend DLL file name (default: the other flavour) |
 | `V4_MIRROR_FIRST` (1) | experts already mirrored in VRAM are computed from there without reading the record into host memory (53 % of a 3k-context token's experts measured); `0` = read first, attach after |
 | `V4_SLAB_SHIFT` (1) | a direct expert read stays where its 4 K-aligned window landed in the slab and the views carry the offset, instead of a 12.6 MB memmove per expert (decode 0.62 -> 0.58 s/token); `0` = memmove |
+| `V4_DEV2_EARLY` (1) | with a second card, launch its expert group at routing time (its experts are resident there, nothing to read) and join it after this layer's reads and uploads; `0` = launch it at the partition, after them (measured: +22 ms/token at 3.3k context) |
+| `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_UPLOAD_THREADS` (1) | decode attach on one uploader thread per card (aux-stream copies, joined before compute); `0` = attach inline from the lane loop |
 | `V4_READ_STRIPE` (off) | `1` = read each expert window as two halves from the two mirror replicas at once (Windows overlapped twins). Measured with `COLI_MODEL_MIRROR` on a second NVMe (826-token prompt, 60 tokens): decode 24.2 -> 21.3 s (-12 %), prefill 52.4 -> 44.6 s (-15 %), text identical; needs a real second drive — two copies on one drive gain nothing |

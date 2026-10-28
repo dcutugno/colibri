@@ -5868,6 +5868,17 @@ static void *v4_second_group_thread(void *arg) {
     return NULL;
 }
 
+/* V4_DEV2_EARLY (1): the second card's group launched at routing time, under
+ * this layer's reads and uploads; 0 = launched at the partition, after them. */
+static int v4_dev2_early_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_DEV2_EARLY");
+        on = !e || !*e || atoi(e) != 0;
+    }
+    return on;
+}
+
 /* V4_MIRROR_FIRST=0 restores the old order (host read, then attach). */
 static int mirror_first_enabled(void) {
     static int on = -1;
@@ -6152,6 +6163,25 @@ static int moe_token_pipeline(float *output,
         }
         for (int i = 0; i < selected; i++) g_v4_last_ids[layer][i] = expert_ids[i];
         g_v4_last_n[layer] = selected;
+        /* V4_EXPERT_TRACE=1: the routed set with its VRAM / RAM state at
+         * routing time, one line per layer, for cache-policy simulation. */
+        static int xtrace = -1;
+        if (xtrace < 0) { const char *e = getenv("V4_EXPERT_TRACE"); xtrace = e && *e && *e != '0'; }
+        if (xtrace) {
+            char line[512]; int n = 0;
+            n += snprintf(line + n, sizeof(line) - n, "xtrace layer=%d ids=", layer);
+            for (int i = 0; i < selected && n < 400; i++) {
+                ColiExpertKey key = {layer, expert_ids[i]};
+                int vram = 0, ram = coli_v4_expert_store_cached(store, key) ? 1 : 0;
+#ifdef COLI_V4_GPU_TIER
+                ColiExpertView probe;
+                vram = store->gpu && coli_v4_gpu_expert_resident(store, key, &probe) == 0;
+#endif
+                n += snprintf(line + n, sizeof(line) - n, "%s%d:%d%d", i ? "," : "",
+                              expert_ids[i], vram, ram);
+            }
+            fprintf(stderr, "%s%c", line, 10);
+        }
         /* Prediction for the next MoE layer: the previous token's experts
          * there, minus what is already cached in RAM or mirrored in VRAM. */
         int next = layer + 1;
@@ -6199,6 +6229,54 @@ static int moe_token_pipeline(float *output,
                           weights->plan.layer, selected);
 #ifdef COLI_V4_GPU_TIER
     int mirror_first = !result && store->gpu && mirror_first_enabled();
+    /* V4_DEV2_EARLY: every routed expert's residence is known now; those on
+     * the second card need no read, so its group starts here on its thread
+     * and is joined once this layer's reads and uploads are done (measured
+     * before: launched after them, it added its whole runtime per layer). */
+    V4SecondGroupJob early_job = {0};
+    pthread_t early_thread;
+    int early_started = 0, early_n = 0;
+    void **egates = NULL, **eups = NULL, **edowns = NULL;
+    float *eweights = NULL, *esum = NULL;
+    if (mirror_first && v4_dev2_early_on()) {
+        for (int i = 0; i < selected; i++)
+            if (coli_v4_gpu_expert_resident(
+                    store, (ColiExpertKey){weights->plan.layer, expert_ids[i]},
+                    &rviews[i]) == 0) {
+                resident[i] = 1;
+                if (rviews[i].gpu_second) early_n++;
+            }
+        if (early_n) {
+            egates = malloc((size_t)early_n * sizeof(*egates));
+            eups = malloc((size_t)early_n * sizeof(*eups));
+            edowns = malloc((size_t)early_n * sizeof(*edowns));
+            eweights = malloc((size_t)early_n * sizeof(*eweights));
+            esum = malloc((size_t)d * sizeof(*esum));
+            if (egates && eups && edowns && eweights && esum) {
+                int k = 0;
+                for (int i = 0; i < selected; i++)
+                    if (resident[i] && rviews[i].gpu_second) {
+                        egates[k] = rviews[i].gate.gpu;
+                        eups[k] = rviews[i].up.gpu;
+                        edowns[k] = rviews[i].down.gpu;
+                        eweights[k] = expert_weights[i];
+                        k++;
+                    }
+                early_job = (V4SecondGroupJob){store, egates, eups, edowns,
+                                               eweights, early_n,
+                                               config->swiglu_limit, esum,
+                                               input, 0};
+                if (pthread_create(&early_thread, NULL, v4_second_group_thread,
+                                   &early_job) == 0)
+                    early_started = 1;
+            }
+            if (!early_started) {
+                free(egates); free(eups); free(edowns); free(eweights); free(esum);
+                egates = eups = edowns = NULL; eweights = esum = NULL;
+                early_n = 0;
+            }
+        }
+    }
 #else
     int mirror_first = 0;
 #endif
@@ -6206,6 +6284,7 @@ static int moe_token_pipeline(float *output,
         int preload = selected < dual_loader_lanes()
             ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
+            if (resident[i]) continue;
 #ifdef COLI_V4_GPU_TIER
             if (mirror_first && coli_v4_gpu_expert_resident(
                     store, (ColiExpertKey){weights->plan.layer, expert_ids[i]},
@@ -6327,13 +6406,13 @@ static int moe_token_pipeline(float *output,
 
             int next = current + dual_loader_lanes();
 #ifdef COLI_V4_GPU_TIER
-            if (next < selected && mirror_first &&
+            if (next < selected && !resident[next] && mirror_first &&
                 coli_v4_gpu_expert_resident(
                     store, (ColiExpertKey){weights->plan.layer, expert_ids[next]},
-                    &rviews[next]) == 0) {
+                    &rviews[next]) == 0)
                 resident[next] = 1;
+            if (next < selected && resident[next])
                 next = selected;   /* nothing to read for it */
-            }
 #endif
             if (next < selected) {
                 memset(&jobs[slot], 0, sizeof(jobs[slot]));
@@ -6430,6 +6509,15 @@ static int moe_token_pipeline(float *output,
      * (DSV4_CUDA_DEVICE2 mirrors) and the CPU remainder each contribute a
      * partial sum below. Counted here for the non-hybrid attach path too. */
     int second_count = 0;
+#ifdef COLI_V4_GPU_TIER
+    int early_ok = 0;
+    if (early_started) {
+        pthread_join(early_thread, NULL);
+        early_started = 0;
+        early_ok = early_job.ok;
+        if (!early_ok) early_n = 0;   /* its experts fall to the late group / the CPU */
+    }
+#endif
     if (!result && store->gpu && !gpu_compute) {
         if (!coli_v4_hybrid_enabled()) {
             hybrid_gpu_count = 0;
@@ -6500,7 +6588,7 @@ static int moe_token_pipeline(float *output,
          * is timed to feed the host-bandwidth EMA. A backend failure on the
          * GPU half degrades that subset to the CPU loop instead of failing
          * the token. */
-        int gpu_n = hybrid_gpu_count, sec_n = second_count,
+        int gpu_n = hybrid_gpu_count, sec_n = second_count - early_n,
             cpu_n = selected - hybrid_gpu_count - second_count;
         void **gates = malloc((size_t)(gpu_n ? gpu_n : 1) * sizeof(*gates));
         void **ups = malloc((size_t)(gpu_n ? gpu_n : 1) * sizeof(*ups));
@@ -6515,6 +6603,10 @@ static int moe_token_pipeline(float *output,
         float *sec_weights = malloc((size_t)(sec_n ? sec_n : 1) * sizeof(*sec_weights));
         float *sec_sum = malloc((size_t)d * sizeof(*sec_sum));
         int sec_ok = sec_n > 0 && sgates && sups && sdowns && sec_weights && sec_sum;
+        /* the early group's experts (resident on the second card at routing
+         * time) are covered by it; the late group takes the ones uploaded
+         * there during this layer */
+        int early_covered = early_ok && early_n > 0;
         /* CPU subset FIRST: it computes while the fill DMA enqueued by the
          * q* pass is still in flight. The host bandwidth EMA is measured
          * right here, under bus contention — which is exactly the number the
@@ -6524,7 +6616,9 @@ static int moe_token_pipeline(float *output,
         for (int current = 0; !result && current < selected; current++) {
             int on_gpu = views[current].gate.gpu && views[current].up.gpu &&
                          views[current].down.gpu;
-            if (on_gpu && (views[current].gpu_second ? sec_ok : gpu_ok))
+            if (on_gpu && (views[current].gpu_second
+                               ? (resident[current] && early_covered) || sec_ok
+                               : gpu_ok))
                 continue;   /* covered by its card's group below */
             if (v4_view_ensure_host(store, &views[current])) {
                 result = moe_fail("layer %d: expert %d is only in VRAM and its "
@@ -6574,7 +6668,8 @@ static int moe_token_pipeline(float *output,
             int k = 0;
             for (int i = 0; i < selected; i++)
                 if (views[i].gate.gpu && views[i].up.gpu &&
-                    views[i].down.gpu && views[i].gpu_second) {
+                    views[i].down.gpu && views[i].gpu_second &&
+                    !(resident[i] && early_covered)) {
                     sgates[k] = views[i].gate.gpu;
                     sups[k] = views[i].up.gpu;
                     sdowns[k] = views[i].down.gpu;
@@ -6621,7 +6716,9 @@ static int moe_token_pipeline(float *output,
             if (!(views[current].gate.gpu && views[current].up.gpu &&
                   views[current].down.gpu))
                 continue;   /* already computed by the CPU loop above */
-            if (views[current].gpu_second ? sec_ok : gpu_ok)
+            if (views[current].gpu_second
+                    ? (resident[current] && early_covered) || sec_ok
+                    : gpu_ok)
                 continue;   /* its card's group computed it */
             if (v4_view_ensure_host(store, &views[current])) {
                 result = moe_fail("layer %d: expert %d is only in VRAM and its "
@@ -6642,11 +6739,13 @@ static int moe_token_pipeline(float *output,
             for (int i = 0; i < d; i++) {
                 float acc = output[i];
                 if (gpu_ok) acc += gpu_sum[i];
+                if (early_covered) acc += esum[i];
                 if (sec_ok) acc += sec_sum[i];
                 output[i] = coli_bf16_round(acc + shared_output[i]);
             }
             if (gpu_ok) g_v4_hyb_gpu_n += (unsigned long long)gpu_n;
             if (sec_ok) g_v4_dev2_n += (unsigned long long)sec_n;
+            if (early_covered) g_v4_dev2_n += (unsigned long long)early_n;
             g_v4_hyb_cpu_n += (unsigned long long)cpu_n;
         }
         free(gates); free(ups); free(downs);
@@ -6688,6 +6787,10 @@ static int moe_token_pipeline(float *output,
     g_v4_dp_compute += v4_wait_clock() - dpt_c;
     for (int current = 0; views && current < selected; current++)
         coli_expert_release(store, &views[current]);
+#ifdef COLI_V4_GPU_TIER
+    if (early_started) pthread_join(early_thread, NULL);
+    free(egates); free(eups); free(edowns); free(eweights); free(esum);
+#endif
     free(views);
     free(resident);
     free(rviews);
