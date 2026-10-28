@@ -40,6 +40,21 @@ class FamilyCapabilities:
     # command) and generates nothing. The engine confirms it at start-up with
     # `CAPS decide=1 chat=0`, which is what the gateway routes on.
     decision: bool = False
+    # The numeric logprobs/echo channel (the SUBMIT `logprobs=` key): the engine
+    # emits one ECHO frame per prompt position it read out, position 0 included
+    # (" nan 0"), so the gateway can serve a run that starts at 0 -- which is what
+    # /v1/completions with `echo: true` promises and what a scoring harness reads.
+    # colibri.c, mimo.c and qwen36.c keep that contract. An engine that resumes a
+    # read-out from a live prefix without a pin photo answers it with a hole, and
+    # the gateway refuses that by name rather than shifting every logprob by one
+    # token (engine_pinned_prefix_not_echoed).
+    logprobs_echo: bool = False
+    # The family's SUBMIT header carries the seventh (gbytes) numeric field in front
+    # of the key=value extension keys -- the shape decode_batch.h's coli_submit_parse
+    # reads. The siblings speak a 6-field header (c/qwen36.c takes its keys straight
+    # after top_p), so handing them the extra field puts a bare `0` where their
+    # parser wants `key=value` and the engine answers "bad submit extension".
+    submit_gbytes: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,8 +320,8 @@ def _qwen36_layer_types(config, layers, model_dir):
             kinds = meta.get("layer_types")
             if isinstance(kinds, list) and len(kinds) == layers:
                 return kinds
-    if config.get("model_type") == "qwen3_moe":
-        # Qwen3 MoE (Qwen3-Coder-30B-A3B): every layer is attention, no DeltaNet.
+    if config.get("model_type") in ("qwen3_moe", "qwen3"):
+        # Qwen3 MoE (Qwen3-Coder-30B-A3B) and the dense Qwen3: every layer is attention, no DeltaNet.
         return ["full_attention"] * layers
     interval = config.get("full_attention_interval")
     if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
@@ -324,7 +339,9 @@ def _qwen36_geometry(config, context, _model_dir):
     30 of 40 layers never grow."""
     layers = _required_int(config, "num_hidden_layers", "qwen36")
     kinds = _qwen36_layer_types(config, layers, _model_dir)
-    full = sum(kind == "full_attention" for kind in kinds)
+    # Flint's and Muse Spark's sliding_attention layers keep their rows like the full ones (the
+    # engine's KV is one array per attention layer, the window applied when it reads)
+    full = sum(kind in ("full_attention", "sliding_attention") for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
     if full == layers:
@@ -401,7 +418,7 @@ def _qwen38_geometry(config, context, _model_dir):
     rope = rope if isinstance(rope, dict) else config
     partial = rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0))
     if (isinstance(partial, bool) or not isinstance(partial, (int, float)) or
-            not math.isfinite(partial) or partial <= 0):
+            not math.isfinite(partial) or not 0 < partial <= 1):
         raise ValueError(f"{family}: invalid partial_rotary_factor")
     rotary_dim = int(head_dim * partial)
     if rotary_dim < 1 or rotary_dim > head_dim or rotary_dim % 2:
@@ -1022,7 +1039,10 @@ def _dsv41_expert_inventory(name, size, config, _dtype=None):
     return ((layers + int(match.group(1)), int(match.group(2)), size),)
 
 
-_DSV41_ENGRAM = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+# a table as the checkpoint's two tensors, or a GGUF's one (blk.N.engram_embd, each row its
+# e4m3 then its scales: _gguf_tensor_sizes renames only the experts)
+_DSV41_ENGRAM = re.compile(r"^(?:layers\.(\d+)\.engram\.embed\.(weight|scale)|blk\.(\d+)\.engram_embd\.weight"
+                           r"|per_layer_token_embd\.weight|engram\.embed\.weight)$")   # the published GGUFs': every table in one
 
 
 def _dsv41_resident_inventory(name, size, _config, _dtype=None):
@@ -1344,7 +1364,8 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
-        capabilities=FamilyCapabilities(True, True, False, True),
+        capabilities=FamilyCapabilities(True, True, False, True,
+                                        logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
@@ -1467,7 +1488,13 @@ FAMILIES = (
         # expert and routes nothing.
         # qwen3_moe: Qwen3-Coder-30B-A3B and its REAP prunes, every layer attention,
         # no shared expert (tools/convert_qwen36.py writes their container).
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe"),
+        # qwen3: the dense Qwen3 (0.6B to 32B), qwen3_moe's layers with one MLP each.
+        # flint: Flint (RecursiveSI/flint), qwen3_moe's layers with a sink per head,
+        # sliding-window layers, dense layers in front and sigmoid routing.
+        # muse_spark: Muse Spark Open (its GGUFs, tools/gguf_import.py), Flint's window and
+        # layers without RoPE, residual gates and the experts at their own width.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint",
+                     "muse_spark"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1490,6 +1517,12 @@ FAMILIES = (
                             ("num_experts", 103), ("hidden_size", 2048)),
                            "Qwen3-Coder-REAP-25B-A3B", "25B",
                            model_id="qwen3-coder-reap-25b-a3b-colibri"),
+            DisplayVariant((("num_hidden_layers", 49),
+                            ("num_experts", 256), ("hidden_size", 2048)),
+                           "Flint", "40B", model_id="flint-colibri"),
+            DisplayVariant((("num_hidden_layers", 62),
+                            ("num_experts", 256), ("hidden_size", 8192)),
+                           "Muse-Spark-Open-816B-A42B", "816B", model_id="muse-spark-open-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1506,7 +1539,8 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 16, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True,
+                                        logprobs_echo=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1606,15 +1640,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: the engine links no CUDA/Metal path. Since #1830 a
-        # VK=1 build can put its resident matrices on a Vulkan device
-        # (COLI_VULKAN=1), opt-in and outside the planner, which is why
-        # tests/test_registry_engine_agreement.py does not count VK_OBJ. The
-        # planner must not offer a VRAM tier it cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
-        # tier ... 100% projected expert residency" into `coli plan` for this
-        # model; resource_plan.py:945 is the gate and says the same thing in
-        # words ("a CPU-only engine has no VRAM tier").
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier
+        # (cu_tier.h, COLI_CUDA=1); a build with Vulkan too runs on Vulkan unless
+        # COLI_VULKAN=0. Before that the engine linked no CUDA/Metal path and this
+        # was False: the planner must not offer a VRAM tier it cannot execute
+        # (resource_plan.py's gate, "a CPU-only engine has no VRAM tier").
+        # tests/test_registry_engine_agreement.py holds it to the build rule.
+        supports_accelerator=True,
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
@@ -1660,11 +1692,10 @@ FAMILIES = (
         planner_id="mimo",
         planner_geometry=_mimo_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: mimo.c links no CUDA/Metal backend. Its Vulkan path
-        # (#1830's dense matrices, and the routed experts on the shared Vulkan tier,
-        # vk_tier.c) is opt-in and outside the planner (see deepseek_v41 above for
-        # why the planner must not offer a VRAM tier the engine cannot use).
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier, as
+        # deepseek_v41's above (cu_tier.h); a build with Vulkan too runs on Vulkan
+        # unless COLI_VULKAN=0.
+        supports_accelerator=True,
         expert_inventory=_mimo_expert_inventory,
         resident_inventory=_mimo_resident_inventory,
         config_section="root",
@@ -1672,7 +1703,8 @@ FAMILIES = (
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 16, "CTX"),
         # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
         # as the template has it); no grammars, no audio in or out
-        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True,
+                                        logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         # the engine is driven through the gateway (SERVE); coli run has no mimo
         # branch and would fall through to GLM's binary, as for deepseek_v41
@@ -2053,17 +2085,36 @@ def resolve_model(model_dir):
                           config, family_config, str(model), head)
 
 
+def _gguf_name(resolved):
+    """(name, size label) of a model folder tools/gguf_import.py wrote: the GGUF's own
+    general.name, e.g. ("Qwen3-0.6B", "0.6B"); ("", "") for anything else."""
+    gg = (getattr(resolved, "config", None) or {}).get("colibri_gguf")
+    if not isinstance(gg, dict) or not isinstance(gg.get("name"), str):
+        return "", ""
+    size = gg.get("size")
+    return gg["name"].strip(), size.strip() if isinstance(size, str) else ""
+
+
 def default_model_id(resolved):
     """The API model id for what was actually loaded: its display variant's, if it has
-    one of its own, else the family's."""
+    one of its own; for an imported GGUF that matches no variant, its own name
+    (Qwen3-0.6B: qwen3-0.6b-colibri) rather than a sibling's id; else the family's."""
     family = resolved.descriptor
     config = resolved.family_config
     head = decision_head_of(resolved)
     if head:
         return head.model_id
+    matched = False
     for variant in family.display_variants:
-        if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
-            return variant.model_id
+        if all(config.get(key) == value for key, value in variant.geometry):
+            if variant.model_id:
+                return variant.model_id
+            matched = True
+            break
+    name, _ = _gguf_name(resolved)
+    slug = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")
+    if slug and family.display_variants and not matched:   # one-model families keep their id
+        return slug + "-colibri"
     return family.default_model_id
 
 
@@ -2084,11 +2135,14 @@ def display_for(resolved):
             if all(config.get(key) == value for key, value in geometry):
                 return head.display_name, scale
         return head.display_name, ""
-    if not family.display_variants:
-        return family.display_name, family.display_scale
+    name, size = _gguf_name(resolved)
+    if not family.display_variants:   # an imported GGUF says which model it is (Inkling-Small)
+        return (name, size) if name else (family.display_name, family.display_scale)
     for variant in family.display_variants:
         if all(config.get(key) == value for key, value in variant.geometry):
             return variant.display_name, variant.display_scale
+    if name:   # an imported GGUF: the name its file gives
+        return name, size
     return resolved.model_type, ""
 
 

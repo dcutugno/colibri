@@ -927,21 +927,120 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
 #include "edge_adapter_internal.h"
 #endif
 
+/* The state file named by the setting `env`, or <snap>/<name>. */
+static char *q38_state_path(const char *snap, const char *env, const char *name) {
+    const char *given = getenv(env);
+    char *path = given && *given ? q38_format_alloc("%s", given) : q38_format_alloc("%s/%s", snap, name);
+    if (!path) { fprintf(stderr, "OOM path of %s\n", name); exit(1); }
+    return path;
+}
+
 /* Qwen3.8 routes every transformer layer; the MTP row (index c.layers) is
  * kept only when the head is attached and routes too. Keep the
  * process-global route_trace owner in the CLI/serve model only; segment
  * adapters can coexist in one process and intentionally leave telemetry
  * detached, just like the other range-native engines. */
-static void q38_telemetry_init(const char *snap, const Model *m) {
+static int64_t q38_telemetry_init(const char *snap, const Model *m) {
     rt_init("qwen38", m->c.layers, m->c.experts);
     if (!m->mtp) rt_drop_row(m->c.layers);
-    const char *up = getenv("COLI_USAGE");
-    if (up && *up) snprintf(g_q38_usage, sizeof g_q38_usage, "%s", up);
-    else snprintf(g_q38_usage, sizeof g_q38_usage, "%s/.coli_usage", snap);
+    char *usage = q38_state_path(snap, "COLI_USAGE", ".coli_usage");
+    snprintf(g_q38_usage, sizeof g_q38_usage, "%s", usage);
+    free(usage);
     int64_t h = rt_load(g_q38_usage);
     if (h > 0)
         fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
                 (long long)h, g_q38_usage);
+    return h;   /* 0: no history (no file, or no record for this model) */
+}
+
+/* Creates the draft list (draft_vocab.h) when the head can use one: Q38_MTP_VOCAB is above 0,
+ * Q38_MTP_DUMP is unset (the dump contains the logits of the whole vocabulary), Q38_DRAFT_HEAD
+ * has built no int4 copy of the lm_head, the lm_head has int8 rows on the host and the counts
+ * file is not the file of the expert history, which the counts would replace. It runs after the
+ * trunk is int8 and before COLI_VK_DENSE_HOST releases host copies, so the lm_head rows can stay
+ * on the host. */
+static void q38_vocab_decide(Model *m, const char *snap) {
+    if (!m->mtp) return;
+    int top = q38_env_int_in_range("Q38_MTP_VOCAB", DRAFT_VOCAB_DEFAULT_TOP, 0, m->c.vocab);
+    if (!top || g_q38_mtp_dump) return;
+    if (m->draft_codes) {
+        fprintf(stderr, "[qwen38 MTP] draft vocabulary off: Q38_DRAFT_HEAD=int4 scores the whole "
+                        "vocabulary from its own copy of the lm_head\n");
+        return;
+    }
+    if (!m->lm_head.q8) {
+        fprintf(stderr, "[qwen38 MTP] draft vocabulary: the lm_head has no int8 rows on the host, "
+                        "so the head scores the whole vocabulary (Q38_MTP_VOCAB=0 silences this)\n");
+        return;
+    }
+    char *counts = q38_state_path(snap, "COLI_VOCAB_USAGE", ".coli_vocab");
+    char *usage = q38_state_path(snap, "COLI_USAGE", ".coli_usage");
+    int same = coli_own_same_path(counts, usage);
+    if (same)
+        fprintf(stderr, "[qwen38 MTP] draft vocabulary off, the head scores the whole vocabulary: "
+                        "COLI_VOCAB_USAGE and COLI_USAGE are the same file, %s. Set COLI_VOCAB_USAGE "
+                        "to another file.\n", counts);
+    free(counts);
+    free(usage);
+    if (same) return;
+    if (!(m->draft_vocab = draft_vocab_new(m->c.vocab, top))) { fprintf(stderr, "OOM draft vocabulary\n"); exit(1); }
+}
+
+/* Reads the token counts of the draft list from <snap>/.coli_vocab or COLI_VOCAB_USAGE. */
+static void q38_vocab_init(const char *snap, Model *m) {
+    DraftVocab *v = m->draft_vocab;
+    if (!v) return;
+    char *path = q38_state_path(snap, "COLI_VOCAB_USAGE", ".coli_vocab");
+    fprintf(stderr, "[qwen38 MTP] draft vocabulary: top %d + %d/%d rule + conversation, ",
+            v->top, DRAFT_VOCAB_NEAR_NUM, DRAFT_VOCAB_NEAR_DEN);
+    double tokens; int distinct;
+    switch (draft_vocab_load(v, path)) {
+    case DRAFT_VOCAB_LOADED:
+        draft_vocab_totals(v, &tokens, &distinct);
+        fprintf(stderr, "counts from %s (%.0f tokens, %d distinct)\n", v->path, tokens, distinct);
+        break;
+    case DRAFT_VOCAB_NO_FILE:
+        fprintf(stderr, "no counts file at %s yet\n", v->path);
+        break;
+    case DRAFT_VOCAB_NOT_COUNTS:
+        fprintf(stderr, "%s cannot be read as a counts file\n", v->path);
+        break;
+    case DRAFT_VOCAB_OTHER_SIZE:
+        fprintf(stderr, "%s has counts for another vocabulary size\n", v->path);
+        break;
+    case DRAFT_VOCAB_DAMAGED:
+        draft_vocab_totals(v, &tokens, &distinct);
+        fprintf(stderr, "counts from %s up to a damaged record, after %d records (%.0f tokens, %d distinct)\n",
+                v->path, v->records, tokens, distinct);
+        break;
+    }
+}
+
+static void q38_vocab_save(const Model *m) {
+    DraftVocab *v = m->draft_vocab;
+    if (!v || !rt_save_enabled()) return;
+    double tokens; int distinct;
+    draft_vocab_totals(v, &tokens, &distinct);
+    switch (draft_vocab_save(v)) {
+    case DRAFT_VOCAB_SAVED:
+        fprintf(stderr, "[STATS] %.0f tokens across %d distinct -> %s\n", tokens, distinct, v->path);
+        break;
+    case DRAFT_VOCAB_LEFT_ALONE:
+        fprintf(stderr, "[STATS] no counts are written to %s. Set COLI_VOCAB_USAGE to use another file.\n", v->path);
+        break;
+    case DRAFT_VOCAB_NOT_SAVED:
+        fprintf(stderr, "[STATS] the draft vocabulary counts were not written to %s. Make the directory "
+                        "writable, or point COLI_VOCAB_USAGE at a file that is.\n", v->path);
+        break;
+    }
+}
+
+static void q38_vocab_report(const Model *m, const char *scope) {
+    if (!m->draft_vocab) return;
+    DraftVocabSummary s = draft_vocab_summary(m->draft_vocab);
+    fprintf(stderr, "[qwen38 MTP] %s: draft list %.0f tokens on average, %.1f%% of picks inside, "
+                    "%llu ids appended, %llu rebuilds\n", scope, s.average_list_tokens, s.inside_percent,
+            (unsigned long long)s.appended, (unsigned long long)s.rebuilds);
 }
 
 static int q38_context_total(const Cfg *c, int prompt_tokens, int new_tokens,
@@ -975,8 +1074,8 @@ static void q38_validate_ids(const Cfg *c, const int *ids, int count,
 /* A decode run's speculation (qwen38_core.h, "speculative decoding"): the MTP
  * head's drafts when it is attached, Q38_MTP_DRAFTS of them per verify (1..3,
  * default 2, the depth measured fastest on a Ryzen 8700GE, CPU and Vulkan chain
- * alike, docs/speculative.md; 1 is the verify before it; 0 or auto lets the gate
- * pick); prompt-lookup drafts under
+ * alike, docs/speculative.md, and 1 where q38_mtp_igpu_defaults sets it; 0 or
+ * auto lets the gate pick); prompt-lookup drafts under
  * COLI_LOOKUP=1, up to COLI_LOOKUP_DRAFTS (1..5, default 5); the forced modes
  * the tests use (Q38_MTP_FORCE, COLI_LOOKUP_FORCE), and COLI_SPEC_GATE=0,
  * which drafts every proposal in full. */
@@ -998,7 +1097,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.on = m->mtp;
     sp.force = q38_spec_force_mode("Q38_MTP_FORCE", getenv("Q38_MTP_FORCE"), 3, 0, &sp.force_row);
     const char *depth = getenv("Q38_MTP_DRAFTS");
-    sp.depth = 2;
+    sp.depth = m->mtp_drafts;
     if (depth && *depth) {
         if (!strcmp(depth, "auto") || !strcmp(depth, "0")) sp.depth = 0;
         else if (depth[0] >= '1' && depth[0] <= '3' && !depth[1]) sp.depth = depth[0] - '0';
@@ -1009,6 +1108,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
     spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
+    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", 0);   /* opt-in: measured 1-5% slower on the Vulkan chain at depth 2 */
     if (sp.lookup && prompt && np > 0) {
         sp.hist_cap = np + 256;
         sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));
@@ -1078,6 +1178,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     float *logit = step(m, prompt, np, 0);
     q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
     Q38Spec *sp = &g_q38_run_spec;
+    if (m->draft_vocab) draft_vocab_begin(m->draft_vocab, prompt, np, 0);
     *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
     int len = np;
     for (int s = 0; s < n_new; s++) {
@@ -1096,6 +1197,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
             free(logit); out[len++] = best; break;
         }
         free(logit); out[len++] = best;
+        if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
     }
     q38_spec_end(m, sp);
@@ -1936,6 +2038,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         fprintf(stderr,"[qwen38 prefix] cache disabled for request %s (state snapshot unavailable)\n",q->id);
     if(getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
+    if(m->draft_vocab)draft_vocab_begin(m->draft_vocab,ids,np,reuse);
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -1994,6 +2097,7 @@ static int serve_one(Model *m, ServeReq *q){
          * its own prompt, after the live state's last one, so stepping here
          * would only run a decode pass that prefill repeats. */
         if(s == q->max_tok - 1) break;
+        if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
     q38_spec_end(m, &spec);
@@ -2026,7 +2130,7 @@ static int serve_one(Model *m, ServeReq *q){
     fflush(stdout);
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
-    {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);}
+    {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
     q38_spec_free(&spec);
     return input_eof?-1:0;
 }
@@ -2045,6 +2149,24 @@ static int g_q38_mux_slots = 1;
 static Q38Seq *g_q38_mux_seq;              /* [slots]: the conversations the Model does not hold */
 static Q38PrefixCache *g_q38_mux_prefix;   /* [slots]: their prefix caches */
 static int g_q38_mux_cur;                  /* the slot the Model holds, -1 when every one is parked */
+
+/* The state a serve allocates once it runs: the attention layers' K, V and index keys
+ * at the context for every slot (the MTP head's rows with one), the DeltaNet layers'
+ * state for the slots past the Model's. Pages the RAM does not count until they are
+ * written, which a host pool (the Vulkan tier's, the CUDA chain's) must leave. */
+static size_t q38_state_later(Model *m){
+    const Cfg *c=&m->c;
+    int ctx=m->max_t>0?m->max_t:qwen38_max_ctx();
+    if(ctx>c->max_positions)ctx=c->max_positions;
+    size_t t=(size_t)ctx,kv=0,dn=0;
+    for(int i=0;i<c->layers;i++)
+        if(c->is_attn[i])kv+=t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float);
+        else dn+=((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim+(size_t)c->dn_conv_dim*(c->dn_convk-1))*sizeof(float);
+    int n=g_q38_mux_slots>1?g_q38_mux_slots:1;
+    size_t mtp=q38_layer_rows(m)>c->layers&&n==1?t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float):0;
+    return kv*(size_t)n+dn*(size_t)(n-1)+mtp;
+}
+
 
 typedef struct {
     ServeReq q;
@@ -2288,17 +2410,19 @@ static void q38_vk_tier_start(Model *m, int cap);   /* below: the Vulkan routed-
  * the trunk goes up now, so the tier sees it placed. */
 static void q38_dho_start(Model *m) {
     if(!g_vk_ready)return;
+    g_q38_dho_model=m;
     size_t bytes=0; int n=0,layers=m->c.layers,head=1,dev=(g_vk_chain||g_vk_dense)&&!qt_ready();
     q38c_dho_bound(&layers,&head,&dev);   /* a partial chain: its N layers' matrices only (qwen38_chain.h) */
     q38_dho_each(m,q38_dho_count,&bytes,&n,layers,head);
     if(!coli_vk_dense_host_decide("qwen38",dev,bytes))return;
-    g_q38_dho_model=m;
     g_vk_dense=1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
     bytes=0; n=0;
     /* the full chain fitted: layer by layer, each dropped once all of it is on the device */
     if(!q38c_dho_place(m,&bytes,&n))q38_dho_each(m,q38_dho_drop,&bytes,&n,layers,head);
     q38c_dho_layers();
-    coli_vk_dense_host_placed("qwen38","the embedding (its rows are gathered on the CPU), the vision tower, norms");
+    coli_vk_dense_host_placed("qwen38",m->draft_vocab
+        ? "the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms"
+        : "the embedding (its rows are gathered on the CPU), the vision tower, norms");
 }
 #endif
 
@@ -2321,10 +2445,10 @@ int main(int argc, char **argv) {
             char *arena = NULL; jval *r = json_parse(buf, &arena);
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
-            if (g[0] == '/') snprintf(gp, sizeof gp, "%s", g); else snprintf(gp, sizeof gp, "%s/%s", snap, g);
+            gguf_path_join(gp, sizeof gp, snap, g);
             const char *mt = jstr(r, "mtp");   /* the MTP head's own GGUF (unsloth's mtp-*.gguf), optional */
             char mp[4096] = "";
-            if (mt && *mt) { if (mt[0] == '/') snprintf(mp, sizeof mp, "%s", mt); else snprintf(mp, sizeof mp, "%s/%s", snap, mt); }
+            if (mt && *mt) gguf_path_join(mp, sizeof mp, snap, mt);
             free(arena);
             if (gguf_open(&g_q38gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_q38gg.err); return 1; }
             if (mp[0]) {
@@ -2342,6 +2466,30 @@ int main(int argc, char **argv) {
             g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
             fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                     gp, g_q38gg.n_files, g_q38gg.n_tensors);
+            /* The CUDA chain runs a GGUF whose experts' types its frame computes (their blocks on
+             * the card and in a host pool; Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000: prompt
+             * 209-213 tok/s and decode 49.6-50.8 against the Vulkan chain's 194-197 and 44-51). Any
+             * other GGUF runs on Vulkan in a build with both backends when CUDA was asked for and
+             * COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+            int cuda_blocks = 1;
+#ifdef COLI_CUDA
+            for (int i = 0; i < g_q38gg.n_tensors && cuda_blocks; i++) {
+                if (!strstr(g_q38gg.t[i].name, "_exps.weight")) continue;
+                const int t = g_q38gg.t[i].type;
+                cuda_blocks = cc_moe_block_type(t) && coli_cuda_block_elems(100 + t) > 0;
+            }
+#else
+            cuda_blocks = 0;
+#endif
+            {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+                if (cu && *cu == '1' && !(vk && *vk) && !cuda_blocks) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+                    setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
+                    fprintf(stderr, "[gguf] the CUDA chain's frame does not take every expert type of this GGUF: it runs on "
+                                    "Vulkan, the same card (COLI_VULKAN=0 keeps CUDA, those experts then on the CPU)\n");
+#endif
+                }
+            }
         }
     }
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
@@ -2492,7 +2640,21 @@ int main(int argc, char **argv) {
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
      * copies of the rest come from the same bytes) */
     if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+    /* The MTP head stays on the CPU beside the CUDA chain, and its drafts cost more than they
+     * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
+     * 46-48 tok/s, the head's drafts 42.5-44.7, the prompt 180 against 150 tok/s as the head
+     * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
+    if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+        m.mtp = 0;
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device, "
+                        "the head would run on the CPU; Q38_MTP=1 drafts)\n");
+    }
 #endif
+    if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
+        g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
+        if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
+    }
+    q38_vocab_decide(&m, snap);   /* the draft list or the whole vocabulary, before COLI_VK_DENSE_HOST releases the lm_head rows */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -2501,14 +2663,11 @@ int main(int argc, char **argv) {
     g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
     /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen38_chain.h); the CUDA
      * tier keeps its priority */
-    /* measured on a Radeon 780M: prefill faster, decode slower in either mode, so opt-in
-     * on an integrated GPU (docs/vulkan.md, "The dense chain") */
+    /* measured on a Radeon 780M: prefill faster, decode slower in either mode, so opt-in on an
+     * integrated GPU, and on by default from many compute units (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
-        g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
-    if(g_vk_chain&&g_q38_gguf){   /* the chain uploads the dense matrices in its own formats; a GGUF's are ggml blocks */
-        g_vk_chain=0;
-        fprintf(stderr,"[VK] qwen38: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); the expert tier runs\n");
-    }
+        g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,
+                                        coli_vk_device_igpu_many_cu()?COLI_VK_CHAIN_ON:COLI_VK_CHAIN_OFF);
     if(g_vk_chain&&g_q38_mux_slots>1){
         g_vk_chain=0;
         fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
@@ -2521,11 +2680,12 @@ int main(int argc, char **argv) {
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
-    if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
-        g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
-        if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
-    }
-    q38_telemetry_init(snap, &m);
+    int64_t hist = q38_telemetry_init(snap, &m);
+    if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
+#endif
+    q38_vocab_init(snap, &m);
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
@@ -2549,6 +2709,7 @@ int main(int argc, char **argv) {
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m);
         rt_save(g_q38_usage, 0);
+        q38_vocab_save(&m);
         q38_prefix_cache_release(&m);
         q38_model_free(&m); free_tokenizer(); rt_destroy();
         return 0;
@@ -2573,6 +2734,7 @@ int main(int argc, char **argv) {
         vkt_report("run", m.hits, m.miss);
 #endif
         rt_save(g_q38_usage,0);
+        q38_vocab_save(&m);
         q38_model_free(&m); free(prompt); free(full); json_free(ref_root);
         free(buf); free(arena); free_tokenizer(); rt_destroy(); return 0;
     }
@@ -2643,6 +2805,7 @@ int main(int argc, char **argv) {
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     q38_spec_report(&m, &g_q38_run_spec, "run");
+    q38_vocab_report(&m, "run");
     q38_spec_free(&g_q38_run_spec);
     if (g_q38_mtp_dump) { fclose(g_q38_mtp_dump); g_q38_mtp_dump = NULL; }
     tm_report(&m);
@@ -2660,6 +2823,7 @@ int main(int argc, char **argv) {
     vkt_report("run", m.hits, m.miss);
 #endif
     rt_save(g_q38_usage, 0);
+    q38_vocab_save(&m);
     free(g_last_logit); g_last_logit=NULL;
     q38_model_free(&m); free(out); free(prompt); free(full); json_free(ref_root);
     free(buf); free(arena); free_tokenizer(); rt_destroy();
@@ -2672,6 +2836,11 @@ int main(int argc, char **argv) {
 }
 #endif /* QWEN38_TEST_SERVE */
 #endif /* !QWEN38_NO_MAIN || QWEN38_TEST_SERVE */
+#if defined(QWEN38_NO_MAIN) && !defined(QWEN38_TEST_SERVE)
+/* q38_state_later (above) counts what a serve allocates once it runs; a test build has no
+ * serve, and the tier's start (below) still asks */
+static size_t q38_state_later(Model *m){ (void)m; return 0; }
+#endif
 
 static int q38_u64_mul(uint64_t left,uint64_t right,uint64_t *out){
     if(!out||(right&&left>UINT64_MAX/right))return -1;*out=left*right;return 0;
@@ -2962,6 +3131,28 @@ static int q38_vk_in_ram(void *ctx,int layer,int e){
     int si=lc->by_expert?lc->by_expert[e]:-1;
     return si>=0&&si<lc->n&&lc->slots[si].eid==e;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_q38_vk_slot_bytes;
+static void q38_vk_ram_given(void *ctx,size_t bytes){
+    Model *m=(Model*)ctx;Cfg *c=&m->c;int L=0,was=0,now=0;
+    for(int i=0;m->cache&&i<c->layers;i++)L+=m->cache[i].slots!=NULL;
+    if(L<1||!g_q38_vk_slot_bytes)return;
+    const size_t per=g_q38_vk_slot_bytes*(size_t)L;
+    const int cut=(int)((bytes+per-1)/per);
+    for(int i=0;i<c->layers;i++){
+        LCache *lc=&m->cache[i];
+        if(!lc->slots)continue;
+        int cap=lc->cap-cut;
+        if(cap<c->topk)cap=c->topk;
+        if(cap<lc->n)cap=lc->n;   /* slots filled already stay */
+        if(cap>lc->cap)cap=lc->cap;
+        was=lc->cap;now=cap;lc->cap=cap;
+    }
+    fprintf(stderr,"[VK] qwen38: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes/1073741824.0,now,was);
+}
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
  * bytes as the CPU path has them, through the layer's RAM cache (a slot stays valid
  * until the next load); several at once through the parallel reads. */
@@ -3036,6 +3227,13 @@ static VktFmt q38_vk_native_fmt(Model *m,int begin,int end,size_t *ram_expert){
     }
     return f;
 }
+/* the context the chain's KV mirror will hold: the cache's when it is there, else what a
+ * server allocates at its start (q38_serve_ensure_kv) */
+static int q38_vk_chain_ctx(const Model *m){
+    if(m->max_t>0)return m->max_t;
+    int n=qwen38_max_ctx();
+    return n>m->c.max_positions?m->c.max_positions:n;
+}
 static void q38_vk_tier_start(Model *m,int cap){
     if(!g_vk_ready||qt_ready()){
         if(g_vk_ready&&qt_ready())
@@ -3091,12 +3289,19 @@ static void q38_vk_tier_start(Model *m,int cap){
         else { fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp); fmd=fm; }
         if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
     }
+    g_q38_vk_slot_bytes=ram_expert;
+    int igpu=q38_mtp_igpu_wanted(m,coli_vk_device_igpu_many_cu(),g_vk_chain==COLI_VK_CHAIN_ON);
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
                   .gate_up=f,.down=fd,.act=VKT_ACT_SWIGLU,
                   .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fmd,
+                  .extra_whole=q38c_mtp_planned(m),   /* the head's layer on the device: its experts whole, in the frame */
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
-                  .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
+                  .ram_reserve=q38_vk_tier_ram_reserve(m,cap,ram_expert,igpu),
+                  .ram_floor=q38_vk_tier_ram_reserve(m,c->topk,ram_expert,igpu),.ram_given=q38_vk_ram_given,
+                  .ram_later=q38_state_later(m),
                   .dense_bytes=q38_vk_dense_bytes(m),
+                  .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
+                  .stage=g_vk_chain,   /* the chain stages a prompt chunk's host pool experts */
                   .in_ram=q38_vk_in_ram,.ram_ctx=m,
                   .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch,
                   .layer_gate_up=lgu,.layer_down=ldn};
@@ -3107,8 +3312,9 @@ static void q38_vk_tier_start(Model *m,int cap){
     free(lgu);free(ldn);   /* read during vkt_init only */
     if(!tier_on)return;
     atexit(vkt_shutdown);
+    if(igpu)q38_mtp_igpu_defaults(m);   /* the tier is up and has left room for the cache of the head */
     /* the warm start: the history's hottest experts, read in parallel */
-    int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
+    int all=(c->layers+(m->mtp?1:0))*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
     const char *warm=getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
     int n=warm&&*warm=='0'?0:vkt_plan(pl,pe,all);
@@ -3187,10 +3393,7 @@ static int q38_segment_cache_resize(Model *m,int capacity){
     if(!m||capacity<1)return -1;
     for(int layer=m->range_begin;layer<m->range_end;layer++){
         LCache *cache=&m->cache[layer];
-        if(cache->n)return -1;
-        Slot *slots=(Slot*)calloc((size_t)capacity,sizeof(*slots));
-        if(!slots)return -1;
-        free(cache->slots);cache->slots=slots;cache->cap=capacity;
+        if(cache->n||q38_cache_slots_set(cache,capacity))return -1;
     }
     return 0;
 }

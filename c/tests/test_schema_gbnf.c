@@ -45,7 +45,10 @@ static void number_literals(void){
         {"-999999999999999", "-999999999999999"},
         {"1e-100", "1e-100"}, {"-1e-100", "-1e-100"},
         {"0", "0"}, {"-0", "0"}, {"42.0", "42"}, {"-42", "-42"},
-        {"0.5", "0.5"}, {"-0.5", "-0.5"}
+        {"0.5", "0.5"}, {"-0.5", "-0.5"},
+        /* A fraction is the shortest text that reads back as the same double. */
+        {"0.1", "0.1"}, {"-0.3", "-0.3"}, {"2.675", "2.675"}, {"1.1e-7", "1.1e-07"},
+        {"0.30000000000000004", "0.30000000000000004"}
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++){
         /* Both numeric callers share the formatter. Keep a mixed enum so the
@@ -175,10 +178,23 @@ int main(void){
     /* 6. unsupported schemas -> NULL (fallback), never crash */
     {
         char err[160];
+        CHECK(schema_to_gbnf("{\"const\":1e9999}", err, sizeof err) == NULL);
+        CHECK(schema_to_gbnf("{\"enum\":[1,-1e9999]}", err, sizeof err) == NULL);
         CHECK(schema_to_gbnf("{\"oneOf\":[{\"type\":\"string\"}]}", err, sizeof err) == NULL);
         CHECK(schema_to_gbnf("{\"type\":\"string\",\"pattern\":\"a+\"}", err, sizeof err) == NULL);
         CHECK(schema_to_gbnf("{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"},"
                              "\"b\":{\"type\":\"string\"}},\"required\":[\"a\"]}", err, sizeof err) == NULL); /* subset-required */
+        CHECK(schema_to_gbnf("{\"type\":\"array\",\"minItems\":0.5,\"items\":{\"type\":\"string\"}}", err, sizeof err) == NULL);
+        CHECK(schema_to_gbnf("{\"type\":\"array\",\"minItems\":-1,\"items\":{\"type\":\"string\"}}", err, sizeof err) == NULL);
+        CHECK(schema_to_gbnf("{\"type\":\"array\",\"minItems\":true,\"items\":{\"type\":\"string\"}}", err, sizeof err) == NULL);
+        {
+            char *kept = schema_to_gbnf("{\"type\":\"array\",\"minItems\":0,\"items\":{\"type\":\"string\"}}", err, sizeof err);
+            CHECK(kept != NULL);
+            free(kept);
+            kept = schema_to_gbnf("{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"}}", err, sizeof err);
+            CHECK(kept != NULL);
+            free(kept);
+        }
         CHECK(schema_to_gbnf("not json at all {{", err, sizeof err) == NULL
               || 1 /* json.h is permissive; compiler must still fail or produce a parseable grammar */);
     }

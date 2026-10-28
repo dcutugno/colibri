@@ -728,7 +728,10 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan_vram_gb = vram_gb if cuda else 0
         # a Vulkan engine: the plan of a COLI_VULKAN=1 run (the dense weights on the device,
         # the Vulkan line), not the CPU path's
-        plan_env = dict(os.environ, COLI_VULKAN="1") if linkage.get("vulkan") and linkage.get("linked") else None
+        # Ambient COLI_VULKAN must not give a CPU binary a Vulkan plan, and
+        # an explicit CPU selection disables this path even in a VK build.
+        vulkan_active = linkage.get("vulkan") and linkage.get("linked") and gpu_indices != []
+        plan_env = dict(os.environ, COLI_VULKAN="1" if vulkan_active else "0")
         plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=plan_gpus, kv_slots=kv_slots, env=plan_env)
@@ -956,7 +959,7 @@ def run_decision_doctor(model, engine_path, available_memory=None):
             params += count
         needed = params * 4
         available_memory = memory_available() if available_memory is None else available_memory
-        if not available_memory:
+        if available_memory is None:
             status, summary = "warn", "available RAM could not be measured"
         elif needed < available_memory:
             status, summary = "pass", f"{needed / 1e9:.1f} GB of f32 weights fit in RAM"

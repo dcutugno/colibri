@@ -746,7 +746,7 @@ class ClefTinyEndToEnd(unittest.TestCase):
         self.addCleanup(arch.stop)
         engine = Engine(QWEN36, CLEF_CONTAINER, family=family_by_id("qwen36"),
                         env=dict(os.environ, COLI_DENSE_I8="0", OMP_NUM_THREADS="2",
-                                 COLI_NO_OMP_TUNE="1"))
+                                 COLI_NO_OMP_TUNE="1", Q36_KV="f32"))   # ref.json is float32's
         self.engine = engine
         self.addCleanup(engine.process.stdout.close)
         self.addCleanup(engine.close)

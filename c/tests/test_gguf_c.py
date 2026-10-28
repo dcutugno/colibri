@@ -81,6 +81,26 @@ def run(*args):
     return subprocess.run(_wrap([BIN, *args]), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+@unittest.skipUnless(BIN.is_file(), "tests/test_gguf_c is not built")
+class GgufPathJoin(unittest.TestCase):
+    """gguf.json's path: kept when absolute in either system's form, else under the model
+    directory (#2189: a Windows import's "D:\\..." was joined to the directory)."""
+    def test_absolute_paths_are_kept(self):
+        d = "D:\\colibri\\models\\flashnext"
+        for path in ("D:\\models\\m-00001-of-00003.gguf", "d:/models/m.gguf", "\\\\host\\share\\m.gguf",
+                     "\\models\\m.gguf", "/srv/models/m.gguf"):
+            with self.subTest(path=path):
+                p = run("--join", d, path)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(p.stdout.decode().strip(), path)
+
+    def test_relative_paths_join_the_directory(self):
+        for path in ("m.gguf", "src\\m.gguf", "src/m.gguf"):
+            with self.subTest(path=path):
+                p = run("--join", "/models/x", path)
+                self.assertEqual(p.stdout.decode().strip(), "/models/x/" + path)
+
+
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
 @unittest.skipUnless(BIN.is_file(), "tests/test_gguf_c is not built")
 class GgufReader(unittest.TestCase):

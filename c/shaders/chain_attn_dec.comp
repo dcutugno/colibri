@@ -1,0 +1,228 @@
+#version 450
+// chain_attn.comp's attention for a decode's or a verify's few rows (vk_chain.c,
+// vkc_attn_w from VKC_ATTN_DEC_MIN positions), the positions split into blocks of L:
+// chain_attn.comp gives a (head, row) one workgroup that walks every position in turn
+// (Qwen3.6's 16 heads: 16 workgroups for a 24 GiB card, about 160 us a layer at 700
+// positions, a tenth of the decode).
+//   mode 0: workgroup (head h, block b, row s): the block's scores (a subgroup a position,
+//           its lanes over the head dim), their max m and sum l of exp(score - m), and
+//           acc[d] = sum exp(score - m) V[t][d]; m, l and acc into the scratch;
+//   mode 1: workgroup (head h, row s): the blocks joined (the sink's logit with them),
+//           acc / l, times sigmoid(gate) when has_gate, into o.
+//   mode 2: mode 0 for every query head of a KV head at once (workgroup (KV head, block,
+//           row); the pipeline made with GQ, the heads a KV head, and HDQ, the head dim):
+//           each K and V row read once for the GQ heads instead of once a head. Qwen3.6's
+//           eight heads a KV head after an 18K prompt read 74 MB of rows a layer eight times.
+//           K and V four floats a load (vec4 sums: not mode 0's bits; a verify's rows still
+//           get their decode steps' bits, each row its own blocks).
+// The bindings and push constants are chain_attn.comp's (no selection list: the host
+// keeps those there), plus the scratch at binding 7 and mode, L, nb. Each row takes the
+// blocks its own positions choose (dec_len), so a verify's row has its decode step's bits.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int GQ = 1;     // mode 2: query heads a KV head
+layout(constant_id = 1) const int HDQ = 256;  // mode 2: the head dim
+
+layout(std430, binding = 0) readonly buffer QB { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };
+layout(std430, binding = 4) readonly buffer GB { float gt[]; };
+layout(std430, binding = 6) readonly buffer SB { float snk[]; };
+layout(std430, binding = 7) buffer XB { float xs[]; };   // per (row, head, block): m, l, acc[vd]
+layout(std430, binding = 1) readonly buffer KB4 { vec4 kc4[]; };   // mode 2: K and V four floats a load
+layout(std430, binding = 2) readonly buffer VB4 { vec4 vc4[]; };
+layout(std430, binding = 1) readonly buffer KB8 { uvec2 kc8[]; };   // mode 2, KV16: four halves a load
+layout(std430, binding = 2) readonly buffer VB8 { uvec2 vc8[]; };
+vec4 k4(int i) { if (KV16) { uvec2 u = kc8[i]; return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); } return kc4[i]; }
+vec4 v4(int i) { if (KV16) { uvec2 u = vc8[i]; return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); } return vc4[i]; }
+
+layout(push_constant) uniform P {
+    int S, H, KVH, hd, pos_base, cap;
+    int q_off, q_row, q_seg;
+    int g_off, g_row, g_seg, has_gate;
+    int o_off, o_row;
+    int sel_off, sel_row;
+    float scale;
+    int k_off, v_off;
+    int win, ring, vd, kv_pm, sink, sink_off;
+    int mode, L, nb;   // L: the heads the blocks' rule counts (dec_len); nb blocks a row
+} p;
+
+shared float qs[HDQ];
+shared vec4 qv[GQ * HDQ / 4];   // mode 2: the heads' q rows, then the V sums of the position groups
+shared float sc[GQ * 256];
+shared float red[GQ * 64];
+
+// the positions a block takes for a row of n positions, as a decode step of that row alone
+// chooses them (vk_chain.c's attn_dec_len: 64, doubled to 256 at most while there would be
+// more than 1024 blocks for p.L heads, the workgroups of a block: H a head, KVH by KV head)
+int dec_len(int n) {
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && p.L * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    return L;
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups);
+    int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int h = int(gl_WorkGroupID.x);
+    int vd = p.vd, stride = vd + 2;
+    if (p.mode == 0) {
+        int b = int(gl_WorkGroupID.y), s = int(gl_WorkGroupID.z);
+        int kvh = h / (p.H / p.KVH);
+        int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
+        int n = p.pos_base + s + 1 - first, L = dec_len(n);
+        int t0 = b * L, cnt = min(L, n - t0);
+        int xo = ((s * p.H + h) * p.nb + b) * stride;
+        if (cnt <= 0) {   // past the row's positions: an empty block
+            if (tid == 0) { xs[xo] = -3.0e38; xs[xo + 1] = 0.0; }
+            for (int d = tid; d < vd; d += 256) xs[xo + 2 + d] = 0.0;
+            return;
+        }
+        int qb = p.q_off + s * p.q_row + h * p.q_seg;
+        for (int d = tid; d < p.hd; d += 256) qs[d] = q[qb + d];
+        barrier();
+        int kbase = kvh * p.cap;
+        // the block's scores: a subgroup a position, its lanes over the head dim
+        for (int j = sg; j < cnt; j += nsg) {
+            int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
+            int kb = p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * p.hd;
+            float a = 0.0;
+            for (int d = lane; d < p.hd; d += sgs) a += qs[d] * kf(kb + d);
+            a = subgroupAdd(a);
+            if (subgroupElect()) sc[j] = a * p.scale;
+        }
+        barrier();
+        // the block's max and sum: each subgroup's part, then theirs
+        float mx = -3.0e38;
+        for (int j = tid; j < cnt; j += 256) mx = max(mx, sc[j]);
+        mx = subgroupMax(mx);
+        if (subgroupElect()) red[sg] = mx;
+        barrier();
+        float m = red[0];
+        for (int g = 1; g < nsg; g++) m = max(m, red[g]);
+        barrier();
+        float e = 0.0;
+        for (int j = tid; j < cnt; j += 256) { float w = exp(sc[j] - m); sc[j] = w; e += w; }
+        e = subgroupAdd(e);
+        if (subgroupElect()) red[sg] = e;
+        barrier();
+        float l = 0.0;
+        for (int g = 0; g < nsg; g++) l += red[g];
+        // acc[d] = sum_j w_j V[t_j][d]: the threads over d
+        for (int d = tid; d < vd; d += 256) {
+            float acc = 0.0;
+            for (int j = 0; j < cnt; j++) {
+                int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
+                int vb = p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * vd;
+                acc += sc[j] * vf(vb + d);
+            }
+            xs[xo + 2 + d] = acc;
+        }
+        if (tid == 0) { xs[xo] = m; xs[xo + 1] = l; }
+        return;
+    }
+    if (p.mode == 2) {
+        // K and V rows as vec4 (the host's offsets and HDQ multiples of four): a K row over the
+        // subgroup's lanes, its loads issued before the sums; V a vec4 column a thread, the
+        // positions over 256 / (HDQ / 4) groups of threads, their sums added group by group
+        const int NV = HDQ / 4, NG = 256 / NV;
+        int kvh = h, b = int(gl_WorkGroupID.y), s = int(gl_WorkGroupID.z);
+        int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
+        int n = p.pos_base + s + 1 - first, L = dec_len(n);
+        int t0 = b * L, cnt = min(L, n - t0);
+        int xo0 = ((s * p.H + kvh * GQ) * p.nb + b) * stride, xg = p.nb * stride;   // head kvh * GQ + g at xo0 + g * xg
+        if (cnt <= 0) {
+            if (tid < GQ) { xs[xo0 + tid * xg] = -3.0e38; xs[xo0 + tid * xg + 1] = 0.0; }
+            for (int i = tid; i < GQ * HDQ; i += 256) xs[xo0 + (i / HDQ) * xg + 2 + i % HDQ] = 0.0;
+            return;
+        }
+        int qb = p.q_off + s * p.q_row + kvh * GQ * p.q_seg;
+        for (int i = tid; i < GQ * NV; i += 256) {
+            int g = i / NV, c = i - g * NV, o4 = qb + g * p.q_seg + 4 * c;
+            qv[i] = vec4(q[o4], q[o4 + 1], q[o4 + 2], q[o4 + 3]);
+        }
+        barrier();
+        int kbase = kvh * p.cap;
+        for (int j = sg; j < cnt; j += nsg) {
+            int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
+            int kb4 = (p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4;
+            vec4 kk[4];
+            for (int i = 0; i < 4; i++) { int c = lane + i * sgs; kk[i] = c < NV ? k4(kb4 + c) : vec4(0.0); }
+            float a[GQ];
+            for (int g = 0; g < GQ; g++) a[g] = 0.0;
+            for (int i = 0; i < 4; i++) {
+                int c = lane + i * sgs;
+                if (c < NV) for (int g = 0; g < GQ; g++) a[g] += dot(qv[g * NV + c], kk[i]);
+            }
+            for (int g = 0; g < GQ; g++) {
+                float x = subgroupAdd(a[g]);
+                if (subgroupElect()) sc[g * 256 + j] = x * p.scale;
+            }
+        }
+        barrier();
+        float mx[GQ];
+        for (int g = 0; g < GQ; g++) mx[g] = -3.0e38;
+        for (int j = tid; j < cnt; j += 256) for (int g = 0; g < GQ; g++) mx[g] = max(mx[g], sc[g * 256 + j]);
+        for (int g = 0; g < GQ; g++) { float x = subgroupMax(mx[g]); if (subgroupElect()) red[g * 64 + sg] = x; }
+        barrier();
+        float M[GQ];
+        for (int g = 0; g < GQ; g++) { M[g] = red[g * 64]; for (int k = 1; k < nsg; k++) M[g] = max(M[g], red[g * 64 + k]); }
+        barrier();
+        float e[GQ];
+        for (int g = 0; g < GQ; g++) e[g] = 0.0;
+        for (int j = tid; j < cnt; j += 256)
+            for (int g = 0; g < GQ; g++) { float w = exp(sc[g * 256 + j] - M[g]); sc[g * 256 + j] = w; e[g] += w; }
+        for (int g = 0; g < GQ; g++) { float x = subgroupAdd(e[g]); if (subgroupElect()) red[g * 64 + sg] = x; }
+        barrier();
+        int c = tid % NV, grp = tid / NV;
+        vec4 acc[GQ];
+        for (int g = 0; g < GQ; g++) acc[g] = vec4(0.0);
+        for (int j = grp; j < cnt; j += NG) {
+            int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
+            vec4 v = v4((p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4 + c);
+            for (int g = 0; g < GQ; g++) acc[g] += sc[g * 256 + j] * v;
+        }
+        for (int k = NG - 1; k >= 1; k--) {   // the groups' sums into group 0's, the last group first
+            if (grp == k) for (int g = 0; g < GQ; g++) qv[g * NV + c] = k == NG - 1 ? acc[g] : qv[g * NV + c] + acc[g];
+            barrier();
+        }
+        if (grp == 0)
+            for (int g = 0; g < GQ; g++) {
+                vec4 v = NG > 1 ? acc[g] + qv[g * NV + c] : acc[g];
+                int o = xo0 + g * xg + 2 + 4 * c;
+                xs[o] = v.x; xs[o + 1] = v.y; xs[o + 2] = v.z; xs[o + 3] = v.w;
+            }
+        for (int g = tid; g < GQ; g += 256) {
+            float l = 0.0;
+            for (int k = 0; k < nsg; k++) l += red[g * 64 + k];
+            xs[xo0 + g * xg] = M[g]; xs[xo0 + g * xg + 1] = l;
+        }
+        return;
+    }
+    // mode 1: the row's blocks joined
+    int s = int(gl_WorkGroupID.y);
+    int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
+    int n = p.pos_base + s + 1 - first, L = dec_len(n), nb = (n + L - 1) / L;
+    int xo = (s * p.H + h) * p.nb * stride;
+    float M = p.sink != 0 ? snk[p.sink_off + h] : -3.0e38;
+    for (int b = 0; b < nb; b++) M = max(M, xs[xo + b * stride]);
+    float Lt = p.sink != 0 ? exp(snk[p.sink_off + h] - M) : 0.0;
+    for (int b = 0; b < nb; b++) Lt += xs[xo + b * stride + 1] * exp(xs[xo + b * stride] - M);
+    float inv = Lt > 0.0 ? 1.0 / Lt : 0.0;
+    int ob = p.o_off + s * p.o_row + h * vd, gb = p.g_off + s * p.g_row + h * p.g_seg;
+    for (int d = tid; d < vd; d += 256) {
+        float v = 0.0;
+        for (int b = 0; b < nb; b++) v += xs[xo + b * stride + 2 + d] * exp(xs[xo + b * stride] - M);
+        v *= inv;
+        if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[gb + d]));
+        o[ob + d] = v;
+    }
+}

@@ -320,10 +320,10 @@ static const char *k3c_unsupported(const Model *m) {
     if (nbmax > 15) return "more AttnRes blocks than its shader takes";
     return NULL;
 }
-/* a W as k3c_w puts it on the device: its bytes there and its payload */
+/* a W as k3c_w puts it on the device: its bytes there and its payload (a GGUF's blocks too) */
 static void k3c_fit_w(const W *w, size_t *b, size_t *mm) {
     int fmt = k3_vk_dev_fmt(w);
-    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4) || w->O < 1 || w->I < 1) return;
+    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4 || w->gg) || w->O < 1 || w->I < 1) return;
     int gs = fmt == 4 ? w->gs : 0;
     *b += vkc_fit_tensor(fmt, w->I, w->O, gs); *mm += coli_vk_tensor_payload(fmt, w->I, w->O, gs);
 }
@@ -431,7 +431,7 @@ static int k3c_layer_up(K3Chain *ch, Model *m, int i, const char **why) {
         /* kv_b as it is: per head Q key rows then V value rows, the absorption reads it transposed */
         *t = (VkcMla){c->n_heads, c->qk_nope, c->qk_rope, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
                       c->attn_scale, VKC_ROPE_HALF, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                      ch->prm, ch->o_qn[i], ch->o_kn[i]};
+                      ch->prm, ch->o_qn[i], ch->o_kn[i], 0};
         ok = k3c_w(&q->qa, &t->q_a) && k3c_w(&q->qb, &t->q_b) && k3c_w(&q->kva, &t->kv_a) && k3c_w(&q->kvb, &t->kv_b) &&
              k3c_w(&q->o, &t->o) && k3c_w(&q->g, &ch->mg[i]);
     }
@@ -707,7 +707,7 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
     }
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
-            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0, 0}};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], pt, R ? 2 : 1, pb);
             ch->kv_valid[i] = pb;

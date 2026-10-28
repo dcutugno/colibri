@@ -578,8 +578,8 @@ def env_for_engine(a, arch, plan=None):
     # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
         if arch != "deepseek_v4":
-            from resource_plan import physical_cpu_count
-            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+            from resource_plan import team_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
         else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
@@ -604,11 +604,10 @@ def env_for_engine(a, arch, plan=None):
         # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
         # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
         # ONLY working channel was a poisoned system variable (#509's exact shape).
-    # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
-    # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
-    # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
-    # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo"):
+    # --ram reaches engines and gateway planners that consume RAM_GB. kimi_k3
+    # gained a RAM budget in #855; qwen36's gateway turns it into the positional
+    # cache cap, so it must receive the flag even though the engine gets that cap.
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo", "qwen36"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # Expert workers: env_for() wires these for glm; glm53 goes through
@@ -957,8 +956,8 @@ def env_for(a):
     # setdefault, so an explicit OMP_NUM_THREADS still wins, and the whole
     # thing stays behind COLI_NO_OMP_TUNE like the rest of the OMP tuning.
     if not e.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        e.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        from resource_plan import team_cpu_count
+        e.setdefault("OMP_NUM_THREADS", str(team_cpu_count()))
     if sys.platform == "win32":
         # COLI_NO_OMP_TUNE spegne SOLO il blocco OMP (stesso perimetro del
         # self-exec di glm.c; presence-based come nel motore: impostarla a
@@ -1294,6 +1293,18 @@ def stream_turn(p, sentinel, on_bytes):
             line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            fields=line.split()
+            # STAT tok tps hit rss prompt_tokens 0 CONTEXT_EXCEEDED [cause]:
+            # the token sits at fields[7] (the PR's "7th token" counts past
+            # the STAT keyword).
+            if len(fields)>=8 and fields[7]=="CONTEXT_EXCEEDED":
+                # #2097: the legacy protocol has no ERROR frame; the engine
+                # refuses an over-context turn with an empty answer plus this
+                # token (and the cause as the next field: PROMPT_TOO_LONG,
+                # HISTORY_FULL, or RENDER_CLIPPED). The chat loop turns it
+                # into the message the user actually sees; older engines send
+                # no cause, hence True as the fallback.
+                st["context_exceeded"]=fields[8] if len(fields)>=9 else True
             if interrupted: st["interrupted"]=True
             return st
         if len(pend)>len(sentinel):
@@ -1331,7 +1342,7 @@ def cmd_info(a):
         info_decision_model(a, resolved, row)
         return
     if os.path.exists(cfgp):
-        c=json.load(open(cfgp))
+        c=json.load(open(cfgp, encoding="utf-8"))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
         # below text_config.  The registry has already resolved that section;
         # using the root here produced a recognized family followed by four
@@ -1677,6 +1688,73 @@ def cmd_tune(a):
               f"{100*a.min_gain:.1f}% gain and safety gates")
     print(f"  profile: {path}\n")
 
+def run_via_gateway(a, family, engine, prompt):
+    """coli run for a family the gateway drives (Qwen3.8 and the others without a one-shot
+    adapter, #2189): the private server coli chat starts, on a free port, one streamed
+    turn printed as it comes, then the server stopped."""
+    import socket, urllib.request, urllib.error
+    from family_registry import default_model_id
+    resolved=resolve_model(a.model); arch=family.id
+    model_id=default_model_id(resolved)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1",0)); port=probe.getsockname()[1]
+    base=f"http://127.0.0.1:{port}"
+    import openai_server
+    cmd=[sys.executable,openai_server.__file__,"--model",a.model,"--engine",engine,"--arch",arch,
+         "--model-id",model_id,"--host","127.0.0.1","--port",str(port),"--max-tokens",str(serve_max_tokens(a))]
+    if a.cap is not None: cmd+=["--cap",str(a.cap)]
+    p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+    try:
+        sp=Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading")
+            if server_probe(base,timeout=1.0): break
+            time.sleep(1)
+        else:
+            sp.stop(); sys.exit(f"timed out loading {model_id}")
+        sp.stop()
+        request={"model":model_id,"messages":[{"role":"user","content":prompt}],"stream":True,
+                 "max_tokens":ngen_for(a,interactive=True,family=family)}
+        if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF: request["enable_thinking"]=False
+        req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps(request).encode(),
+                                   headers={"Content-Type":"application/json"})
+        think_open=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    if line[6:]=="[DONE]": break
+                    try: ev=json.loads(line[6:])
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        rtxt=d.get("reasoning_content")
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
+                            if not think_open: think_open=True; sys.stdout.write(C.dim)
+                            sys.stdout.write(rtxt); sys.stdout.flush()
+                        txt=d.get("content")
+                        if txt:
+                            if think_open: think_open=False; sys.stdout.write(C.r+"\n")
+                            sys.stdout.write(txt); sys.stdout.flush()
+                else:
+                    sys.exit("\nthe server closed the generation stream before completion")
+        except KeyboardInterrupt:
+            pass
+        except urllib.error.HTTPError as e:
+            try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+            except Exception: detail=""
+            sys.exit(f"\n{C.yel}the server rejected the request: HTTP {e.code}{C.r} {detail}")
+        sys.stdout.write((C.r if think_open else "")+"\n"); sys.stdout.flush()
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -1690,6 +1768,8 @@ def cmd_run(a):
     if family.modality=="decision":
         sys.exit(decision_refusal(family))
     if not family.has_cli_adapter:
+        if family.has_gateway_adapter:
+            return run_via_gateway(a, family, engine, prompt)
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
     if arch=="deepseek_v4":
@@ -1765,6 +1845,26 @@ def server_probe(base, api_key=None, timeout=1.5):
         return data[0]["id"] if data else None
     except Exception:
         return None
+
+def server_restarting(base, api_key=None, timeout=1.5):
+    """Is the coli serve at `base` starting its engine again? Its /health answers 503
+    "restarting" while it does (openai_server.keep_engine, #2290): server_probe sees no
+    server then, and a chat must wait for this one rather than start a second."""
+    import urllib.request, urllib.error
+    req=urllib.request.Request(base.rstrip("/")+"/health")
+    if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        urllib.request.urlopen(req, timeout=timeout).close()
+        return False
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code==503 and json.loads(e.read().decode("utf-8","replace")).get("status")=="restarting"
+        except Exception:
+            return False
+        finally:
+            e.close()
+    except Exception:
+        return False
 
 # ---- generation statistics for the chat footer (#1475) ----------------------
 # Measurement and rendering apart: gen_stats() counts (exact completion tokens
@@ -2170,8 +2270,8 @@ IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
 # un apostrofo -- cioe' su una frase italiana su due.
 _ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
 # a drive with either slash (Python on MSYS2 and many Windows tools write C:/...), never a
-# letter inside a word ("Nota:/tmp/x.png" is /tmp/x.png)
-_IMAGE_PATH_START = r"(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/]|~?/|\./)"
+# letter or slash inside a word ("Nota:/tmp/x.png" is /tmp/x.png, "WebP/AVIF" is prose)
+_IMAGE_PATH_START = r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|~?/|\./)"
 IMAGE_PATH = re.compile(
     r'"' + _IMAGE_PATH_START + r'[^"\n]*\.(?:' + _ESTENSIONI + r')"'
     + r"|'" + _IMAGE_PATH_START + r"[^'\n]*\.(?:" + _ESTENSIONI + r")'"
@@ -2764,6 +2864,13 @@ def cmd_chat(a):
     if not getattr(a,"no_attach",False):
         base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
         mid=server_probe(base, getattr(a,"api_key",None))
+        if not mid and server_restarting(base, getattr(a,"api_key",None)):
+            sp=Spinner(f"{base} is starting its engine again…"); sp.start()
+            try:
+                while not mid and server_restarting(base, getattr(a,"api_key",None)):
+                    time.sleep(1); mid=server_probe(base, getattr(a,"api_key",None))
+            finally:
+                sp.stop()
         if mid:
             entry=server_model_entry(base, getattr(a,"api_key",None))
             serves_images="image_generation" in (entry.get("capabilities") or [])
@@ -2970,6 +3077,23 @@ def cmd_chat(a):
             if not raw: md.close()
             sp2.stop()
             if st is None: engine_diag(p, errlog); break
+            if st.get("context_exceeded"):
+                # #2097: the turn was refused, not answered. An empty answer
+                # here used to read as the model going silent, with the reason
+                # only in the engine's stderr, which this client drains to a
+                # temporary log and never shows. Say why, and what fixes it.
+                cause=st["context_exceeded"]
+                if cause=="HISTORY_FULL":
+                    why="the conversation history no longer fits the context"
+                    hint="type :reset to clear it and continue"
+                elif cause=="RENDER_CLIPPED":
+                    why="the prompt text exceeded the 64KB render buffer and was clipped"
+                    hint="paste it in shorter chunks"
+                else:  # PROMPT_TOO_LONG, or an older engine with no cause token
+                    why="this turn does not fit the context"
+                    hint="shorten the prompt or raise CTX (:reset only clears history)"
+                print(f"  {C.yel}[context is full: {why}; {hint}]{C.r}\n")
+                continue
             el=time.time()-t0
             if st.get("tok") and chat_stats_mode(a) == "off":
                 if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
@@ -3088,7 +3212,8 @@ def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
     try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
     except StopIteration: return False
-    if coli_i+1>=len(argv) or argv[coli_i+1]!="serve":
+    # `coli web` is a serve too, and the one `coli start` runs
+    if coli_i+1>=len(argv) or argv[coli_i+1] not in ("serve","web"):
         return False
     configured=8000
     for i,arg in enumerate(argv[coli_i+2:], start=coli_i+2):
@@ -3133,8 +3258,15 @@ def cmd_serve(a):
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    pidfile=serve_pidfile(a.port)
+    # A serve already on this port gets its pidfile back when this one ends (at once,
+    # the port being taken), or coli stop and coli status lose track of it.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        with open(pidfile) as f: owner=f.read()
+        if not _pid_alive(int(owner.split()[0])): owner=None
+    except (OSError,ValueError,IndexError): owner=None
+    try:
+        with open(pidfile,"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     # and the stop request `coli stop` leaves when it cannot end this process itself.
     # The watcher ends with the serve: left running in a process that goes on (a test
@@ -3169,7 +3301,11 @@ def cmd_serve(a):
               family=family)
     finally:
         served.set()
-        try: os.unlink(serve_pidfile(a.port))
+        try:
+            with open(pidfile) as f: ours=f.read().split()[:1]==[str(os.getpid())]
+            if ours and owner:
+                with open(pidfile,"w") as f: f.write(owner)
+            elif ours: os.unlink(pidfile)
         except OSError: pass
 
 def _proc_state(pid):
@@ -3234,12 +3370,16 @@ def cmd_cluster_worker(a):
     stop_heartbeat=threading.Event()
     if coordinator:
         from cluster import heartbeat, register
-        register(coordinator, {"node_id":node_id, "host":host, "port":a.port,
-                               "role":"expert", "layers":a.layers})
+        node={"node_id":node_id, "host":host, "port":a.port, "role":"expert", "layers":a.layers}
+        register(coordinator, node)
         def keep_registered():
             while not stop_heartbeat.wait(10):
                 try: heartbeat(coordinator, node_id)
-                except OSError: pass
+                except OSError:
+                    # a restarted coordinator has an empty registry and refuses the
+                    # heartbeat of a node it does not know: register again
+                    try: register(coordinator, node)
+                    except OSError: pass
         threading.Thread(target=keep_registered, name="colibri-cluster-heartbeat", daemon=True).start()
     glm53 = resolve_model(a.model).descriptor.id == "glm53"
     e=env_for_engine(a,"glm53") if glm53 else env_for(a)
@@ -3408,7 +3548,9 @@ def cmd_web(a):
     if not os.path.exists(os.path.join(dist, "index.html")):
         print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
         print("serving the API anyway (the dashboard will 404 until built).")
-    url = f"http://{a.host}:{a.port}/"
+    # A wildcard bind is not an address to connect to (Windows refuses 0.0.0.0).
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
+    url = f"http://{shown}:{a.port}/"
     if not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
@@ -3427,7 +3569,7 @@ def cmd_web(a):
             while True:
                 time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
+                    urllib.request.urlopen(f"{url}health", timeout=5)
                 except OSError:
                     # Say something once, rather than looking hung. A 93-layer K3 load
                     # is 40+ minutes and the user has no way to tell waiting from stuck.

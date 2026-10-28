@@ -85,6 +85,24 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     free(t);
 }
+/* no bus to copy host memory over: the tier keeps the host's step for those experts */
+int coli_cuda_host_register(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
+void coli_cuda_host_unregister(void *p) { (void)p; }
+int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return 0; }
+/* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
+static int fake_block_elems;
+int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
+/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
+static int fake_alloc_fail;
+void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
+void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
+/* an arena's slot: the fake keeps the host bytes as an upload would */
+static int fake_upload_at;
+int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
+    (void)dev; (void)cap; fake_upload_at++;
+    return upload_common(t, w, NULL, fmt, I, O, device, 0);
+}
+size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { return t ? (size_t)t->I * (size_t)t->O : 0; }
 int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {
     if (!t || !w || fake_overwrite_fail) return 0;
     if (fake_upload_hook) fake_upload_hook(t->fmt);
@@ -234,7 +252,7 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
  * device); fake_chain_frames counts the submits. */
 #include "../cuda_chain.h"
 struct CcBuf { int kind; size_t bytes; float *d; };
-static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops;
+static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
 static size_t fake_chain_dev_bytes;
 static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
 static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
@@ -267,7 +285,9 @@ static int fcc_submit(int wait) {
 static int fcc_finish(void) { return fcc_ready(); }
 static int fcc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     if (!fcc_ready() || !dst || !src || (doff + n) * 4 > dst->bytes || (soff + n) * 4 > src->bytes) return 0;
-    memmove(dst->d + doff, src->d + soff, n * 4); fake_chain_ops++; return 1;
+    memmove(dst->d + doff, src->d + soff, n * 4); fake_chain_ops++;
+    if (dst->kind == CC_DOWN) fake_chain_down_copies++;
+    return 1;
 }
 static int fcc_zero(CcBuf *dst, size_t off, size_t n) {
     if (!fcc_ready() || !dst || (off + n) * 4 > dst->bytes) return 0;
@@ -541,13 +561,138 @@ static int fcc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated
     }
     return 1;
 }
+static int fcc_route(CcBuf *logits, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p) {
+    if (!fcc_ready() || !logits || !ids || !w || !p || p->E > CC_ROUTE_EMAX || p->K > CC_ROUTE_KMAX) return 0;
+    fake_chain_ops++;
+    float sc[CC_ROUTE_EMAX];
+    for (int s = 0; s < p->S; s++) {
+        const float *lr = logits->d + p->l_off + s * p->l_row;
+        float m = -3.4e38f, sum = 0.f;
+        for (int e = 0; e < p->E; e++) {
+            float v = (lr[e] + (p->has_bias == 2 && bias ? bias->d[p->b_off + e] : 0.f)) / p->temp;
+            sc[e] = v; if (v > m) m = v;
+        }
+        if (p->kind == 0) {
+            double ds = 0;
+            for (int e = 0; e < p->E; e++) { sc[e] = expf(sc[e] - m); ds += sc[e]; }
+            for (int e = 0; e < p->E; e++) sc[e] = (float)(sc[e] / ds);
+        } else for (int e = 0; e < p->E; e++) sc[e] = fcc_sig(sc[e]);
+        int *ir = (int *)ids->d + p->i_off + s * p->i_row;
+        float *wr = w->d + p->w_off + s * p->w_row;
+        for (int k = 0; k < p->K; k++) {
+            int be = -1; float bv = -3.4e38f;
+            for (int e = 0; e < p->E; e++) {
+                int used = 0; for (int j = 0; j < k; j++) used |= ir[j] == e;
+                float pk = sc[e] + (p->has_bias == 1 && bias ? bias->d[p->b_off + e] : 0.f);
+                if (!used && pk > bv) { bv = pk; be = e; }
+            }
+            ir[k] = be; sum += be >= 0 ? sc[be] : 0.f;
+        }
+        float div = sum + p->norm_eps; int nrm = (p->norm == 1 || (p->norm == 2 && p->K > 1)) && div > 0.f;
+        for (int k = 0; k < p->K; k++) wr[k] = (ir[k] >= 0 ? (nrm ? sc[ir[k]] / div : sc[ir[k]]) : 0.f) * p->scale;
+    }
+    return 1;
+}
+static int fcc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
+    if (!fcc_ready() || !tab || !ids || !w || !hid || !y || !p || p->fmt != 1) return 0;
+    fake_chain_ops++;
+    const CcExpert *tb = (const CcExpert *)tab->d + p->t_off;
+    const int *id = (const int *)ids->d;
+    float *hd = hid->d + (size_t)p->S * p->K * p->I;
+    if (p->parts & 1) {
+        if (!x) return 0;
+        for (int s = 0; s < p->S; s++) {
+            const float *xr = x->d + p->x_off + s * p->x_row;
+            for (int k = 0; k < p->K; k++) {
+                int e = id[p->i_off + s * p->i_row + k];
+                float *h = hid->d + ((size_t)s * p->K + k) * p->I, *dn = hd + ((size_t)s * p->K + k) * p->D;
+                if (e < 0 || e >= p->E || !tb[e].g) { memset(dn, 0, (size_t)p->D * 4); continue; }
+                const int8_t *gw = (const int8_t *)tb[e].g, *uw = (const int8_t *)tb[e].u, *dw = (const int8_t *)tb[e].d;
+                for (int o = 0; o < p->I; o++) {
+                    float ga = 0.f, ua = 0.f;
+                    for (int i = 0; i < p->D; i++) { ga += xr[i] * gw[(size_t)o * p->D + i]; ua += xr[i] * uw[(size_t)o * p->D + i]; }
+                    ga *= tb[e].gs[o]; ua *= tb[e].us[o]; h[o] = ga * fcc_sig(ga) * ua;
+                }
+                for (int o = 0; o < p->D; o++) {
+                    float a = 0.f; for (int i = 0; i < p->I; i++) a += h[i] * dw[(size_t)o * p->I + i];
+                    dn[o] = a * tb[e].ds[o];
+                }
+            }
+        }
+    }
+    if (p->parts & 2) {
+        for (int s = 0; s < p->S; s++) {
+            float *yr = y->d + p->y_off + s * p->y_row;
+            if (p->h_off >= 0 && hy) memcpy(yr, hy->d + p->h_off + s * p->D, (size_t)p->D * 4);
+            else memset(yr, 0, (size_t)p->D * 4);
+            for (int k = 0; k < p->K; k++) {
+                int e = id[p->i_off + s * p->i_row + k];
+                if (e < 0 || e >= p->E || !tb[e].g) continue;
+                float wk = w->d[p->w_off + s * p->w_row + k];
+                const float *dn = hd + ((size_t)s * p->K + k) * p->D;
+                for (int d = 0; d < p->D; d++) yr[d] += wk * dn[d];
+            }
+        }
+    }
+    return 1;
+}
+static int fcc_signal(CcBuf *flag, size_t word, unsigned v) {
+    if (!fcc_ready() || !flag || (word + 1) * 4 > flag->bytes) return 0;
+    ((unsigned *)flag->d)[word] = v; fake_chain_ops++; return 1;
+}
+static int (*fake_wait_hook)(unsigned v);   /* the host's answer, where a device would wait for it */
+static int fcc_wait_host(CcBuf *flag, size_t word, unsigned v) {
+    if (!fcc_ready() || !flag || (word + 1) * 4 > flag->bytes) return 0;
+    if (fake_wait_hook && !fake_wait_hook(v)) return 0;
+    fake_chain_ops++; return 1;
+}
+static int fcc_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs) {
+    if (!t || !t->w || !t->sc) return 0;
+    *w = t->w; *sc = t->sc; if (gs) *gs = t->gs; return 1;
+}
+static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
+    if (!fcc_ready() || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
+    fake_chain_ops++;
+    const float *lg = logits->d;
+    int best = 0;
+    for (int i = 1; i < n; i++) if (lg[i] > lg[best]) best = i;
+    float z = 0.f, mx = lg[best];
+    for (int i = 0; i < n; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+    ((int *)out->d)[0] = best;
+    out->d[1] = z > 0.f ? 1.f / z : 0.f;
+    return 1;
+}
+static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
+    if (!fcc_ready() || !t || !ids || !x || !y || n < 1 || !t->w || (t->fmt != 0 && t->fmt != 1)) return 0;
+    if ((size_t)t->I * 4 > x->bytes || (size_t)n * 4 > ids->bytes || (size_t)n * 4 > y->bytes) return 0;
+    fake_chain_ops++;
+    const int *id = (const int *)ids->d;
+    for (int j = 0; j < n; j++) {
+        int o = id[j];
+        if (o < 0 || o >= t->O) { y->d[j] = -INFINITY; continue; }
+        float a = 0.f;
+        if (t->fmt == 1 && t->sc) {
+            const int8_t *w = (const int8_t *)t->w + (size_t)o * t->I;
+            for (int i = 0; i < t->I; i++) a += x->d[i] * (float)w[i];
+            y->d[j] = a * t->sc[o];
+        } else if (t->fmt == 0) {
+            const float *w = (const float *)t->w + (size_t)o * t->I;
+            for (int i = 0; i < t->I; i++) a += x->d[i] * w[i];
+            y->d[j] = a;
+        } else return 0;
+    }
+    return 1;
+}
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
-static const ColiCudaChainOps fake_chain_table = {
-    sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
+static ColiCudaChainOps fake_chain_table = {
+    CC_OPS_BASE_SIZE /* no routed experts in the frame by default: the engines' host step */, fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
     fcc_buf, fcc_free, fcc_reserve, fcc_ptr, fcc_bytes, fcc_begin, fcc_submit, fcc_finish,
     fcc_copy, fcc_zero, fcc_copy_regions, fcc_write, fcc_read,
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
     fcc_qsa, fcc_ple,
+    fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    fcc_pick, fcc_matmul_rows,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

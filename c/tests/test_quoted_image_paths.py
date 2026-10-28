@@ -78,6 +78,13 @@ class QuotedImagePathsTest(unittest.TestCase):
         text = "Guarda com'è questa frase senza immagini"
         self.assertEqual(self.namespace["message_with_images"](text), text)
 
+    def test_slash_inside_a_word_does_not_start_a_path(self):
+        for text in ("Is WebP/AVIF smaller than a .png for icons",
+                     "TCP/IP diagram.png please"):
+            with self.subTest(text=text):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(self.namespace["message_with_images"](text), text)
+
     def test_multiple_images_still_rejected(self):
         paths = [self.folder / name for name in ("one.png", "two.png")]
         for path in paths:

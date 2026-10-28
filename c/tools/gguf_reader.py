@@ -187,8 +187,12 @@ def _tensor_bytes(dims, ggml_type):
 
 
 class GGUFReader:
-    def __init__(self, path):
+    def __init__(self, path, header_only=False):
+        """header_only: the file is the header of a model fetched with tools/gguf_header.py
+        (GGUF_CHECK), so the tensor data is legitimately absent: offsets and sizes are still
+        parsed and checked, only "lies inside the file" is not."""
         self.path = path
+        self.header_only = header_only
         self.f = open(path, "rb")
         self.file_size = os.fstat(self.f.fileno()).st_size
         self.version = None
@@ -354,7 +358,7 @@ class GGUFReader:
                 raise GGUFError(
                     "%s: tensor %r: %s" % (self.path, tensor["name"], exc)) from exc
             absolute = self._data_base + tensor["offset"]
-            if absolute + nbytes > self.file_size:
+            if absolute + nbytes > self.file_size and not self.header_only:
                 raise GGUFError(
                     "%s: tensor %r range [%d, %d) exceeds file size %d"
                     % (self.path, tensor["name"], absolute,

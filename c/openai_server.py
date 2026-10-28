@@ -196,6 +196,9 @@ class GenerationScheduler:
         self.queue = collections.deque()
         self.active = 0
         self.closed = False
+        # True while serve() starts a dead engine again (keep_engine): nothing is admitted,
+        # so a request waits in the queue for the new engine instead of failing on the old
+        self.paused = False
         self.admitted = 0
         self.completed = 0
         self.failed = 0
@@ -215,7 +218,7 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if self._available_slot(slot) is None and len(self.queue) >= self.max_queue:
+            if (self.paused or self._available_slot(slot) is None) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -239,7 +242,7 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
-                available = self._available_slot(slot, ticket)
+                available = None if self.paused else self._available_slot(slot, ticket)
                 if available is not None:
                     break
                 self.condition.wait(min(remaining, 0.25))
@@ -264,6 +267,15 @@ class GenerationScheduler:
                 setattr(self, outcome, getattr(self, outcome) + 1)
                 self._observe("slot_duration_seconds", time.monotonic() - admitted_at)
                 self.condition.notify_all()
+
+    def pause(self):
+        with self.condition:
+            self.paused = True
+
+    def resume(self):
+        with self.condition:
+            self.paused = False
+            self.condition.notify_all()
 
     def _available_slot(self, slot, ticket=None):
         # Caller holds the condition lock. Pinned waiters reserve only their
@@ -643,6 +655,10 @@ def _tool_param_types(tools):
         for key, spec in props.items():
             if isinstance(spec, dict):
                 t = spec.get("type")
+                branches = spec.get("anyOf", spec.get("oneOf"))
+                if t is None and isinstance(branches, list):
+                    # pydantic's Optional[str]: {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                    t = [b.get("type") for b in branches if isinstance(b, dict)]
                 if isinstance(t, list):          # {"type": ["string", "null"]}
                     t = next((x for x in t if x != "null"), None)
                 types[key] = t
@@ -805,8 +821,12 @@ def parse_glm_tool_calls_strict(reply, tools):
             cursor = match.end()
         if any(key not in args for key in params.get("required") or []):
             invalid("missing required argument")
+        try:
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            invalid("argument contains a non-finite JSON number")
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                      "function": {"name": name, "arguments": arguments}})
     content, _box_map, _content_map = _tool_call_content_spans(reply, None, False)
     return content, calls
 
@@ -1061,6 +1081,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
     if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
+    if chat_flavor() == "muse":
+        return parse_muse_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
@@ -1076,6 +1098,8 @@ def _tool_stream_markers():
         return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
+    if chat_flavor() == "muse":
+        return (MUSE_ATEM_OPEN,)
     return (BOX_START,)
 
 
@@ -1124,6 +1148,12 @@ def detect_chat_flavor(family_id, model_dir):
         # Qwen3-Coder (qwen3_moe): its own XML tool block, no thinking
         if "interact with a computer to solve tasks" in text:
             return "qwen3_coder"
+        # Flint: GLM's tool-call form, role tokens without separators, no thinking switch
+        if "macro flint_text" in text:
+            return "flint"
+        # Muse Spark: messages to recipients, calls as <atem:function_calls>
+        if "render_valid_recipients" in text:
+            return "muse"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -1299,14 +1329,21 @@ def decode_wav_mono16k(data, param):
     down), sample rate must already be 16 kHz — resampling belongs at the
     capture edge, not in the gateway."""
     import struct as _struct
-    np = _np()
     if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise APIError(400, "Audio must be a RIFF/WAVE file.", param, "invalid_value")
+    end = 8 + _struct.unpack_from("<I", data, 4)[0]
+    if end < 12 or end > len(data):
+        raise APIError(400, "WAV file has an invalid RIFF boundary.", param, "invalid_value")
     pos, fmt, raw = 12, None, None
-    while pos + 8 <= len(data):
+    while pos + 8 <= end:
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
-        if pos + 8 + size > len(data):
+        if pos + 8 + size > end:
             raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
+        # An odd chunk is word-padded, but the pad is optional when the RIFF
+        # size ends on that chunk's body. Python's wave module reads the PCM
+        # in that file. A missing pad earlier still swallows the next header,
+        # so only a chunk that ends on the boundary may omit it.
+        pad = (size & 1) and (pos + 8 + size < end)
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
             if len(body) < 16:
@@ -1314,9 +1351,12 @@ def decode_wav_mono16k(data, param):
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
-        pos += 8 + size + (size & 1)
+        pos += 8 + size + pad
+    if pos != end:
+        raise APIError(400, "WAV file has a truncated chunk header.", param, "invalid_value")
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
+    np = _np()
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
@@ -2057,6 +2097,522 @@ def _qwen3_coder_tool_block(tools):
     return "".join(out)
 
 
+FLINT_ESCAPES = (("\x00", ""), ("<think>", ""), ("</think>", ""),
+                 ("<|begin_of_text|>", "&lt;|begin_of_text|&gt;"), ("<|end_of_text|>", "&lt;|end_of_text|&gt;"),
+                 ("<|system|>", "&lt;|system|&gt;"), ("<|developer|>", "&lt;|developer|&gt;"),
+                 ("<|user|>", "&lt;|user|&gt;"), ("<|assistant|>", "&lt;|assistant|&gt;"),
+                 ("<|observation|>", "&lt;|observation|&gt;"))
+
+
+def _flint_text(text):
+    """The template's flint_text macro: NULs and thinking tags dropped, role tokens escaped."""
+    for old, new in FLINT_ESCAPES:
+        text = text.replace(old, new)
+    return text
+
+
+def _flint_tool_preamble(tools):
+    if not tools:
+        return ""
+    lines = []
+    for position, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+        lines.append(json.dumps(tool.get("function", tool), ensure_ascii=False))
+    # as transformers renders the template (trim_blocks): the declarations one after the
+    # other, with no line between them or around them
+    return ("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>" +
+            "".join(lines) + "</tools>\n\nFor each function call, output the function name and arguments "
+            "within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+            "<arg_value>{arg-value-1}</arg_value>...</tool_call>\n")
+
+
+def render_chat_flint(messages, tools=None, tool_choice=None, add_generation_prompt=True):
+    """Flint's chat_template.jinja (RecursiveSI/flint), byte for byte: role tokens with no
+    separators, the `# Tools` system block after the leading system turns, assistant
+    reasoning as <think>..</think> before the answer, calls as GLM's
+    <tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>, tool results
+    as <|observation|><tool_response>..</tool_response>. The template has no thinking switch:
+    the model decides on each turn whether to write a <think> block. A trailing assistant turn
+    with add_generation_prompt=False stays open, as the template leaves it."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    preamble = _flint_tool_preamble(tools)
+    parts, pending = [], True
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if pending and role != "system":
+            parts.append(preamble)
+            pending = False
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer", "user"):
+            parts.append(f"<|{role}|>" + _flint_text(text))
+        elif role == "tool":
+            parts.append("<|observation|><tool_response>" + _flint_text(text) + "</tool_response>")
+        else:
+            parts.append("<|assistant|>")
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                parts.append(f"<think>{reasoning}</think>")
+            parts.append(text)
+            calls = message.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+            for position, call in enumerate(calls or []):
+                where = f"messages.{index}.tool_calls.{position}"
+                fn = call.get("function", call) if isinstance(call, dict) else None
+                if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                    raise APIError(400, "Each tool call needs a `function.name`.", where)
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        raise APIError(400, "`function.arguments` must be a JSON object.",
+                                       f"{where}.function.arguments")
+                if not isinstance(args, dict):
+                    raise APIError(400, "`function.arguments` must be a JSON object.",
+                                   f"{where}.function.arguments")
+                parts.append("<tool_call>" + fn["name"])
+                for key, value in args.items():
+                    shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    parts.append(f"<arg_key>{key}</arg_key><arg_value>{shown}</arg_value>")
+                parts.append("</tool_call>")
+    if pending:
+        parts.append(preamble)
+    if add_generation_prompt:
+        parts.append("<|assistant|>")
+    return "".join(parts)
+
+
+# ---- Muse Spark (meta-models/Muse-Spark-Open) ---------------------------------------------
+# Every turn is a message <|start|>ROLE<|message|>BODY<|eot|> (or <|eom|> when the same role
+# goes on); the assistant addresses each message to a recipient: "self" for its reasoning,
+# "commentary" for updates between tool calls, "user" for the answer, a function's name for
+# a call written as an <atem:function_calls> block. The prompt ends on <|start|>assistant and
+# the model writes the rest of the header itself (" to=self<|message|>..."). MuseChannels turns
+# that stream into the form the gateway's later stages read: the reasoning between <think>
+# and </think>, the commentary and the answer as text, a call's block as it is, and <|eot|>
+# (a stop sequence) where the turn ends.
+
+MUSE_EFFORT = {"low": 8, "medium": 32, "high": 256, "xhigh": 512}
+MUSE_CUTOFF = "2026-01-04"
+MUSE_ATEM_OPEN, MUSE_ATEM_CLOSE = "<atem:function_calls>", "</atem:function_calls>"
+MUSE_STOP_SEQUENCES = ("<|eot|>", "<|end_of_text|>")
+
+
+def _muse_esc(value):
+    """The template's esc: no special token and no bare media placeholder out of caller text."""
+    if isinstance(value, bool):
+        value = "True" if value else "False"
+    return (str(value).replace("<|", "< |").replace("<image>", "< image>")
+            .replace("<video>", "< video>").replace("<audio>", "< audio>"))
+
+
+def _muse_esc_header(value):
+    return _muse_esc(value).replace("\r", " ").replace("\n", " ")
+
+
+def _muse_esc_attr(value):
+    return (_muse_esc_header(value).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("'", "&#39;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _muse_json(value):
+    """The template's tojson, as transformers defines it: json.dumps with its default separators."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _muse_content(content, where):
+    """render_content: a string, or the text parts of a list, each escaped (the engine takes no
+    image, video or audio for this model)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return _muse_esc(content)
+    if not isinstance(content, list):
+        raise APIError(400, "Message content must be a string or an array of text parts.", where)
+    out = []
+    for index, part in enumerate(content):
+        if not isinstance(part, dict) or part.get("type") not in ("text", "input_text", "output_text"):
+            raise APIError(400, "Colibri currently supports text message content only.",
+                           f"{where}.{index}", "unsupported_content_type")
+        if not isinstance(part.get("text"), str):
+            raise APIError(400, "Text content parts require a string `text` field.", f"{where}.{index}.text")
+        out.append(_muse_esc(part["text"]))
+    return "".join(out)
+
+
+def _muse_fn_line(fn, where):
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        raise APIError(400, "Each tool needs a `function.name`.", where)
+    desc = fn.get("description") or ""
+    params = fn.get("parameters") or {}
+    if fn.get("defer_loading"):
+        desc = _jinja_string(desc) + " [deferred: use tool_search to load full schema]"
+        return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
+                _muse_esc(_muse_json(desc)) + ', "defer_loading": true}')
+    if isinstance(params, dict) and not params:
+        text = '{"type": "object", "properties": {}, "additionalProperties": false}'
+    elif isinstance(params, dict) and "additionalProperties" not in params:
+        text = _muse_json(params)[:-1] + ', "additionalProperties": false}'
+    else:
+        text = _muse_json(params)
+    return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
+            _muse_esc(_muse_json(desc)) + ', "parameters": ' + _muse_esc(text) + '}')
+
+
+def _muse_tool_defs(tools):
+    meta, fns = "", ""
+    for position, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+        if tool.get("type") == "namespace":
+            raise APIError(400, "Namespace tools are not supported with this model; send functions.",
+                           f"tools.{position}", "unsupported_parameter")
+        fn = tool.get("function", tool)
+        if not isinstance(fn, dict):
+            raise APIError(400, "Each tool needs a `function` object.", f"tools.{position}")
+        if not meta:
+            meta = '\n{"name": "", "description": ""}'
+        fns += _muse_fn_line(fn, f"tools.{position}.function")
+    return ("In this environment you have access to a set of tools you can use to answer the user's question.\n\n"
+            'You can invoke a function by writing a "<atem:function_calls>" block like the following as part of your reply to the user:\n'
+            '<atem:function_calls>\n<atem:invoke name="$FUNCTION_NAME">\n<atem:parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\n'
+            "String and scalar parameters should be specified as is, while lists and objects should use JSON format. "
+            "Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n"
+            "Here are the functions available in JSONSchema format:\n"
+            "// Tool metadata" + meta + "\n// Function schemas" + fns + "\n\n"
+            "Here are examples of how to call functions in the tool set. To make parallel tool calls, emit each call as its "
+            "own message (one tool call per message) in consecutive messages, as shown below:\n"
+            "(If the tool namespace is not specified, invoke the function directly as `example_function_name_1` rather than "
+            "`example_tool_name_1.example_function_name_1`)\n\n"
+            "to=example_tool_name_1.example_function_name_1\n\n"
+            '<atem:function_calls>\n<atem:invoke name="example_tool_name_1.example_function_name_1">\n'
+            '<atem:parameter name="example_parameter_1">value_1</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls>\n\n"
+            "to=example_tool_name_2.example_function_name_2\n\n"
+            '<atem:function_calls>\n<atem:invoke name="example_tool_name_2.example_function_name_2">\n'
+            '<atem:parameter name="example_parameter_2">This is the value for the second parameter\nthat can span\n"multiple" lines\n</atem:parameter>\n'
+            '<atem:parameter name="example_parameter_3">value_3</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls>").strip()
+
+
+def _muse_recipients(tools):
+    recipients = ['"self"', '"commentary"']
+    text = ('Use the appropriate recipient for each message:\n\n'
+            '- "self": private reasoning and tool planning.\n'
+            '- "commentary": user-visible intermediate updates while the assistant will continue working, '
+            'including messages sent to the user before or between tool calls.\n')
+    if tools:
+        first = next((t.get("function", t).get("name") for t in tools
+                      if isinstance(t, dict) and t.get("type") != "namespace"), None)
+        if first is not None:
+            recipients.append('"[func_name] (e.g., ' + _muse_esc_header(first) + ')"')
+        text += '- "tool" or "[tool name]": the name of the tool to call.\n'
+    recipients.append('"user"')
+    text += ('- "user": messages that end the assistant turn, such as a completed response or clarification '
+             "question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n")
+    return (text + "\n# Valid recipients: " + ", ".join(recipients) + ".").strip()
+
+
+def _muse_args(call, where):
+    fn = call.get("function", call) if isinstance(call, dict) else None
+    if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+        raise APIError(400, "Each tool call needs a `function.name`.", where)
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+    if not isinstance(args, dict):
+        raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+    return fn["name"], args
+
+
+def _muse_atem(name, args):
+    out = ['<atem:function_calls>\n<atem:invoke name="' + _muse_esc_attr(name) + '">\n']
+    for key, value in args.items():
+        out.append('<atem:parameter name="' + _muse_esc_attr(key) + '">')
+        if isinstance(value, bool):
+            out.append("true" if value else "false")
+        elif value is None:
+            out.append("null")
+        elif isinstance(value, (dict, list, tuple)):
+            out.append(_muse_esc(_muse_json(value)))
+        else:
+            out.append(_muse_esc(value))
+        out.append("</atem:parameter>\n")
+    out.append("</atem:invoke>\n</atem:function_calls>")
+    return "".join(out)
+
+
+def render_chat_muse(messages, enable_thinking=True, reasoning_effort=None, tools=None, tool_choice=None,
+                     add_generation_prompt=True, current_date=None):
+    """Muse Spark's chat_template.jinja (the GGUF's tokenizer.chat_template), byte for byte for
+    text and function tools: the system message the template builds (identity, knowledge cutoff,
+    today's date, the caller's instructions, the tools, the reasoning strength, the recipients),
+    then every turn as a message, the assistant's reasoning to "self", its calls one message
+    each. reasoning_effort low / medium / high / xhigh (the template's default) sets the
+    reasoning strength; the template has no switch to turn reasoning off, so thinking off is
+    the lowest strength. current_date: the date the template's strftime_now gives (today)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    effort = reasoning_effort or "xhigh"
+    if effort in ("minimal", "none") or not enable_thinking:
+        effort = "low"
+    if effort not in MUSE_EFFORT:
+        raise APIError(400, "Muse Spark's reasoning_effort is low, medium, high or xhigh.", "reasoning_effort")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        if message.get("role") not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {message.get('role')!r}.", f"messages.{index}.role")
+    rest, instructions, first = messages, None, 0
+    if messages[0]["role"] in ("system", "developer"):
+        instructions = (_muse_content(messages[0].get("content"), "messages.0.content")
+                        .replace("Reasoning effort", "Reasoning strength").replace("Reasoning Effort", "Reasoning Strength")
+                        .replace("reasoning effort", "reasoning strength").replace("REASONING EFFORT", "REASONING STRENGTH"))
+        rest, first = messages[1:], 1
+    if current_date is None:
+        current_date = time.strftime("%Y-%m-%d")
+    parts = ["You are a helpful AI assistant.", f"Knowledge cutoff: {MUSE_CUTOFF}."]
+    if current_date:
+        parts.append(f"Current date: {current_date}.")
+    if instructions:
+        parts.append(instructions)
+    if tools:
+        parts.append(_muse_tool_defs(tools))
+    if "reasoning strength:" not in (instructions or "").lower():
+        parts.append(f"Reasoning strength: {MUSE_EFFORT[effort]}.")
+    parts.append(_muse_recipients(tools))
+    out = ["<|begin_of_text|>", "<|start|>system<|message|>" + "\n\n".join(parts) + "<|eot|>"]
+    for offset, message in enumerate(rest):
+        index, role = first + offset, message["role"]
+        last = offset == len(rest) - 1
+        end_token = "<|eom|>" if not last and rest[offset + 1]["role"] == role else "<|eot|>"
+        where = f"messages.{index}.content"
+        if role in ("system", "developer"):
+            out.append(f"<|start|>{role}<|message|>" + _muse_content(message.get("content"), where) + "<|eot|>")
+        elif role == "user":
+            stamp = ""
+            if message.get("render_timestamp") and isinstance(message.get("timestamp"), str):
+                stamp = "[" + _muse_esc_header(message["timestamp"]) + "] "
+            out.append("<|start|>user<|message|>" + stamp + _muse_content(message.get("content"), where) + "<|eot|>")
+        elif role == "tool":
+            name = message.get("name")
+            if not name:
+                call_id = message.get("tool_call_id")
+                name = call_id or ""
+                for other in messages:
+                    calls = other.get("tool_calls") if isinstance(other, dict) else None
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict) or call.get("id") != call_id:
+                            continue
+                        function = call.get("function")
+                        found = function.get("name") if isinstance(function, dict) else None
+                        if isinstance(found, str) and found:
+                            name = found
+            if not name:
+                raise APIError(400, "A tool message needs a `name` or a `tool_call_id` that names a call.",
+                               f"messages.{index}")
+            out.append("<|start|>tool " + _muse_esc_header(name) + '<|message|><tool_output name="' +
+                       _muse_esc_attr(name) + '">\n' + _muse_content(message.get("content"), where) +
+                       "\n</tool_output><|eot|>")
+        else:
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if reasoning:
+                out.append("<|start|>assistant to=self<|message|>" + _muse_esc(reasoning) + "<|eom|>")
+            body = _muse_content(message.get("content"), where)
+            calls = message.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+            if calls:
+                if body:
+                    out.append("<|start|>assistant to=commentary<|message|>" + body + "<|eom|>")
+                for position, call in enumerate(calls):
+                    name, args = _muse_args(call, f"messages.{index}.tool_calls.{position}")
+                    out.append("<|start|>assistant to=" + _muse_esc_header(name) + "<|message|>" +
+                               _muse_atem(name, args) + (end_token if position == len(calls) - 1 else "<|eom|>"))
+            elif body or not reasoning:
+                recipient = message.get("recipient") or "user"
+                if recipient == "user":
+                    end_turn = True
+                elif recipient in ("self", "commentary"):
+                    end_turn = False
+                else:
+                    end_turn = bool(message.get("end_turn")) if message.get("end_turn") is not None else False
+                out.append("<|start|>assistant to=" + _muse_esc_header(recipient) + "<|message|>" + body +
+                           ("<|eot|>" if end_turn else "<|eom|>"))
+    if add_generation_prompt:
+        out.append("<|start|>assistant")
+    return "".join(out)
+
+
+class MuseChannels:
+    """Muse Spark's messages, streamed, as the gateway's later stages read a reply: a message to
+    "self" between <think> and </think>, any other message's body as it is (an answer,
+    commentary, a call's <atem:function_calls> block), two visible messages a blank line apart,
+    and <|eot|> passed on where the turn ends (MUSE_STOP_SEQUENCES stop there). A header the
+    model writes is " to=RECIPIENT<|message|>" after the prompt's <|start|>assistant, and
+    "<|start|>assistant to=RECIPIENT<|message|>" for every message after the first."""
+    START, MESSAGE, EOM, EOT, END = "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.buf = ""
+        self.state = "header"       # header: up to <|message|>; body: up to <|eom|> / <|eot|>
+        self.recipient = None
+        self.visible = False        # a visible message was emitted already
+        self.pending_gap = False    # the next visible text starts a new message
+        self.done = False
+
+    def _hold(self, markers):
+        for size in range(min(len(self.buf), max(map(len, markers)) - 1), 0, -1):
+            if any(m.startswith(self.buf[-size:]) for m in markers):
+                return size
+        return 0
+
+    def feed(self, chunk):
+        if self.done:
+            return
+        self.buf += chunk
+        while self.buf and not self.done:
+            if self.state == "header":
+                end = self.buf.find(self.MESSAGE)
+                stop = min((p for p in (self.buf.find(self.EOT), self.buf.find(self.END)) if p >= 0), default=-1)
+                if stop >= 0 and (end < 0 or stop < end):
+                    self.sink(self.EOT)
+                    self.done = True
+                    return
+                if end < 0:
+                    return
+                header = self.buf[:end].replace(self.START, "").strip()
+                self.buf = self.buf[end + len(self.MESSAGE):]
+                self.recipient = header.split("to=", 1)[1].strip() if "to=" in header else "user"
+                self.state = "body"
+                if self.recipient == "self":
+                    self.sink(THINK_OPEN)
+                elif self.visible:
+                    self.pending_gap = True
+                continue
+            hits = [(p, m) for m in (self.EOM, self.EOT, self.END, self.START) if (p := self.buf.find(m)) >= 0]
+            if not hits:
+                hold = self._hold((self.EOM, self.EOT, self.END, self.START))
+                self._body(self.buf[:len(self.buf) - hold])
+                self.buf = self.buf[len(self.buf) - hold:]
+                return
+            pos, marker = min(hits)
+            self._body(self.buf[:pos])
+            self.buf = self.buf[pos + (len(marker) if marker != self.START else 0):]
+            if self.recipient == "self":
+                self.sink(THINK_CLOSE)
+            self.state = "header"
+            if marker in (self.EOT, self.END):
+                self.sink(self.EOT)
+                self.done = True
+
+    def _body(self, text):
+        if not text:
+            return
+        if self.recipient != "self":
+            if self.pending_gap:
+                self.sink("\n\n")
+                self.pending_gap = False
+            self.visible = True
+        self.sink(text)
+
+    def finish(self):
+        if self.done:
+            return
+        if self.state == "body":
+            self._body(self.buf)
+            if self.recipient == "self":
+                self.sink(THINK_CLOSE)
+        self.buf = ""
+        self.done = True
+
+
+def chat_channels(sink):
+    """The first stage of a chat reply: Muse Spark's channels (MuseChannels), else none."""
+    return MuseChannels(sink) if chat_flavor() == "muse" else None
+
+
+_MUSE_INVOKE = re.compile(r'<atem:invoke name="([^"]*)">(.*?)</atem:invoke>', re.S)
+_MUSE_PARAM = re.compile(r'<atem:parameter name="([^"]*)">(.*?)</atem:parameter>', re.S)
+
+
+def _muse_unattr(text):
+    return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'")
+            .replace("&quot;", '"').replace("&amp;", "&"))
+
+
+def _muse_value(raw, schema):
+    """A parameter's text as its schema types it: strings as written, JSON for the rest."""
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    kinds = kind if isinstance(kind, list) else [kind]
+    if "string" in kinds:
+        # the template writes None as `null`, and every string as is
+        return None if raw == "null" and "null" in kinds else raw
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def parse_muse_tool_calls(reply, tools):
+    """Muse Spark's calls: each <atem:function_calls> block's invokes, the parameters typed by the
+    tool's schema. Returns (content, tool_calls); the content is the text outside the blocks,
+    an unfinished block cut off."""
+    schemas = {}
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            schemas[fn["name"]] = ((fn.get("parameters") or {}).get("properties") or {})
+    calls, content, rest = [], [], reply
+    while True:
+        start = rest.find(MUSE_ATEM_OPEN)
+        if start < 0:
+            content.append(rest)
+            break
+        content.append(rest[:start])
+        end = rest.find(MUSE_ATEM_CLOSE, start)
+        if end < 0:
+            break                                   # unfinished: dropped from the content
+        block = rest[start:end]
+        for name, body in _MUSE_INVOKE.findall(block):
+            name = _muse_unattr(name)
+            props = schemas.get(name, {})
+            args = {}
+            for key, raw in _MUSE_PARAM.findall(body):
+                key = _muse_unattr(key)
+                args[key] = _muse_value(raw, props.get(key))
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        rest = rest[end + len(MUSE_ATEM_CLOSE):]
+    text = re.sub(re.escape(THINK_OPEN) + ".*?(?:" + re.escape(THINK_CLOSE) + "|$)", "", "".join(content), flags=re.S)
+    text = text.replace(THINK_CLOSE, "").replace("<|eot|>", "")
+    return text.strip(), calls
+
+
 def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
     """Qwen3-Coder's chat_template (qwen3_moe), byte for byte: ChatML with a newline after
     every <|im_end|>, no thinking at all, the system turn carrying the client's system text
@@ -2678,9 +3234,9 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        rtok = role_token.get(role)
-        if rtok is None:
+        if not isinstance(role, str) or role not in role_token:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        rtok = role_token[role]
         # the template emits the effort hint inline, right before the first
         # non-system message — not at the end. Position matters: it changes the
         # exact token sequence the model was trained on.
@@ -3270,7 +3826,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                                    f"messages.{index}.content.{position}.text")
                 texts.append(text)
             content = "".join(texts)
-        content = content or ""
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
+            raise APIError(400, "Message content must be a string or an array of text parts.",
+                           f"messages.{index}.content")
         if role == "user":
             prompt.append(f"<|user|>{content}")
         elif role == "system":
@@ -3391,7 +3951,8 @@ def _dsv41_merge_turns(messages):
                           "reasoning_content": reasoning,
                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
-            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+            result_id = message.get("tool_call_id")
+            block = ({"kind": "tool_result", "id": result_id if isinstance(result_id, str) else "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"
                      else {"kind": "text", "id": "", "text": text})
             if turns and turns[-1]["role"] == "user":
@@ -3408,7 +3969,7 @@ def _dsv41_merge_turns(messages):
             order = {}
             for at, call in enumerate(turn["tool_calls"]):
                 identifier = call.get("id") if isinstance(call, dict) else None
-                if identifier:
+                if isinstance(identifier, str) and identifier:   # an object or array id is unhashable
                     order[identifier] = at
         elif turn["role"] == "user" and order:
             results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
@@ -3582,8 +4143,14 @@ def resolve_generation_prompt(messages, body):
                        "continue from.", "messages")
     raw = last.get("content")
     if isinstance(raw, list):                       # multimodal parts: only the text counts
-        text = "".join(part.get("text", "") for part in raw
-                       if isinstance(part, dict) and part.get("type") == "text")
+        texts = []
+        for index, part in enumerate(raw):
+            if isinstance(part, dict) and part.get("type") == "text":
+                if not isinstance(part.get("text"), str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"{where}.content.{index}.text")
+                texts.append(part["text"])
+        text = "".join(texts)
     elif raw is None:
         text = ""
     elif isinstance(raw, str):
@@ -3630,6 +4197,11 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                                   tool_choice, add_generation_prompt)
     if chat_flavor() == "qwen3_coder":
         return render_chat_qwen3_coder(messages, tools, tool_choice, add_generation_prompt)
+    if chat_flavor() == "flint":
+        return render_chat_flint(messages, tools, tool_choice, add_generation_prompt)
+    if chat_flavor() == "muse":
+        return render_chat_muse(messages, enable_thinking, reasoning_effort, tools, tool_choice,
+                                add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
@@ -3689,6 +4261,8 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
     regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
     proseguito non ne apre nessuno."""
+    if chat_flavor() in ("flint", "muse"):   # a turn starts as text, and <think> opens reasoning
+        return False
     return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
 
@@ -3712,6 +4286,9 @@ class ThinkingStreamSplit:
         # with thinking off the prompt already closed it, so output is pure answer and
         # the splitter must start in text mode or it would file the whole answer as reasoning.
         self.thinking = initial_thinking
+        # Flint writes <think> itself when it decides to reason: the opening marker switches
+        # to reasoning there (every other family's prompt opened or closed the block already)
+        self.opens = chat_flavor() in ("flint", "muse")   # Muse Spark's through MuseChannels
         self.buf = ""
         self.track_spans = track_spans
         self.thinking_spans = []
@@ -3746,6 +4323,8 @@ class ThinkingStreamSplit:
                     self.thinking = False
                     if self.on_thinking_end:
                         self.on_thinking_end()
+                elif marker == THINK_OPEN and self.opens and not self.thinking:
+                    self.thinking = True
                 continue
 
             hold = 0
@@ -4264,6 +4843,9 @@ def stop_policy(body, chat):
         # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and chat_flavor() == "muse" and not sequences:
+        # the end of the turn, which MuseChannels passes on as <|eot|>
+        return MUSE_STOP_SEQUENCES, ignore_leading
     if chat and ARCH == "qwen36" and not sequences:
         # KAT normally ends with the special im_end token, which the native
         # engine handles by token id. Quantized checkpoints can instead spell
@@ -5050,8 +5632,11 @@ def _engine_extension_args(engine_k):
 
     An empty mapping when nothing was requested, which is what keeps a plain request's
     header byte-identical to one built with no extension at all. When the channel is
-    requested it also asks for the seventh numeric field, which coli_submit_parse expects
-    before the first key=value token.
+    requested, the seventh numeric field goes ahead of the first key=value token -- but
+    only for the families whose SUBMIT header carries it (`submit_gbytes`):
+    coli_submit_parse reads seven fields, while a sibling engine's parser reads six and
+    takes its keys straight after top_p, so the extra field would land where it wants a
+    key and be answered with "bad submit extension".
 
     That is this helper's decision for THESE endpoints, not a property of the request
     builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
@@ -5059,7 +5644,10 @@ def _engine_extension_args(engine_k):
     always sent; changing that endpoint's wire is not this change's to make."""
     if not engine_k:
         return {}
-    return {"logprobs": engine_k, "gbytes_before_ext": True}
+    args = {"logprobs": engine_k}
+    if family_by_id(ARCH).capabilities.submit_gbytes:
+        args["gbytes_before_ext"] = True
+    return args
 
 
 # An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
@@ -5685,12 +6273,22 @@ class Engine:
         # pre-tokenized token-id intake (`ids=`) are unrelated capabilities with separate
         # coli_submit_ext keys. The numeric channel is opened to an engine that keeps the
         # whole of its contract: a DATA tail on every generated token, and an ECHO frame
-        # for EVERY prompt position (" nan 0" at position 0) unless a pin photo covers the
-        # prefix -- which means never resuming a read-out from a live prefix. colibri.c
-        # (glm) and mimo.c do; the engines that score /v1/systemone options but resume
-        # read-outs from a live prefix would answer `echo` with a hole. Token-id intake
-        # is glm's alone: serve_codec.h, which mimo reads its frames with, has no `ids=`.
-        self.supports_logprobs_echo = arch in ("glm", "mimo")
+        # for EVERY prompt position (" nan 0" at position 0), which also means never
+        # resuming a read-out from a live prefix (such a prefix is not recomputed, so its
+        # positions would carry no frame). Whose wire keeps the contract is the family's
+        # own declaration (`logprobs_echo`): colibri.c (glm), mimo.c and qwen36.c do --
+        # qwen36 after its read-out learned to carry position 0 and to refuse a live
+        # prefix while the channel is on. An engine that answers `echo` with a hole gets
+        # its request refused by name instead of a 200 with every logprob shifted. Token-id
+        # intake is glm's alone: serve_codec.h, which mimo reads its frames with, has no
+        # `ids=`. The two conditions are independent: the family's wire declares the channel
+        # (`logprobs_echo`), and the engine has to run under its OWN rendering -- a chat
+        # flavor (CHAT_FLAVOR, resolved from the checkpoint's template before this
+        # constructor) swaps in another family's tool-call parser, which does not report the
+        # tool-call spans the alignment reads. ChatFlavorLogprobsGateTest keeps the two sets
+        # apart for every registry family.
+        self.supports_logprobs_echo = (family.capabilities.logprobs_echo
+                                       and CHAT_FLAVOR in (None, arch))
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
@@ -5786,6 +6384,12 @@ class Engine:
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
+
+    @property
+    def alive(self):
+        """The process runs and its output is still read: after the dispatcher stops, every
+        request fails, so an engine whose process outlived its reader counts as gone too."""
+        return not self.closed and self.dispatcher_error is None and self.process.poll() is None
 
     @staticmethod
     def _stats(fields):
@@ -6182,7 +6786,12 @@ class Engine:
                  gbytes_before_ext=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        payload = prompt.encode("utf-8")
+        # GLM's ids=1 intake consumes decimal token IDs directly, without a
+        # detokenize/re-tokenize round trip. The completion route checks the
+        # list and engine capability before it reaches this wire builder.
+        token_ids = isinstance(prompt, list)
+        payload = (" ".join(map(str, prompt)).encode("ascii") if token_ids
+                   else prompt.encode("utf-8"))
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
         gpayload = grammar.encode("utf-8") if grammar else b""
@@ -6246,11 +6855,13 @@ class Engine:
             ext += f" logprobs={int(logprobs)}"
         if pin:
             ext += " pin=1"
+        if token_ids:
+            ext += " ids=1"
         # `gbytes_before_ext` asks for the 7th numeric field ahead of the extension keys
         # even with no grammar or audio payload to describe. It defaults to False, so
         # every caller that does not ask keeps the wire it had.
         gbytes_field = (f" {len(xpayload)}"
-                        if (xpayload or (ext and gbytes_before_ext)) else "")
+                        if (xpayload or token_ids or (ext and gbytes_before_ext)) else "")
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else gbytes_field)
@@ -6287,9 +6898,28 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        produced = False   # a DATA or TOOL frame came: the engine is past the prompt
+        cancel_at = 0.0
         # DATA's numeric tail, in emission order. Stays empty when logprobs is 0, because
         # the dispatcher never parses a tail for a request that did not ask for one.
         generated_logprobs = []
+
+        def _cancel():
+            # #2290: the client left mid-turn. The admission (the slot) stays this
+            # request's until the engine stops, so say so: without a line the server
+            # looks healthy and idle while every later request queues behind it.
+            nonlocal cancel_sent, cancel_at
+            cancel_sent = True
+            cancel_at = time.monotonic()
+            sys.stderr.write(f"[api] {request_id}: the client left while the engine was "
+                             f"{'generating' if produced else 'reading the prompt'}; "
+                             "cancelling, the slot frees when the engine stops\n")
+            self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+
+        def _cancelled():
+            sys.stderr.write(f"[api] {request_id}: the engine stopped "
+                             f"{time.monotonic() - cancel_at:.1f} s after the cancel; the slot is free\n")
+            return ClientCancelled()
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -6320,8 +6950,7 @@ class Engine:
                 # orphaned generation. Wait for the engine's ERROR CANCELLED /
                 # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                    _cancel()
                 elif not cancel_sent and not stop_sent and pending.failed is not None:
                     # A fault was recorded for this request, so nothing it generates from
                     # here can reach the client. The turn is still the engine's -- the
@@ -6344,6 +6973,7 @@ class Engine:
                 _accept(value)
             elif kind == "data":
                 _accept({"prompt_tokens": None})
+                produced = True
                 # The dispatcher wraps the payload in a tuple only when a logprob record
                 # rides along; bare bytes is the non-opted-in shape.
                 data, record = value if isinstance(value, tuple) else (value, None)
@@ -6358,8 +6988,7 @@ class Engine:
                         # Same admission-holding rule as the idle branch above:
                         # send CANCEL, then keep consuming frames until the
                         # engine acknowledges with ERROR CANCELLED or DONE.
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "echo":
                 # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
                 # generato, quindi non passa da decode() e non entra nella
@@ -6369,14 +6998,14 @@ class Engine:
                     on_echo(value)
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
+                produced = True
                 if not cancel_sent and not stop_sent:
                     decode_tool(value)
                     if stopped and stopped():
                         stop_sent = True
                         self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -6384,7 +7013,7 @@ class Engine:
                     # (or honored it at a token boundary and still framed a
                     # DONE). Either way the client is gone: the ack is what
                     # mattered, the output is not deliverable.
-                    raise ClientCancelled()
+                    raise _cancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -6404,8 +7033,12 @@ class Engine:
                 # scheduler's outcome, and tries to write a 500 to a socket that is already
                 # closed. An ERROR carrying any other text is the engine's own account of
                 # why the turn ended; that is news, and it is still reported as a failure.
-                raise ClientCancelled()
+                raise _cancelled()
             else:
+                if token_ids and isinstance(value, RuntimeError) and str(value) == "BAD_REQUEST":
+                    raise APIError(400, "The engine rejected this token-ID `prompt` "
+                                   "(check IDs against the model vocabulary).",
+                                   "prompt", "invalid_value") from value
                 raise value
 
     def close(self):
@@ -6460,6 +7093,12 @@ def is_image_engine(engine):
     Decided by the engine object, not by the ARCH global, so a server built in a
     test (or embedded) with an ImageEngine behaves as one."""
     return getattr(engine, "modality", "text") == "image"
+
+
+def engine_alive(engine):
+    """False once the served engine has died: Engine and ImageEngine say so through
+    `alive`; an object without it (a test double, an embedder's engine) is taken as running."""
+    return getattr(engine, "alive", True)
 
 
 # The endpoints that only make sense for a chat model, refused with a pointer
@@ -6517,6 +7156,21 @@ class APIServer(ThreadingHTTPServer):
     # leaves 56 slots that one address cannot touch.
     MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
 
+    # The kernel's accept queue, which socketserver leaves at 5. It holds the
+    # completed handshakes the accept loop has not drained yet; once it is full
+    # Linux drops the next SYN (ListenOverflows in /proc/net/netstat) and that
+    # client sits out the SYN retransmit timer -- 1 s, then 2 s, then 4 s --
+    # before the server has even seen it, which is how a dashboard's parallel
+    # fetches or a benchmark client's burst turn into multi-second stalls. The
+    # caps above run after accept(); they cannot see this. Measured with 100
+    # simultaneous connects, each GET /v1/models: at 5, 47-87 of them waited
+    # over 900 ms (max 2.2-7.9 s) and the counter rose by 91-309 per burst; at
+    # 128 none did and the counter did not move. 128 is werkzeug's and
+    # uvicorn's figure, and holds the 64 connections MAX_CONNECTIONS admits at
+    # once with room for the next burst; the kernel caps it at
+    # net.core.somaxconn (4096 on current Linux, 128 on older ones).
+    request_queue_size = 128
+
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
                  kv_slots=1, allowed_hosts=()):
@@ -6549,6 +7203,11 @@ class APIServer(ThreadingHTTPServer):
         self.compactions = CompactionMemory()
         self.context_limit = None
         self.tokens_per_char = None
+        # serve() starts a dead engine again (keep_engine); an embedder that does not run
+        # it gets "engine_down" from /health instead of "restarting"
+        self.keeps_engine = False
+        self.engine_restarts = 0
+        self.engine_swap = threading.Lock()   # a restart's swap against serve()'s teardown
 
     def model_entry(self):
         """The /v1/models object. An image model says so, and carries the size
@@ -6689,6 +7348,10 @@ class APIServer(ThreadingHTTPServer):
     def close_request(self, request):
         self._release(request)
         super().close_request(request)
+
+
+def _reject_json_constant(name):
+    raise json.JSONDecodeError(f"{name} is not a JSON value", name, 0)
 
 
 def _content_length(value):
@@ -6994,7 +7657,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # mid-body, and the drain will notice the EOF and close (#597 item 3).
         self._body_read = len(raw) == length
         try:
-            body = json.loads(raw)
+            # parse_constant: NaN/Infinity/-Infinity are Python extensions, not JSON.
+            body = json.loads(raw, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
         except (ValueError, RecursionError):
@@ -7040,6 +7704,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if not base.is_dir():
             return False
         rel = unquote(path).lstrip("/") or "index.html"
+        # unquote('%00') embeds a NUL. Path raises ValueError, which do_GET
+        # does not catch, and a NUL with no dot also matches the SPA fallback
+        # if the exception is swallowed. Either way it is not a file.
+        if "\x00" in rel:
+            return False
         target = (base / rel).resolve()
         try:
             target.relative_to(base)
@@ -7079,6 +7748,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if path == "/health":
+                if not engine_alive(self.server.engine) or self.server.scheduler.paused:
+                    # The HTTP side answering is not the service answering (#2290): a
+                    # supervisor or a load balancer sees the engine gone while it is.
+                    self.send_json(503, {"status": "restarting" if self.server.keeps_engine
+                                         else "engine_down"}, request_id,
+                                   {"Retry-After": "5"})
+                    return
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
@@ -7086,6 +7762,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed():
                     payload["arch"] = ARCH            # which family answers: coli chat reads it
                     payload["scheduler"] = self.server.scheduler.snapshot()
+                    payload["engine_restarts"] = self.server.engine_restarts
                     payload["kv_slots"] = self.server.kv_slots
                     payload["input_modalities"] = self.server.input_modalities()
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
@@ -7895,7 +8572,11 @@ class APIHandler(BaseHTTPRequestHandler):
         stream_options = body.get("stream_options") if stream else None
         if stream and stream_options is not None and not isinstance(stream_options, dict):
             raise APIError(400, "`stream_options` must be an object.", "stream_options")
-        include_usage = bool((stream_options or {}).get("include_usage"))
+        include_usage = (stream_options or {}).get("include_usage")
+        if include_usage is not None and not isinstance(include_usage, bool):
+            # bool("false") is True: a string, number or object would have turned the usage frame on
+            raise APIError(400, "`stream_options.include_usage` must be a boolean.", "stream_options.include_usage")
+        include_usage = bool(include_usage)
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
@@ -7921,14 +8602,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **({"on_echo": prompt_echoes.append} if engine_k and echo else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
@@ -8165,13 +8849,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -8204,12 +8891,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (content_split.feed if content_split else emit)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -8275,7 +8965,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort is None and "enable_thinking" not in body:
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
-            if chat_flavor() == "qwen38":
+            if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
                 reasoning_effort = "xhigh"
             elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
                 # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
@@ -8473,8 +9163,12 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
                 _wait, slot = admission
+                channels = chat_channels(output.append)
                 self.server.generate(prompt, budget, 0.3, 0.9,
-                                     output.append, slot, self.client_disconnected)
+                                     channels.feed if channels else output.append, slot,
+                                     self.client_disconnected)
+                if channels:
+                    channels.finish()
         except APIError as error:
             if error.code == "context_length_exceeded":
                 return None
@@ -8649,11 +9343,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed)   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"image": image} if image is not None else {}))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
@@ -8802,11 +9499,14 @@ class APIHandler(BaseHTTPRequestHandler):
             def generation_stopped():
                 return stop_filter.stopped() or sideband.stopped()
 
+            channels = chat_channels(stop_filter.feed)   # Muse Spark's messages first
             stats = self.server.generate(
-                prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
                 **({"on_tool": sideband.feed} if sideband.enabled else {}),
                 **({"image": image} if image is not None else {}))
+            if channels:
+                channels.finish()
             stop_filter.finish()
             sideband.finish()
             if split:
@@ -8844,11 +9544,81 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
+        if isinstance(prompt, list):
+            if not getattr(self.server.engine, "supports_tok_ids", False):
+                raise APIError(400, "Token-ID `prompt` is not supported by this engine.",
+                               "prompt", "unsupported_parameter")
+            if not prompt or any(isinstance(token, bool) or not isinstance(token, int) or
+                                 not 0 <= token <= 2147483647 for token in prompt):
+                raise APIError(400, "`prompt` must be a non-empty array of non-negative "
+                               "32-bit token IDs.", "prompt", "invalid_value")
+            self.generation(body, prompt, request_id, False)
+            return
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
         self.generation(body, prompt, request_id, False)
+
+
+ENGINE_WATCH_S = 0.5            # how often keep_engine looks at the engine
+ENGINE_RESTART_DELAYS = (2.0, 60.0)   # first wait after a failed start, and the ceiling
+# A stop that reached the engine as well (Ctrl-C goes to the whole process group, and a
+# service manager may signal it too) ends serve() within one serve_forever poll, 0.5 s:
+# keep_engine waits this long first, so a server on its way out loads nothing.
+ENGINE_STOP_GRACE_S = 1.0
+
+
+def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RESTART_DELAYS,
+                grace=ENGINE_STOP_GRACE_S):
+    """Start the engine again whenever it dies under a live server (#2290).
+
+    The HTTP side outlives an engine that crashed, ran out of memory or was killed; before
+    this, /health said "ok" and every later request failed until a person restarted both.
+    While the new engine loads, admission is paused: a request waits in the queue (up to
+    the queue timeout) for it instead of failing on the old one, and /health answers 503.
+    A start that fails is tried again after 2 s, then twice as long each time up to 60 s:
+    the memory the dead engine held may take a moment to come back. Runs until `stopping`
+    is set; serve() runs it on its own thread."""
+    while not stopping.wait(watch):
+        dead = server.engine
+        if engine_alive(dead):
+            continue
+        server.scheduler.pause()
+        if stopping.wait(grace):
+            return
+        cause = (getattr(dead, "dispatcher_error", None) or getattr(dead, "dead", None)
+                 or "it exited")
+        print(f"[gateway] the engine stopped ({cause}); starting it again", file=sys.stderr)
+        try:
+            dead.close()          # reaps the process and fails what it still held
+        except Exception as error:
+            print(f"[gateway] closing the dead engine: {error}", file=sys.stderr)
+        # what /v1/systemone photographed lived in the dead engine's KV
+        server.pinned_prefixes.clear()
+        delay, ceiling = delays
+        fresh = None
+        while fresh is None:
+            try:
+                fresh = start()
+            except Exception as error:
+                if stopping.is_set():
+                    return
+                print(f"[gateway] the engine did not start ({error}); "
+                      f"trying again in {delay:g} s", file=sys.stderr)
+                if stopping.wait(delay):
+                    return
+                delay = min(delay * 2, ceiling)
+        with server.engine_swap:
+            if not stopping.is_set():
+                server.engine, fresh = fresh, None
+                server.engine_restarts += 1
+        if fresh is not None:     # the server stopped while it loaded
+            fresh.close()
+            return
+        server.scheduler.resume()
+        print(f"[gateway] the engine is running again (restart {server.engine_restarts})",
+              file=sys.stderr)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
@@ -8886,6 +9656,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
+    stopping = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         family = pending_family or resolve_model(model).descriptor
@@ -8910,19 +9681,25 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
                              f"{family.limits.max_kv_slots} KV slot(s)")
+        def start_engine():
+            if family.modality == "image":
+                # Its own process class: the image engine speaks a line-and-JSON
+                # protocol with binary frames, not the text engines' byte stream.
+                image = image_engine.ImageEngine(engine, model, env=env)
+                # Same lifetime rule as the text engines on Windows: a job object
+                # takes the engine down with this server, however the server ends.
+                image._win_job = _win_kill_on_close_job(getattr(image.process, "pid", None))
+                return image
+            return Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+
         if family.modality == "image":
-            # Its own process class: the image engine speaks a line-and-JSON
-            # protocol with binary frames, not the text engines' byte stream.
-            runtime = image_engine.ImageEngine(engine, model, env=env)
-            # Same lifetime rule as the text engines on Windows: a job object
-            # takes the engine down with this server, however the server ends.
-            runtime._win_job = _win_kill_on_close_job(getattr(runtime.process, "pid", None))
+            runtime = start_engine()
             print(f"[image] {model_id}: default {runtime.info['default_width']}x"
                   f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
                   file=sys.stderr)
         else:
             try:
-                runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+                runtime = start_engine()
             except EngineLoadError as error:
                 # The engine said why: one line naming the kind, not a traceback
                 # that ends in "exited unexpectedly".
@@ -8940,6 +9717,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                   + (" (the engine loaded no vision tower; a picture gets a 400)"
                      if family.capabilities.image and runtime.vision is False else ""),
                   file=sys.stderr)
+        server.keeps_engine = True
+        watchdog = threading.Thread(target=keep_engine, args=(server, start_engine, stopping),
+                                    name="colibri-engine-watchdog", daemon=True)
+        watchdog.start()
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         # On Windows SIGTERM is never delivered (os.kill is TerminateProcess);
@@ -8957,11 +9738,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         except KeyboardInterrupt:
             pass
     finally:
+        with server.engine_swap:
+            stopping.set()
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
         server.server_close()
-        if runtime is not None:
-            runtime.close()
+        # the engine running now: keep_engine may have replaced the first one
+        for running in {id(e): e for e in (server.engine, runtime) if e is not None}.values():
+            running.close()
 
 
 def main():

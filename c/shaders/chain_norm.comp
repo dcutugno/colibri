@@ -10,6 +10,8 @@
 //   flags 1: zero-centred weight, scale by (1 + w) (Qwen3.6/3.8 text norms)
 //   flags 2: no weight (scale by 1)
 //   flags 4: L2 norm: r = 1 / sqrt(sum(x^2) + eps) (no mean)
+//   flags 8: scale, then normalise: v = x * w (w as stored), r from v, y = v * r * post
+//            (Muse Spark's norms on every expert's output and on the feed-forward branch)
 // x and y may be the same buffer and the same places (in place): every element is read
 // for the sum before the barrier and written after it by the thread that reads it.
 // The sum is a float tree; the CPU sums in double. The two differ by rounding only.
@@ -38,7 +40,8 @@ void main() {
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = int(gl_LocalInvocationID.x);
     float acc = 0.0;
-    for (int i = tid; i < p.D; i += 256) { float v = x[xb + i]; acc += v * v; }
+    bool pre = (p.flags & 8) != 0;
+    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
     red[tid] = acc;
     barrier();
     for (int off = 128; off > 0; off >>= 1) {
@@ -49,6 +52,6 @@ void main() {
                                  : 1.0 / sqrt(red[0] / float(p.D) + p.eps);
     for (int i = tid; i < p.D; i += 256) {
         float wv = (p.flags & 2) != 0 ? 1.0 : ((p.flags & 1) != 0 ? 1.0 + w[wb + i] : w[wb + i]);
-        y[yb + i] = x[xb + i] * r * wv * p.post;
+        y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }

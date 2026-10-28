@@ -15,7 +15,7 @@
         "groups": [
           {
             "group": "Get started",
-            "pages": ["index", "quickstart", "AI_SETUP", "MCP_SERVER"]
+            "pages": ["index", "quickstart", "gguf", "AI_SETUP", "MCP_SERVER"]
           },
           {
             "group": "Serve models",
@@ -31,7 +31,7 @@
           },
           {
             "group": "Hardware backends",
-            "pages": ["cuda", "metal", "vulkan", "windows"]
+            "pages": ["cuda", "metal", "vulkan", "gpu-parity", "windows"]
           },
           {
             "group": "Contribute",

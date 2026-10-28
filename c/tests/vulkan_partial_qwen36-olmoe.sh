@@ -326,7 +326,11 @@ ptl_family_qwen36_olmoe() {
   CHAIN_SERVE_EXPECT='olmoe chain: 2 of 4 layers on the device' $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c COLI_VK_CHAIN_LAYERS=2
   CHAIN_SERVE_EXPECT='olmoe chain: 2 of 4 layers on the device' $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c PILOT=1 WIDE=2 COLI_VK_CHAIN_LAYERS=2
   CHAIN_SERVE_EXPECT='olmoe chain: 2 of 4 layers on the device' COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c COLI_VK_CHAIN_LAYERS=2
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 OLMOE_TINY=olmoe_tiny_c \
+  # every tier expert below its GEMM's rows, as vulkan_engines.sh's inkling-olmoe-chain
+  # step: a cold prompt's experts on the tier and a short suffix's in the frame then share
+  # the frame's kernel (chain_moe_gv.comp), whatever rows an expert has in either prompt
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_LAYERS=2 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 \
+    COLI_VK_TIER_GEMM_ROWS=1000 OLMOE_TINY=olmoe_tiny_c \
     $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve.BrioServe
   ptlqo_dho olmoe "partial olmoe dense-only" 2 10 "${O[@]}" -- 8 8 $OR
   chain_gate olmoe "partial olmoe everything fits" 1 "${O[@]}" -- 8 8 $OR

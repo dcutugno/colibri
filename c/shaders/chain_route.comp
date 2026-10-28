@@ -20,6 +20,9 @@
 // The CPU's floats in the CPU's orders where it matters for the pick and the weights:
 // exp and the sums of a softmax are the device's, so a weight can differ in its last
 // bits; the ids are the CPU's unless two picks are that close.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer L { float l[]; };
@@ -42,6 +45,7 @@ shared float rv[256];
 shared float gv[64];
 shared int keepg[64];
 shared int chosen[32];
+shared int keepi[256];      // a round's best expert of each subgroup
 shared float wv[32];
 
 // Every index into shared memory is in range on every lane, the lanes a branch or a loop
@@ -62,7 +66,11 @@ void main() {
     int tid = int(gl_LocalInvocationID.x);
     int lb = p.l_off + s * p.l_row;
 
-    // scores
+    int nsg = int(gl_NumSubgroups), sg = int(gl_SubgroupID);
+    // scores (the row's max and sum by the workgroup's tree: its order of the sum is the
+    // one every step of a prompt or a decode gives a row, so a weight is the same bits
+    // however the rows came; a subgroup's reduction summed in another order and moved a
+    // weight's last bit against the host's routing of the same row)
     if (p.kind == 0) {
         float m = NEG;
         for (int e = tid; e < p.E; e += 256) m = max(m, logit(lb, e));
@@ -117,19 +125,33 @@ void main() {
         barrier();
     }
 
-    // top K: an expert's slot is its rank, the picks above it plus the equal ones of lower
-    // experts: the order of K picks of the largest in turn, with no barrier a slot
-    if (tid < p.K) chosen[tid] = -1;
-    barrier();
-    for (int e = tid; e < p.E; e += 256) {
-        float v = pk[A(e)];
-        if (!(v > NEG)) continue;
-        int r = 0;
-        for (int j = 0; j < p.E && r < p.K; j++) {
-            float u = pk[A(j)];
-            if (u > v || (u == v && j < e)) r++;
+    // top K: K rounds of the largest pick left, the lower expert on a tie. A lane keeps its
+    // experts' picks (e = tid + 256j) in registers; a round takes each subgroup's best
+    // (subgroupMax, then the lowest expert holding it) into one of two halves of rv/keepi,
+    // every lane the best of those, and the lane that owns it drops it: one barrier a round,
+    // the halves taking turns. (Each expert's rank counted against every other was E^2 / 256
+    // reads: 49 us for one row of 512 experts on an RTX PRO 4000, 7.7 with a round three
+    // barriers, 1024 experts 145 us.)
+    float mine[4];
+    [[unroll]] for (int j = 0; j < 4; j++) { int e = tid + 256 * j; mine[j] = e < p.E ? pk[A(e)] : NEG; }
+    for (int k = 0; k < p.K; k++) {
+        float bv = NEG; int be = 0x7fffffff;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            int e = tid + 256 * j;
+            if (mine[j] > bv || (mine[j] == bv && mine[j] > NEG && e < be)) { bv = mine[j]; be = e; }
         }
-        if (r < p.K) chosen[r] = e;
+        float m = subgroupMax(bv);
+        int me = subgroupMin(bv == m && m > NEG ? be : 0x7fffffff);
+        int h = (k & 1) * 128;   /* this round's half */
+        if (subgroupElect()) { rv[h + min(sg, 127)] = m; keepi[h + min(sg, 127)] = me; }
+        barrier();
+        float b = NEG; int c = -1;
+        for (int g = 0; g < nsg && g < 128; g++) {
+            float u = rv[h + g]; int ie = keepi[h + g];
+            if (u > NEG && ie != 0x7fffffff && (u > b || (u == b && ie < c))) { b = u; c = ie; }
+        }
+        if (tid == 0) chosen[k] = c;
+        [[unroll]] for (int j = 0; j < 4; j++) if (c == tid + 256 * j) mine[j] = NEG;
     }
     barrier();
 

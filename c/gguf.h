@@ -117,6 +117,15 @@ static void gguf_scalar_decode(int t, const void *p, gguf_kv *kv) {
     }
 }
 
+/* dir/p, or p alone when it is absolute: "/x", "\\x" (a share, or the drive's root), or a
+ * drive's "C:\\x" or "C:/x", as a gguf.json written on Windows names its GGUF (#2189) */
+static int gguf_path_abs(const char *p) {
+    return p[0] == '/' || p[0] == '\\' ||
+           ((p[0] | 32) >= 'a' && (p[0] | 32) <= 'z' && p[1] == ':' && (p[2] == '\\' || p[2] == '/'));
+}
+static void gguf_path_join(char *out, size_t n, const char *dir, const char *p) {
+    if (gguf_path_abs(p)) snprintf(out, n, "%s", p); else snprintf(out, n, "%s/%s", dir, p);
+}
 static uint64_t gguf_hash(const char *s) { uint64_t h = 1469598103934665603ull; while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ull; } return h; }
 
 static int gguf_find_idx(const gguf_ctx *g, const char *name) {

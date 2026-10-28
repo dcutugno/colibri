@@ -313,6 +313,10 @@ ptl_mimo() {
 ptl_mimo_all() {
   kv_mimo_fixtures
   local k c bits
+  # every run from no expert history and none written (the inkling runs above use the same
+  # file): a probe and the run it counts for take the same warm start, so the same submits
+  rm -f chain.usage
+  local -x COLI_USAGE=chain.usage USAGE_SAVE=0
   # ---- COLI_VK_CHAIN_LAYERS: every N from 0 to L, text and picture; the dense forms at a
   # middle N; one token at a time, blocks of 3, the tower on the per-matrix path (the tail:
   # on the CPU with N < L), the tier off

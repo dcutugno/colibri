@@ -107,9 +107,9 @@ int main(void) {
         int same = 1;
         for (int e = 0; e < NE && same; e++) {
             G_src_planar = 1;
-            stage(a, sa, planar[e], planar[e] + MB, planar[e] + 2 * MB, scales[e], scales[e] + NSG, scales[e] + 2 * NSG);
+            stage(a, sa, 0, planar[e], planar[e] + MB, planar[e] + 2 * MB, scales[e], scales[e] + NSG, scales[e] + 2 * NSG);
             G_src_planar = 0;
-            stage(b, sb, pairs[e], pairs[e] + MB, pairs[e] + 2 * MB, scales[e], scales[e] + NSG, scales[e] + 2 * NSG);
+            stage(b, sb, 0, pairs[e], pairs[e] + MB, pairs[e] + 2 * MB, scales[e], scales[e] + NSG, scales[e] + 2 * NSG);
             same = !memcmp(a, b, sizeof a) && !memcmp(sa, sb, sizeof sa);
         }
         G_src_planar = 1;

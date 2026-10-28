@@ -139,8 +139,55 @@ static int glmc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2")
 /* The device's copy of a resident QT, uploaded once (the per-matrix path's own copy
  * when COLI_VK_DENSE put it there); f32 goes up as the backend's fmt 10. NULL: no
  * device form (int2, E8/IQ3, fp8, planar int4). */
-static ColiVkTensor *glmc_tensor(QT *t) {
+/* A GGUF matrix's rows as the file has them (the loader interleaved some by 16 for the
+ * CPU: gq_r16_unpack gives whole groups back): *rows a malloc'd copy, or NULL when q4
+ * holds them so; *type the file's type. -1: rows not in whole groups, or no memory. */
+static int glmc_gq_rows(const QT *t, uint8_t **rows, int *type) {
+    const int b = gq_r16_base(t->gt);
+    *type = b >= 0 ? b : t->gt; *rows = NULL;
+    if (b < 0) return 0;
+    if (t->O % 16) return -1;
+    if (!(*rows = malloc((size_t)gq_row_bytes(*type, t->I) * (size_t)t->O))) return -1;
+    gq_r16_unpack(t->gt, *rows, t->q4, t->O, t->I);
+    return 0;
+}
+/* a GGUF matrix's device form: its blocks (100 + the file's type), -1 without one */
+static int glmc_gq_fmt(const QT *t) {
+    const int b = gq_r16_base(t->gt), ty = b >= 0 ? b : t->gt, be = coli_vk_block_elems(100 + ty);
+    if (!t->q4 || t->O <= 0 || t->I <= 0 || (b >= 0 && t->O % 16)) return -1;
+    return be > 0 && t->I % be == 0 ? 100 + ty : -1;
+}
+/* A GGUF matrix on the device as floats (fmt 10): a GGUF's kv_b split, whose k_b and v_b
+ * the MLA core reads as k_abs and v_abs on its per-head GEMVs, which take no blocks */
+static ColiVkTensor *glmc_gq_f32(QT *t) {
     if (t->vk) return t->vk;
+    uint8_t *rows; int ty;
+    if (!t->q4 || glmc_gq_rows(t, &rows, &ty) < 0) return NULL;
+    const uint8_t *src = rows ? rows : t->q4;
+    const int64_t rb = gq_row_bytes(ty, t->I);
+    float *f = malloc((size_t)t->O * (size_t)t->I * sizeof(float));
+    if (!f) { free(rows); return NULL; }
+    for (int r = 0; r < t->O; r++) gq_dequant_row(ty, src + (int64_t)r * rb, f + (size_t)r * t->I, t->I);
+    free(rows);
+    const int ok = g_glmc_dev ? coli_vk_tensor_ensure2(&t->vk, f, NULL, 10, t->I, t->O, 0)
+                              : coli_vk_tensor_ensure(&t->vk, f, NULL, 10, t->I, t->O, 0);
+    free(f);
+    return ok ? t->vk : NULL;
+}
+static ColiVkTensor *glmc_tensor(QT *t) {
+    if (t->fmt == QT_KVB)   /* k_b and v_b on their own (the split's QTs hold them); kv_b's own copy stays none */
+        return t->kvb && glmc_gq_f32(&t->kvb->kb) && glmc_gq_f32(&t->kvb->vb) ? t->kvb->kb.vk : NULL;
+    if (t->vk) return t->vk;
+    if (t->fmt == QT_GGML) {   /* a GGUF's blocks as the file has them */
+        const int f = glmc_gq_fmt(t);
+        uint8_t *rows; int ty;
+        if (f < 0 || glmc_gq_rows(t, &rows, &ty) < 0) return NULL;
+        const void *src = rows ? (const void *)rows : (const void *)t->q4;
+        const int ok = g_glmc_dev ? coli_vk_tensor_ensure2(&t->vk, src, NULL, f, t->I, t->O, 0)
+                                  : coli_vk_tensor_ensure(&t->vk, src, NULL, f, t->I, t->O, 0);
+        free(rows);
+        return ok ? t->vk : NULL;
+    }
     int fmt; const void *w;
     switch (t->fmt) {
     case 0: fmt = 10; w = t->qf; break;
@@ -167,6 +214,8 @@ static int glmc_form(const QT *t, int *gs) {
     case 2: return t->planar || !t->q4 ? -1 : 2;
     case 4: if (t->planar || t->gs < 8 || t->gs % 8 || !t->q4) return -1; *gs = t->gs; return 4;
     case 5: return t->q4 ? 5 : -1;
+    case QT_GGML: return glmc_gq_fmt(t);
+    case QT_KVB: return t->kvb ? 10 : -1;   /* k_b and v_b as floats: the checkpoint's [H*(nope+V)][kv_lora] in bytes */
     default: return -1;
     }
 }
@@ -394,15 +443,19 @@ static int glmc_setup_dev(Model *m, int d) {
         QT *q[11]; int nq = glmc_layer_qts(m, i, q), up = 1;
         for (int k = 0; k < nq && up; k++) up = glmc_tensor(q[k]) != NULL;
         if (!up) {   /* free what it placed: the layer runs on the CPU, from its host copies */
-            ColiVkTensor **t[11];
-            for (int k = 0; k < nq; k++) t[k] = &q[k]->vk;
-            vkc_layer_free(t, nq, NULL, 0);
+            ColiVkTensor **t[13]; int nt = 0;
+            for (int k = 0; k < nq; k++) t[nt++] = &q[k]->vk;
+            if (l->kv_b.fmt == QT_KVB && l->kv_b.kvb) { t[nt++] = &l->kv_b.kvb->kb.vk; t[nt++] = &l->kv_b.kvb->vb.vk; }
+            vkc_layer_free(t, nt, NULL, 0);
             vkc_fit_shrink(nm, fit, i - lo, vkc_lost() ? "the device was lost" : "a matrix was refused");
             break;
         }
         ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, c->qk_rope, c->v_head, c->kv_lora, D, c->q_lora, c->eps, c->attn_scale,
-                              VKC_ROPE_INTERLEAVED, l->q_a.vk, l->q_b.vk, l->kv_a.vk, l->kv_b.vk, NULL, NULL, l->o.vk,
-                              ch->prm, o_qn[i], o_kn[i]};
+                              VKC_ROPE_INTERLEAVED, l->q_a.vk, l->q_b.vk, l->kv_a.vk,
+                              l->kv_b.fmt == QT_KVB ? NULL : l->kv_b.vk,                      /* a GGUF's split: */
+                              l->kv_b.fmt == QT_KVB ? l->kv_b.kvb->kb.vk : NULL,              /* k_abs */
+                              l->kv_b.fmt == QT_KVB ? l->kv_b.kvb->vb.vk : NULL, l->o.vk,     /* v_abs */
+                              ch->prm, o_qn[i], o_kn[i], g_kv16};
         if (!d) glm_dho_drop_layer(m, i);   /* COLI_VK_DENSE_HOST: all of the layer is there, its host copies go */
         vkc_fit_mark(fit, i - lo);
     }
@@ -511,13 +564,26 @@ static int glmc_mirror(GlmChain *ch, Model *m, int need, int rows) {
     return 1;
 }
 
+/* A conversation's latent and rope rows: floats, or float16 under KV16 (bytes in Lc8/Rc8),
+ * the array the mirror's uploads and the split's host part read (vkc_kv_write widens) */
+static inline const void *glmc_lat(const KVState *k, int i) { return g_kv16 ? (const void *)k->Lc8[i] : (const void *)k->Lc[i]; }
+static inline const void *glmc_rope(const KVState *k, int i) { return g_kv16 ? (const void *)k->Rc8[i] : (const void *)k->Rc[i]; }
+static inline int glmc_rows_ok(const KVState *k, int i, int R) {
+    return g_kv16 ? k->Lc8 && k->Lc8[i] && (R == 0 || k->Rc8[i]) : k->Lc && k->Lc[i] && (R == 0 || k->Rc[i]);
+}
+static inline const void *glmc_at(const void *base, size_t idx) { return (const char *)base + idx * (g_kv16 ? 2 : 4); }
+/* the device's new rows (floats, float16-exact under KV16) into a conversation's cache */
+static inline void glmc_put(void *const *arr8, float *const *arr, int i, int t, int n, const float *src) {
+    if (g_kv16) kv16_pack((uint16_t *)arr8[i] + (size_t)t * n, src, n);
+    else memcpy(arr[i] + (size_t)t * n, src, (size_t)n * sizeof(float));
+}
 /* Record the uploads that make the mirror the host's below pos_base, for a step of
  * n_rows rows (the split: its window placed first). */
 static int glmc_push_kv(GlmChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1, K = c->kv_lora, R = c->qk_rope, ID = c->index_hd;
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (ch->ks.on) {      /* the split: the window placed, its rows below pos_base uploaded */
-            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            VkcKvPart pt[2] = {{1, K, glmc_lat(m->kv, i), 0, ch->kv[i].lat, 0, g_kv16}, {1, R, glmc_rope(m->kv, i), 0, ch->kv[i].rope, 0, g_kv16}};
             vkc_kv_place(&ch->ks, i - ch->lo, pos_base, n_rows);
             ok = vkc_kv_push(&ch->ks, i - ch->lo, pt, R ? 2 : 1, pos_base);
             int t0 = ch->kv_valid[i], n = pos_base - t0;   /* the index keys stay whole */
@@ -528,8 +594,8 @@ static int glmc_push_kv(GlmChain *ch, Model *m, int pos_base, int n_rows) {
         }
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         if (n <= 0) continue;
-        ok = vkc_write(ch->kv[i].lat, (size_t)t0 * K, coli_kv_row(m->Lc[i], t0, K), (size_t)n * K * sizeof(float)) &&
-             (R == 0 || vkc_write(ch->kv[i].rope, (size_t)t0 * R, coli_kv_row(m->Rc[i], t0, R), (size_t)n * R * sizeof(float))) &&
+        ok = vkc_kv_write(ch->kv[i].lat, (size_t)t0 * K, glmc_at(glmc_lat(m->kv, i), (size_t)t0 * K), (size_t)n * K, g_kv16) &&
+             (R == 0 || vkc_kv_write(ch->kv[i].rope, (size_t)t0 * R, glmc_at(glmc_rope(m->kv, i), (size_t)t0 * R), (size_t)n * R, g_kv16)) &&
              (!glmc_full(m, i) || vkc_write(ch->ik[i], (size_t)t0 * ID, coli_kv_row(m->Ic[i], t0, ID), (size_t)n * ID * sizeof(float)));
         ch->kv_valid[i] = pos_base;
     }
@@ -541,8 +607,8 @@ static void glmc_pull_kv(GlmChain *ch, Model *m, int from, int to, int pb, int n
     for (int i = from; i < to; i++) {
         const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)(i - ch->lo) * ch->kvd_layer;
         for (int s = 0; s < n; s++) {
-            memcpy(coli_kv_row(m->Lc[i], pb + s, K), kv + (size_t)s * K, K * sizeof(float));
-            if (R) memcpy(coli_kv_row(m->Rc[i], pb + s, R), kv + (size_t)n * K + (size_t)s * R, R * sizeof(float));
+            glmc_put((void *const *)m->Lc8, m->Lc, i, pb + s, K, kv + (size_t)s * K);
+            if (R) glmc_put((void *const *)m->Rc8, m->Rc, i, pb + s, R, kv + (size_t)n * K + (size_t)s * R);
             if (glmc_full(m, i))
                 memcpy(coli_kv_row(m->Ic[i], pb + s, ID), kv + (size_t)n * (K + R) + (size_t)s * ID, ID * sizeof(float));
         }
@@ -642,6 +708,7 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
                 for (int z = 0; z < m->enr[i]; z++) if (!(n <= 4 && vk_reg_served(i, m->eroute[i][z]))) expert_prefetch(m, i, m->eroute[i][z]);
             if (pending) { ok = glmc_combine(ch, m, n); pending = 0; }
             size_t ko = (size_t)(i - lo) * ch->kvd_layer;
+            ch->mla[i].kv16 = g_kv16;   /* read now: an oracle run turns KV16 off after the chain started */
             ok = ok && glmc_norm(ch->x, ch->prm, ch->o_in[i], ch->nrm, n, D, c->eps) &&
                  (ch->ks.on ? vkc_kv_mla_qkv(&ch->ks, i - lo, &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, ch->cs, &ch->kv[i], &ch->kvtmp,
                                              ch->kvd, ko)
@@ -649,7 +716,7 @@ static int glmc_forward_seg(Model *m, GlmChain *ch, float *xh, int S, int pos_ba
             if (ok && glmc_full(m, i)) ok = glmc_dsa(ch, m, i, n, pb, &sel_on);
             if (ok && ch->ks.on)   /* the split: the core over the device's blocks and the host's rows */
                 ok = vkc_kv_mla_attn(&ch->ks, i - lo, &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], sel_on ? ch->sel : NULL, 0,
-                                     1 + c->index_topk, NULL, 0, ch->tmp, 0, m->Lc[i], m->Rc[i]);
+                                     1 + c->index_topk, NULL, 0, ch->tmp, 0, glmc_lat(m->kv, i), glmc_rope(m->kv, i));
             else ok = ok && vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], sel_on ? ch->sel : NULL, 0,
                                          1 + c->index_topk, NULL, 0, ch->tmp, 0);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -724,8 +791,8 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
     if (!ch || !ch->ok || ch->failed || vkc_lost()) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n)) ch2 = NULL;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, TK = c->index_topk;
-    if (!m->Lc || !m->Rc || (m->has_dsa && !m->Ic)) return 0;
-    for (int i = 0; i < L; i++) if (m->kv_start[i] != 0 || !m->Lc[i]) return 0;
+    if (!m->kv || (m->has_dsa && !m->Ic)) return 0;
+    for (int i = 0; i < L; i++) if (m->kv_start[i] != 0 || !glmc_rows_ok(m->kv, i, c->qk_rope)) return 0;
     /* the rows this step writes: a mirror of the bound state beside a chain's own (a
      * multiplexed step's) holds them no longer */
     for (int d = 0; d < 2; d++) { GlmChain *x = glmc_of(m, d); if (x) glmc_mux_lower(x, m->kv, x->lo, x->lo + x->n, pos_base); }
@@ -860,8 +927,8 @@ static int glmc_mux_push(GlmChain *ch, Model *m, GlmcMirror *v, KVState *k, int 
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         int t0 = v->kv_valid[i], n = p - t0;
         if (n > 0) {
-            ok = vkc_write(v->kv[i].lat, (size_t)t0 * K, coli_kv_row(k->Lc[i], t0, K), (size_t)n * K * sizeof(float)) &&
-                 (R == 0 || vkc_write(v->kv[i].rope, (size_t)t0 * R, coli_kv_row(k->Rc[i], t0, R), (size_t)n * R * sizeof(float))) &&
+            ok = vkc_kv_write(v->kv[i].lat, (size_t)t0 * K, glmc_at(glmc_lat(k, i), (size_t)t0 * K), (size_t)n * K, g_kv16) &&
+                 (R == 0 || vkc_kv_write(v->kv[i].rope, (size_t)t0 * R, glmc_at(glmc_rope(k, i), (size_t)t0 * R), (size_t)n * R, g_kv16)) &&
                  (!glmc_full(m, i) || vkc_write(v->ik[i], (size_t)t0 * ID, coli_kv_row(k->Ic[i], t0, ID), (size_t)n * ID * sizeof(float)));
             ch->mux_up += (unsigned long long)n;
         }
@@ -875,8 +942,8 @@ static void glmc_mux_pull(GlmChain *ch, Model *m, int from, int to, int S, KVSta
     for (int i = from; i < to; i++) {
         const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)(i - ch->lo) * ch->kvd_layer;
         for (int s = 0; s < S; s++) {
-            memcpy(coli_kv_row(kvs[s]->Lc[i], pos[s], K), kv + (size_t)s * K, K * sizeof(float));
-            if (R) memcpy(coli_kv_row(kvs[s]->Rc[i], pos[s], R), kv + (size_t)S * K + (size_t)s * R, R * sizeof(float));
+            glmc_put((void *const *)kvs[s]->Lc8, kvs[s]->Lc, i, pos[s], K, kv + (size_t)s * K);
+            if (R) glmc_put((void *const *)kvs[s]->Rc8, kvs[s]->Rc, i, pos[s], R, kv + (size_t)S * K + (size_t)s * R);
             if (glmc_full(m, i))
                 memcpy(coli_kv_row(kvs[s]->Ic[i], pos[s], ID), kv + (size_t)S * (K + R) + (size_t)s * ID, ID * sizeof(float));
         }
@@ -967,6 +1034,7 @@ static int glmc_mux_seg(Model *m, GlmChain *ch, float *xh, int S, KVState *const
             for (int z = 0; z < m->enr[i]; z++) if (!(S <= 4 && vk_reg_served(i, m->eroute[i][z]))) expert_prefetch(m, i, m->eroute[i][z]);
         if (pending) { ok = glmc_combine(ch, m, S); pending = 0; }
         size_t ko = (size_t)(i - lo) * ch->kvd_layer;
+        ch->mla[i].kv16 = g_kv16;
         ok = ok && glmc_norm(ch->x, ch->prm, ch->o_in[i], ch->nrm, S, D, c->eps) &&
              vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, S, 0, ch->cs, &ch->mtmp, ch->kvd, ko);
         for (int s = 0; ok && s < S; s++) {   /* the new rows into their conversations' mirrors */
@@ -1046,9 +1114,9 @@ static int glmc_forward_rows(Model *m, float *xh, int S, KVState *const *kvs, co
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, TK = c->index_topk, ctx = 0;
     for (int s = 0; s < S; s++) {
         KVState *k = kvs[s];
-        if (!k || !k->Lc || !k->Rc || (m->has_dsa && !k->Ic) || pos[s] < 0 || pos[s] >= k->max_t) return 0;
+        if (!k || (m->has_dsa && !k->Ic) || pos[s] < 0 || pos[s] >= k->max_t) return 0;
         for (int i = 0; i < L; i++)
-            if (k->kv_start[i] != 0 || !k->Lc[i] || (c->qk_rope && !k->Rc[i]) || (glmc_full(m, i) && !k->Ic[i])) return 0;
+            if (k->kv_start[i] != 0 || !glmc_rows_ok(k, i, c->qk_rope) || (glmc_full(m, i) && !k->Ic[i])) return 0;
         if (pos[s] + 1 > ctx) ctx = pos[s] + 1;
     }
     /* one chunk: the chains' rows, and the DSA scores' scratch (rows x context) */

@@ -1,6 +1,7 @@
 /* Dumps what gguf.h reads, for tests/test_gguf_c.py:
  *   test_gguf_c FILE            -> "OK", kv lines, tensor lines (with a float checksum)
- *   test_gguf_c FILE TENSOR     -> the tensor as float32 on stdout */
+ *   test_gguf_c FILE TENSOR     -> the tensor as float32 on stdout
+ *   test_gguf_c --join DIR PATH -> the path an engine opens for gguf.json's PATH in DIR */
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -14,6 +15,10 @@ int main(int argc, char **argv) {
     _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
 #endif
     if (argc < 2) return 2;
+    if (argc == 4 && !strcmp(argv[1], "--join")) {
+        char out[4096]; gguf_path_join(out, sizeof out, argv[2], argv[3]);
+        printf("%s\n", out); return 0;
+    }
     gguf_ctx g;
     if (gguf_open(&g, argv[1])) { printf("ERR %s\n", g.err); return 1; }
     if (argc == 3) {

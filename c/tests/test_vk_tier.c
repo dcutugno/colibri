@@ -31,11 +31,37 @@
  *            start's before and after (streaming promotes nothing);
  *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
  *            by layer): every device row equals the reference with the model resident,
- *            with a budget of four (experts of one form evicted for the other's, no
- *            upload refused), and streamed through slots that change format between
- *            the layers' steps;
+ *            with a budget of four (the smaller form's experts take the rooms the bigger
+ *            form's give up, no upload refused), and streamed through slots that change
+ *            format between the layers' steps;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
- *            that batch names keep their device memory until the device is idle.
+ *            that batch names keep their device memory until the device is idle;
+ *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
+ *            the warm start puts every expert in the pool and the history's four on the
+ *            device too; a batch step's routed pool experts move up to the device and the
+ *            coldest there go back to their pool copy (no upload refused, every expert
+ *            resident throughout, every device row the reference's, from either place);
+ *            the dense chain's books (vkt_dev_count, then vkt_settle at a frame's start)
+ *            move them the same way, the table whole at every read; with a pool short of
+ *            one expert the device keeps the warm start's set;
+ *   hybrid   GGUF block types (Q4_K, Q6_K down), then colibri's int4-g64 and int8, every
+ *            expert in the host pool, the device
+ *            four: in steps of up to 8 rows the pool's experts outside the device's share are
+ *            computed by the CPU at the join (vkt_host_pairs, GQ_EXACT=1's float form) and
+ *            the rest by the device, every row the reference's; a prompt step (20 rows) and
+ *            COLI_VK_HYBRID=0 leave them all to the device;
+ *   pool copy the same experts and the streaming's slots: a prompt step's host pool experts
+ *            are copied into the slots on the device (coli_vk_xb_sub_copy: at the head of the
+ *            batch with staged uploads, the CPU through the mapping otherwise) and computed
+ *            there, those of at most COLI_VK_HYBRID_BIG_ROWS rows (2) by the CPU in place at
+ *            the join, every row the reference's; COLI_VK_TIER_POOL_COPY=0 and
+ *            COLI_VK_HYBRID_BIG_ROWS=0 read them in place;
+ *   host pairs vkt_host_pairs on the CPU alone (Q4_K/Q6_K, IQ2_XXS/IQ3_XXS, colibri's int4-g64
+ *            pairs, int8 a row, int3-g64, MXFP4 and FP8): the
+ *            pairs of one expert computed together give the bits of each pair computed on its
+ *            own, and the dequantized reference within the form's error. Here the float form
+ *            (GQ_EXACT=1, set for the whole run: vk_tier.c reads it once); with the argument
+ *            host-pairs, alone and before anything reads it, the integer form.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -264,6 +290,7 @@ static void formats(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -272,7 +299,9 @@ static void formats(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
@@ -391,6 +420,7 @@ static void blocks(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -399,7 +429,9 @@ static void blocks(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
@@ -946,9 +978,10 @@ static void layers(void) {
         Books bk = {0, 0}; double worst = 0; unsigned long long streamed = 0, kept = 0;
         int res1 = 0;
         static const int Ss[2][6] = {{1, 3, 20, 1, 2, 24}, {48, 33, 1, 64, 2, 40}};
-        if (mode == 1)   /* layer 0's experts settle, then layer 1's take their room (LFRU: a few hundred steps) */
+        if (mode == 1)   /* layer 1's (the bigger form's) experts settle, then layer 0's take their rooms (LFRU: a few
+                          * hundred steps); a bigger form's never takes a smaller one's room, which would not hold it */
             for (int t = 0; t < 360; t++) {
-                int lay = t < 60 ? 0 : 1, idx[4 * K]; float w[4 * K];
+                int lay = t < 60 ? 1 : 0, idx[4 * K]; float w[4 * K];
                 route(4, 0, 5, idx, w);
                 vkt_begin_forward();
                 double r = step(lay, 4, idx, w, &bk);
@@ -963,18 +996,18 @@ static void layers(void) {
                     double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0) : step(l, S, idx, w, &bk);
                     if (!(r <= worst)) worst = r;
                 }
-        for (int e = 0; e < E; e++) res1 += vkt_resident(1, e);
+        for (int e = 0; e < E; e++) res1 += vkt_resident(mode == 1 ? 0 : 1, e);   /* the budget of four: layer 0's */
         static const char *mn[3] = {"resident", "budget of four", "streaming"};
-        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer 1 resident, worst %.2e\n",
-               mn[mode], bk.dev, bk.routed, streamed, res1, worst);
+        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer %d resident, worst %.2e\n",
+               mn[mode], bk.dev, bk.routed, streamed, res1, mode == 1 ? 0 : 1, worst);
         unsigned long long ev, failed;
         report_counts(&ev, &failed);
         int counted = failed != ~0ull;   /* the report read back (not where stderr cannot be redirected: mingw) */
         CHECK(bk.dev > 0, "layers %s: nothing ran on the device", mn[mode]);
         CHECK(!counted || failed == 0, "layers %s: %llu uploads refused", mn[mode], failed);
         CHECK(worst < 2e-3, "layers %s: device rows off the reference (%.3g)", mn[mode], worst);
-        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the bigger form took a freed one's room "
-                                                "(%d resident, %llu evictions)", res1, ev);
+        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the smaller form took a freed room of the "
+                                                "bigger one (%d resident, %llu evictions)", res1, ev);
         if (mode == 2) CHECK(streamed > 0, "layers: nothing streamed");
         vkt_shutdown(); model_free();
         unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
@@ -1172,13 +1205,14 @@ static void grouped(void) {
                     if (r > worst) worst = r;
                 }
             coli_vk_xb_stats(&b);
-            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches;
+            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches,
+                               cg = b.chain_gemv_batches - a.chain_gemv_batches;   /* subgroups of 32: the chain's decode kernel */
             static const char *mn[4] = {"single", "whole", "mixed", "decode"};
             printf("  %-30s %-6s device %3llu of %3llu, %3llu grouped GEMM / %3llu GEMV batches, %d summed on the device, worst %.2e\n",
                    cs[c].name, mn[mode], bk.dev, bk.routed, gb, gv, summed, worst);
             CHECK(bk.dev > 0, "grouped %s %s: nothing ran on the device", cs[c].name, mn[mode]);
             CHECK(worst < (gb ? 1e-2 : 2e-3), "grouped %s %s: off the reference (%.3g)", cs[c].name, mn[mode], worst);
-            any_gemv |= gv > 0;
+            any_gemv |= gv > 0 || cg > 0;
             any_grouped |= gb > 0; any_summed |= summed > 0;
             vkt_shutdown(); model_free();
             unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
@@ -1188,15 +1222,402 @@ static void grouped(void) {
            any_summed ? "taken" : "not on this device");
     CHECK(!any_grouped || any_summed, "grouped: the device took the grouped route but never summed a whole step");
     const char *gve = getenv("COLI_VK_XB_GEMV");
-    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never the grouped GEMV");
+    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never a grouped GEMV (its own or the chain's)");
     H = h0;
+}
+
+/* vkt_report's line, read back from its stderr into out */
+static void report_line(char *out, size_t n) {
+    out[0] = 0;
+    FILE *t = tmpfile();
+    if (!t) return;
+    fflush(stderr);
+    int saved = dup(2);
+    if (saved < 0) { fclose(t); return; }
+    dup2(fileno(t), 2);
+    vkt_report("test", 0, 0);
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    rewind(t);
+    char line[4096];
+    while (fgets(line, sizeof line, t)) { fputs(line, stderr); if (strstr(line, "] tier test test:")) snprintf(out, n, "%s", line); }
+    fclose(t);
+}
+static unsigned long long after(const char *line, const char *key) {
+    const char *p = strstr(line, key);
+    return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
+}
+/* the experts of each layer on the device's memory (not the host pool), as a mask */
+static unsigned dev_mask(int l) {
+    uint8_t host[E]; unsigned m = 0;
+    if (vkt_dev_host(l, host) < 0) return ~0u;
+    for (int e = 0; e < E; e++) if (vkt_resident(l, e) && !host[e]) m |= 1u << e;
+    return m;
+}
+static void promote_case(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the pool: every expert, then one short of them */
+        set_budget(4, f, f);
+        snprintf(gb, sizeof gb, "%.12f", (c ? L * E - 0.5 : L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "promote: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        CHECK(n == L * E, "promote: planned %d experts of %d", n, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        unsigned m0 = dev_mask(0), m1 = dev_mask(1);
+        CHECK(m0 == 3u && m1 == 3u, "promote: the warm start's device set is %#x / %#x, not the history's 0 and 1", m0, m1);
+        /* phase A: batch steps on experts 5..9 (5 and 6 the hottest) */
+        Books bk = {0, 0}; double worst = 0;
+        int idx[8 * K]; float w[8 * K];
+        for (int t = 0; t < 40; t++)
+            for (int l = 0; l < L; l++) { route(4, 5, 5, idx, w); double r = step(l, 4, idx, w, &bk); if (r > worst) worst = r; }
+        unsigned a0 = dev_mask(0), a1 = dev_mask(1);
+        int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+        /* phase B: the dense chain's books on experts 2..4 (8 rows a step: they pass 5 and 6), the
+         * table read at each frame */
+        unsigned ep = vkt_epoch(); int whole = 1;
+        uint32_t *tab = malloc((size_t)E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+        for (int t = 0; t < 40 && tab; t++) {
+            vkt_settle();
+            for (int l = 0; l < L; l++) whole &= vkt_dev_table(l, tab) == E;
+            for (int l = 0; l < L; l++) { route(8, 2, 3, idx, w); vkt_dev_count(l, 8, K, idx); }
+        }
+        vkt_settle();
+        free(tab);
+        unsigned b0 = dev_mask(0), b1 = dev_mask(1);
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long ups = after(line, "read from it, "), failed = after(line, "failed ");
+        printf("  promote, %s: device sets %#x / %#x after the warm start, %#x / %#x after batch steps on 5..9 "
+               "(device %llu of %llu routed, relative error %.2e), %#x / %#x after the chain's books on 2..4; "
+               "%llu moved up, failed %llu, resident %d\n", c ? "a pool short of one expert" : "every expert in the pool",
+               m0, m1, a0, a1, bk.dev, bk.routed, worst, b0, b1, ups == ~0ull ? 0 : ups, failed, res);
+        CHECK(worst < 2e-3, "promote: relative error %.3g", worst);
+        CHECK(failed == 0, "promote: %llu failed uploads", failed);
+        CHECK(res == L * E && bk.dev == bk.routed, "promote: %d of %d resident, the device took %llu of %llu",
+              res, L * E, bk.dev, bk.routed);
+        CHECK(whole, "promote: a table read in the chain's books was not whole");
+        if (!c) {
+            CHECK(ups != ~0ull && ups >= 8, "promote: %llu experts moved up", ups);
+            CHECK(!(a0 & 3u) && !(a1 & 3u) && (a0 & 0x60u) && (a1 & 0x60u),
+                  "promote: after the batch steps on 5..9 the device holds %#x / %#x", a0, a1);
+            CHECK(!((b0 | b1) & 0x3e0u) && (b0 & 0x1cu) && (b1 & 0x1cu),
+                  "promote: after the chain's books on 2..4 the device holds %#x / %#x", b0, b1);
+            CHECK(vkt_epoch() != ep, "promote: the epoch did not move");
+        } else
+            CHECK(ups == ~0ull && a0 == 3u && a1 == 3u && b0 == 3u && b1 == 3u,
+                  "promote: a pool short of one expert moved them (%#x / %#x, %#x / %#x)", a0, a1, b0, b1);
+        vkt_shutdown();
+        ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
+        CHECK(ph.live == 0, "promote: %d host pool ranges still live after the shutdown", ph.live);
+    }
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
+/* the report's "hybrid: N steps, P host pool pairs": P, ~0 without the part */
+static unsigned long long hy_pairs(const char *line) {
+    const char *p = strstr(line, "| hybrid: ");
+    if (!p) return ~0ull;
+    p = strstr(p, "steps, ");
+    return p ? strtoull(p + 7, NULL, 10) : ~0ull;
+}
+/* vkt_host_pairs alone: 12 pairs of three experts over five rows, all at once (an expert's
+ * pairs grouped, its rows read once) and one by one; the same bits, and the float reference
+ * within tol (the float form's or the integer form's error, whichever vk_tier.c computes) */
+static void host_pairs_case(double tol) {
+    enum { HP = 512, FP = 256, NE = 3, NR = 5, NP = 12 };
+    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
+    /* a GGUF's block types, and colibri's int4-g64 pairs (fmt 4) and int8 a row (fmt 1), the
+     * host pool's layouts of VKT_SRC_I4U_PAIRS_GS and VKT_SRC_I8_ROW */
+    static const int ty[7][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}, {-5, -5}, {-7, -7}, {-12, -12}};
+    static const char *nm[7] = {"Q4_K/Q6_K", "IQ2_XXS/IQ3_XXS", "int4-g64 pairs", "int8 a row", "int3-g64", "MXFP4 g32", "FP8 g128"};
+    static const VktFmt cf[7] = {{0, 0}, {0, 0}, {VKT_SRC_I4U_PAIRS_GS, 64}, {VKT_SRC_I8_ROW, 0}, {VKT_SRC_I3_G64, 64},
+                                 {VKT_SRC_MXFP4_F32, 32}, {VKT_SRC_FP8_GS, 128}};
+    for (int c = 0; c < 7; c++) {
+        const int blk = ty[c][0] >= 0;
+        VktFmt gu = blk ? (VktFmt){(VktSrc)(VKT_SRC_GGML + ty[c][0]), 0} : cf[c];
+        VktFmt dn = blk ? (VktFmt){(VktSrc)(VKT_SRC_GGML + ty[c][1]), 0} : gu;
+        const int gsv = blk || c == 3 ? 0 : cf[c].gs;
+        Ex xe[NE]; VktHostExpert hv[NE], hp[NP]; const VktHostExpert *hx[NP]; const float *xr[NP];
+        for (int e = 0; e < NE; e++) {
+            if (blk) { mat_make_block(&xe[e].g, gu, HP, FP); mat_make_block(&xe[e].u, gu, HP, FP); mat_make_block(&xe[e].d, dn, FP, HP); }
+            else { mat_make(&xe[e].g, gu, HP, FP); mat_make(&xe[e].u, gu, HP, FP); mat_make(&xe[e].d, dn, FP, HP); }
+            hv[e] = (VktHostExpert){xe[e].g.codes, xe[e].u.codes, xe[e].d.codes, ty[c][0], ty[c][1],
+                                    blk ? (size_t)gq_row_bytes(ty[c][0], HP) : row_bytes(gu.kind, HP),
+                                    blk ? (size_t)gq_row_bytes(ty[c][1], FP) : row_bytes(dn.kind, FP),
+                                    xe[e].g.scales, xe[e].u.scales, xe[e].d.scales, gsv, gsv};
+        }
+        float *x = malloc((size_t)NR * HP * sizeof(float)), *gs = malloc((size_t)NP * 2 * FP * sizeof(float)),
+              *hs = malloc((size_t)NP * FP * sizeof(float)), *all = malloc((size_t)NP * HP * sizeof(float)),
+              *one = malloc((size_t)NP * HP * sizeof(float));
+        for (int i = 0; i < NR * HP; i++) x[i] = frnd();
+        for (int p = 0; p < NP; p++) { hp[p] = hv[pe[p]]; hx[p] = &hp[p]; xr[p] = x + (size_t)pr[p] * HP; }
+        int ok = vkt_host_pairs(hx, xr, NP, HP, FP, 0.f, 3, gs, hs, all);
+        for (int p = 0; p < NP && ok; p++) ok = vkt_host_pairs(&hx[p], &xr[p], 1, HP, FP, 0.f, 2, gs, hs, one + (size_t)p * HP);
+        CHECK(ok, "host pairs %s: vkt_host_pairs failed", nm[c]);
+        int diff = ok ? memcmp(all, one, (size_t)NP * HP * sizeof(float)) != 0 : 1;
+        double worst = 0;
+        float *hr = malloc((size_t)FP * sizeof(float));
+        for (int p = 0; p < NP && ok; p++) {   /* the float reference from the dequantized rows */
+            const Ex *m = &xe[pe[p]]; const float *xi = xr[p]; double mx = 0, er = 0;
+            for (int o = 0; o < FP; o++) {
+                double g = 0, u = 0;
+                for (int i = 0; i < HP; i++) { g += (double)m->g.w[(size_t)o * HP + i] * xi[i]; u += (double)m->u.w[(size_t)o * HP + i] * xi[i]; }
+                hr[o] = (float)(g / (1.0 + exp(-g)) * u);
+            }
+            for (int o = 0; o < HP; o++) {
+                double y = 0;
+                for (int i = 0; i < FP; i++) y += (double)m->d.w[(size_t)o * FP + i] * hr[i];
+                if (fabs(y) > mx) mx = fabs(y);
+                if (fabs(y - all[(size_t)p * HP + o]) > er) er = fabs(y - all[(size_t)p * HP + o]);
+            }
+            if (mx > 0 && er / mx > worst) worst = er / mx;
+        }
+        printf("  %-16s %d pairs of %d experts: grouped %s one by one, worst relative error %.2e against the float reference\n",
+               nm[c], NP, NE, diff ? "DIFFERS from" : "the same bits as", worst);
+        CHECK(!diff, "host pairs %s: the grouped pairs are not the bits of each on its own", nm[c]);
+        CHECK(worst < tol, "host pairs %s: relative error %.3g", nm[c], worst);
+        free(x); free(gs); free(hs); free(all); free(one); free(hr);
+        for (int e = 0; e < NE; e++) { mat_free(&xe[e].g); mat_free(&xe[e].u); mat_free(&xe[e].d); }
+    }
+}
+static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;   /* whole blocks of 256 */
+    const int blk = gu.kind >= VKT_SRC_GGML;
+    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+        if (blk) { mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H); }
+        else { mat_make(&ex[l][e].g, gu, H, F); mat_make(&ex[l][e].u, gu, H, F); mat_make(&ex[l][e].d, dn, F, H); }
+    }
+    g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, gu, dn) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1);   /* the device keeps its four: the pool's experts stay there */
+    setenv("GQ_EXACT", "1", 1);               /* the CPU's float form, against the float reference */
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the hybrid on, then COLI_VK_HYBRID=0 */
+        if (c) setenv("COLI_VK_HYBRID", "0", 1);
+        set_budget(4, gu, dn);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(gu, dn, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "hybrid: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        Books bk = {0, 0}; double worst = 0;
+        static const int Ss[] = {1, 3, 8, 1, 2, 8};
+        int idx[20 * K]; float w[20 * K];
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) { route(Ss[t], 0, E, idx, w); double r = step(l, Ss[t], idx, w, &bk); if (r > worst) worst = r; }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long pairs = hy_pairs(line);
+        for (int l = 0; l < L; l++) { route(20, 0, E, idx, w); double r = step(l, 20, idx, w, &bk); if (r > worst) worst = r; }
+        char line2[4096]; report_line(line2, sizeof line2);
+        unsigned long long pairs2 = hy_pairs(line2);
+        printf("  %s experts in the host pool, the hybrid %s: %llu pairs computed by the CPU, %llu after a 20-row step; "
+               "%llu of %llu assignments taken, worst relative error %.2e\n", nm, c ? "off" : "on",
+               pairs == ~0ull ? 0 : pairs, pairs2 == ~0ull ? 0 : pairs2, bk.dev, bk.routed, worst);
+        CHECK(worst < 2e-3, "hybrid: relative error %.3g", worst);
+        CHECK(bk.dev == bk.routed, "hybrid: the tier took %llu of %llu", bk.dev, bk.routed);
+        if (!c) {
+            CHECK(pairs != ~0ull && pairs > 0, "hybrid: no host pool pair computed by the CPU");
+            CHECK(pairs2 == pairs, "hybrid: a 20-row step computed %llu pairs on the CPU", pairs2 - pairs);
+        } else
+            CHECK(pairs == ~0ull, "hybrid: COLI_VK_HYBRID=0 computed %llu pairs on the CPU", pairs);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_HYBRID"); unsetenv("GQ_EXACT"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+    H = H0; F = F0;
+}
+
+/* DeepSeek V4's expert in the hybrid: MXFP4 ue8m0 experts, four on the device and the rest
+ * in the host pool, the CPU computing the pool's pairs in place with the device's roundings
+ * (vk_tier.c hy_act_v4, the route weight in the row). The float form (GQ_EXACT=1) against
+ * expert_v4, the engine's arithmetic: most rows bit-identical once rounded to bf16, every
+ * one close; then the same steps with COLI_VK_HYBRID=0. */
+static void v4_hybrid_case(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f);
+    const float limit = 10.0f;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1); setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1); setenv("GQ_EXACT", "1", 1);
+    uint32_t hist[L][E], *hrows[L];
+    for (int l = 0; l < L; l++) { hrows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the hybrid on, then COLI_VK_HYBRID=0 */
+        if (c) setenv("COLI_VK_HYBRID", "0", 1);
+        set_budget(4, f, f);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, limit);
+        int on = vkt_init(&vc, hrows);
+        CHECK(on, "v4 hybrid: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        unsigned long long dev = 0, same = 0, routed = 0; double worst = 0;
+        static const int Ss[] = {1, 3, 8, 1, 2, 8};
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[8 * K]; float w[8 * K];
+                route(S, 0, E, idx, w);
+                float *xq = malloc(sizeof(float) * S * H), *y = malloc(sizeof(float) * H);
+                uint8_t taken[8 * K]; const float *rows[8 * K];
+                for (int i = 0; i < S * H; i++) xq[i] = frnd() * 4.0f;
+                for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);   /* the engine's rounding of x */
+                int k = vkt_issue_w(l, xq, S, K, idx, w, taken);
+                int joined = k ? vkt_join(rows) : 1;
+                CHECK(joined, "v4 hybrid: join failed");
+                for (int i = 0; i < S * K; i++) {
+                    routed++;
+                    if (!taken[i] || !joined) continue;
+                    float dr[HF_MAX];
+                    expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, y);
+                    for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
+                    double r = rel(dr, y, H); if (r > worst) worst = r;
+                    same += !memcmp(dr, y, (size_t)H * sizeof(float));
+                    dev++;
+                }
+                free(xq); free(y);
+            }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long pairs = hy_pairs(line);
+        printf("  MXFP4 ue8m0 experts in the host pool, DeepSeek V4 roundings, the hybrid %s: %llu pairs computed by the CPU, "
+               "%llu of %llu assignments taken, %llu rows bit-identical to the engine's arithmetic, worst row %.2e\n",
+               c ? "off" : "on", pairs == ~0ull ? 0 : pairs, dev, routed, same, worst);
+        CHECK(dev == routed, "v4 hybrid: the tier took %llu of %llu", dev, routed);
+        CHECK(same * 2 > dev, "v4 hybrid: only %llu of %llu rows equal the engine's arithmetic", same, dev);
+        CHECK(worst < 2e-2, "v4 hybrid: a row off the reference (%.3g)", worst);
+        if (!c) CHECK(pairs != ~0ull && pairs > 0, "v4 hybrid: no host pool pair computed by the CPU");
+        else CHECK(pairs == ~0ull, "v4 hybrid: COLI_VK_HYBRID=0 computed %llu pairs on the CPU", pairs);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_HYBRID"); unsetenv("GQ_EXACT"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
+/* the report's ", and S prompt steps' P pairs": P, 0 without the part */
+static unsigned long long big_pairs(const char *line) {
+    const char *p = strstr(line, "prompt steps' ");
+    return p ? strtoull(p + 14, NULL, 10) : 0;
+}
+/* the report's "N host pool experts copied into the slots": N, 0 without the part */
+static unsigned long long pc_count(const char *line) {
+    const char *p = strstr(line, " host pool experts copied into the slots");
+    if (!p) return 0;
+    while (p > line && p[-1] >= '0' && p[-1] <= '9') p--;
+    return strtoull(p, NULL, 10);
+}
+static void pool_copy_case(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;   /* whole blocks of 256 */
+    VktFmt gu = {(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, dn = {(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+        mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H);
+    }
+    g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, gu, dn) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: the slots refilled within a step */
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    setenv("GQ_EXACT", "1", 1);   /* the CPU's pairs in its float form, against the float reference */
+    for (int c = 0; c < 2; c++) {   /* the copies and the CPU's few-row pairs on, then both off */
+        setenv("COLI_VK_HYBRID_BIG_ROWS", c ? "0" : "2", 1);
+        if (c) setenv("COLI_VK_TIER_POOL_COPY", "0", 1);
+        set_budget(8, gu, dn);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(gu, dn, VKT_ACT_SWIGLU, 0);
+        vc.load = load_cb; vc.release = release_cb;
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "pool copy: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0; double worst = 0;
+        static const int Ss[] = {20, 33, 48, 20};
+        int idx[48 * K]; float w[48 * K];
+        for (int t = 0; t < 4; t++)
+            for (int l = 0; l < L; l++) {
+                route(Ss[t], 0, E, idx, w);
+                vkt_begin_forward();
+                double r = stream_step(l, Ss[t], idx, w, 0, &bk, &streamed, &kept, 0);
+                if (r > worst) worst = r;
+            }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long copies = pc_count(line), cpu = big_pairs(line);
+        printf("  Q4_K/Q6_K experts in the host pool, %s: %llu copied into the slots, %llu pairs on the CPU in place, "
+               "%llu of %llu assignments taken, worst relative error %.2e\n", c ? "both off" : "the copies on, 2 rows",
+               copies, cpu, bk.dev, bk.routed, worst);
+        CHECK(worst < 2e-3, "pool copy: relative error %.3g", worst);
+        CHECK(bk.dev == bk.routed, "pool copy: the device took %llu of %llu", bk.dev, bk.routed);
+        if (!c) CHECK(copies > 0 && cpu > 0, "pool copy: %llu copied into a slot, %llu pairs on the CPU", copies, cpu);
+        else CHECK(copies == 0 && cpu == 0, "pool copy: off, yet %llu copied and %llu pairs on the CPU", copies, cpu);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_TIER_POOL_COPY"); unsetenv("COLI_VK_TIER_PROMOTE"); unsetenv("COLI_VK_TIER_RATE");
+    unsetenv("COLI_VK_HYBRID_BIG_ROWS"); unsetenv("GQ_EXACT");
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_HALF");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+    H = H0; F = F0;
 }
 
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
+        unsetenv("GQ_EXACT");
+        printf("host pairs, the integer form:\n"); host_pairs_case(5e-2);
+        printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
+        return fails != 0;
+    }
+    /* a device that shares the host's RAM (Lavapipe) has a type for the host pool only with
+     * COLI_VK_TIER_HOST=1 at the device's start (backend_vulkan.c): promote_case's pool */
+    int host_set = getenv("COLI_VK_TIER_HOST") != NULL;
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "1", 1);
+    /* the CPU's pairs of the hybrid steps (any case with a host pool: GGUF block types and
+     * colibri's int8 and int4) in their float form, against the float references; vk_tier.c
+     * reads GQ_EXACT once, so before any case (the integer form: the argument host-pairs) */
+    setenv("GQ_EXACT", "1", 1);
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
+    /* the budgets, evictions and promotions below are the device's: the host pool (a
+     * discrete card's system RAM) would take what the device leaves */
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "0", 1);
     scratch_budget();
     printf("formats:\n"); formats();
     printf("blocks:\n"); blocks();
@@ -1210,6 +1631,14 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();
+    printf("promote:\n"); promote_case();
+    printf("hybrid:\n");
+    hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");
+    hybrid_case((VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, "int4-g64");
+    hybrid_case((VktFmt){VKT_SRC_I8_ROW, 0}, (VktFmt){VKT_SRC_I8_ROW, 0}, "int8");
+    v4_hybrid_case();
+    printf("pool copy:\n"); pool_copy_case();
+    printf("host pairs:\n"); host_pairs_case(2e-3);
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */

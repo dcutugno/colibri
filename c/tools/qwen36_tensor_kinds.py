@@ -40,6 +40,8 @@ LAYER_KINDS = frozenset((
     "self_attn.o_proj.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
+    # Flint (RecursiveSI/flint): a learned sink logit per attention head
+    "self_attn.softmax_offset",
     # MoE block: router, shared expert, its gate
     "mlp.gate.weight",
     "mlp.shared_expert.gate_proj.weight",
@@ -63,14 +65,13 @@ GLOBAL_KINDS = frozenset(("embed_tokens.weight", "norm.weight", "lm_head.weight"
 
 # Whole subtrees the engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
-SKIP_PREFIXES = (
-    ("mtp.", "mtp", "multi-token-prediction head (mtp_num_hidden_layers); "
-                    "the engine predicts one token per step and never reads it"),
-)
+SKIP_PREFIXES = ()
 
 # The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
 # the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
-VISION_PREFIXES = ("model.visual.", "visual.")
+# "model.language_model.visual.": the same tower, as some finetune exports
+# (llmfan46/Qwen3.6-35B-A3B-uncensored-heretic) nest it under the language model's prefix.
+VISION_PREFIXES = ("model.visual.", "visual.", "model.language_model.visual.")
 
 _LAYER = re.compile(r"^layers\.(\d+)\.(.+)$")
 
@@ -92,13 +93,22 @@ def classify(name, prefix):
          ("global", kind)            embed / final norm / lm_head
          ("layer", index, kind)      a tensor of transformer layer <index>
          ("vision", name)            the vision tower, name after "visual."
-         ("skip", group)             mtp, deliberately not converted
+         ("mtp", name)               checkpoint MTP tensor
        or raise UnknownTensor.
 
     ``kind`` for a layer is the suffix after ``layers.<i>.``; for the
     per-expert layout it is normalised to ``mlp.experts.<e>.<proj>.weight``
     so the converter can key on it.
     """
+    if name.startswith("mtp."):
+        rest = name[4:]
+        if rest in ("fc.weight", "norm.weight", "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
+            return ("mtp", rest)
+        m = _LAYER.match(rest)
+        if m and int(m.group(1)) == 0 and not m.group(2).startswith("linear_attn."):
+            if m.group(2) in LAYER_KINDS or _EXPERT_SEPARATE.match(m.group(2)):
+                return ("mtp", rest)
+        raise UnknownTensor(name)
     for skip_prefix, group, _why in SKIP_PREFIXES:
         if name.startswith(skip_prefix):
             return ("skip", group)

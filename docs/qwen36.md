@@ -115,10 +115,134 @@ quote, repeated structure), the engine drafts the up to 5 tokens that followed i
 and checks them in one verify forward. The DeltaNet state is copied after each verify
 row, so a rejected draft rolls back by swapping a copy in. A gate drafts only where the
 measured acceptance and verify cost say it pays. The output is that of plain decoding,
-greedy or sampled, on the CPU and in the Vulkan dense chain. Lookup stays off under the
-CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
-resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+greedy or sampled, on the CPU, in the Vulkan dense chain and in the CUDA chain with every
+routed expert on the device. Lookup stays off under a CUDA tier holding part of the
+experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
+
+## The MTP head (`Q36_MTP`)
+
+`tools/convert_qwen36.py` carries the release's `mtp.*` tensors into
+`model-mtp.safetensors`. Dense weights and norms stay f16; routed experts use
+exactly the trunk's merged int8/int4, group-scale or mixed-down format.
+`Q36_MTP=1` loads this block from `SNAP`; unset or `0` leaves it unread. A
+container without the block still decodes normally and reports that the head
+is unavailable. No separate model download is needed.
+
+For a full conversion, use the usual command. To add the head to an existing
+container, only the source shards named for `mtp.*` in the release's index are
+needed. This command creates a new directory, links the base files, and writes
+only the head and updated metadata. The base is never modified; the destination
+must be new or empty, and the expert quantization is inherited from the base.
+
+```sh
+python3 c/tools/convert_qwen36.py --model /path/to/hf-checkpoint \
+  --mtp-only --base-container /path/to/converted-int4 \
+  --out /path/to/converted-with-mtp
+SNAP=/path/to/converted-with-mtp Q36_MTP=1 ./c/qwen36 8 4 "Explain speculative decoding."
+```
+
+The computation follows Qwen's MTP module: at position p, concatenate the
+normalized embedding of token p+1 with the normalized backbone output h_p,
+then `mtp.fc`, one gated full-attention decoder layer with its own KV cache,
+MoE (top-8 of 256 experts and a gated shared expert), `mtp.norm`, and the shared
+`lm_head`. **h_p is the backbone's output after its final norm**, normalized once more by
+`mtp.pre_fc_norm_hidden`; a deeper draft takes the head's own output after `mtp.norm`.
+On the released 35B checkpoint this wiring drafts better than the residual before
+the norm: first drafts accepted 89.2 / 88.6 / 85.7 % against 85.1 / 88.6 / 84.0 % on a
+German, an English and a code prompt. `tools/qwen36_mtp_ref.py` computes it with Qwen's
+Transformers decoder layer from the exact converted weights, and the harness checks
+the engine is not the other wiring.
+
+Every backbone forward feeds the completed token/hidden pairs into the head's
+KV cache; only draft rows need its full decoder computation. Rejected verify
+rows are rewound, and pins preserve the pending residual. The same verify
+path as prompt lookup commits tokens: output and final logits equal ordinary
+decoding, including sampled `serve` turns. As for lookup, speculation is off
+under a CUDA tier holding part of the experts, `CACHE_ROUTE` and qpack.
+
+`Q36_MTP_DRAFTS=1` is the default; `1` through `7` set the maximum depth, and
+`auto` lets the measured gate choose. `Q36_MTP_PMIN` (default `0`) stops adding
+deeper drafts when the newest draft's probability is below the threshold.
+`Q36_MTP_VOCAB_IDS` names a whitespace-separated list of token IDs: the head
+scores only those rows of the shared output matrix, with duplicates removed.
+The probability is then conditional on this vocabulary. Verification still
+uses the model's full vocabulary. Scores over 20 below the best are omitted
+from the float probability sum.
+
+`Q36_MTP_VOCAB=N` has the head score a list of the most used tokens instead
+(`draft_vocab.h`, the list of Qwen3.8's head): the `N` tokens with the highest
+counts, every token with at least 3/4 of the count of the `N`-th, and every
+token of the conversation; a token the conversation uses outside the list joins
+it at once. The counts come from `<model>/.coli_vocab` (`COLI_VOCAB_USAGE` names
+another file), halve every 1,024 counted tokens and are written back at exit
+unless `USAGE_SAVE=0`; while fewer than `N` tokens have a count, the lowest ids
+fill the list. Where the head drafts on the CUDA chain the list is on by default
+with `N` = 16000; elsewhere it is asked for, and `Q36_MTP_VOCAB=0` always scores
+the whole vocabulary (`N` must be an integer from 0 to the vocabulary's
+size). It stays off with the Vulkan chain and with `Q36_MTP_DUMP`, and
+`Q36_MTP_VOCAB_IDS` takes precedence. A draft can only be a listed token, and
+its probability is conditional on the list: with two or more drafts that is
+what `Q36_MTP_PMIN` and `Q36_MTP_PSTEP` read. A qwen36 engine stopped by a
+signal does not write the counts, nor one whose head turned off during the run
+(`[mtp] ... it stays off`); `coli serve` closes its input first, so it does.
+
+With the Vulkan chain the head runs on the device: its layer, its routing and its
+routed experts through the chain's device MoE, one frame a draft. `Q36_MTP_GPU=0`
+keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a device without the
+chain's MoE. With the CUDA chain and every routed expert on the card the head runs on
+its device the same way (`qwen36_mtp_cuda.h`: the chain's ops, the head's experts
+uploaded once as the tier's int8 or int4-g64 and read from an expert table of their
+addresses). There a head that cannot go on the device stays off: beside the card the
+CPU's head cost 5.1 ms a draft row and decode fell from 98 to 85-88 tok/s. Under a
+CUDA tier holding part of the experts there are no speculative steps, and `Q36_MTP=1`
+leaves the head off and says so. On the CUDA chain the head also picks its draft and the
+draft's probability on the device (`cc_pick`): 8 bytes come down a draft, not the
+vocabulary's logits. `Q36_MTP_VOCAB_IDS` and `Q36_MTP_DUMP` keep the scores coming down.
+With the `Q36_MTP_VOCAB` list the head reads only the listed rows of the `lm_head`
+already on the card (`cc_matmul_rows`), not the whole matrix; the card keeps a copy
+of the list, sent whole after a rebuild and by its new ids after an append. A
+backend without `matmul_rows` scores the whole vocabulary.
+
+Measured on an RTX PRO 4000 before the `Q36_MTP_VOCAB` list, the head scoring the
+whole vocabulary (Qwen3.6-35B-A3B int4-g64, `coli serve`, answers of 128 tokens, two
+alternated rounds of three):
+
+| `Q36_MTP_DRAFTS` | Vulkan chain | CUDA chain | drafts accepted |
+|---|---|---|---|
+| no head | 84.2-86.0 tok/s | 97.9-98.2 tok/s | |
+| 1 (the default) | 93.9-97.4 tok/s | 106.8-108.5 tok/s | 84-87% |
+| 2 | 82.0-83.7 tok/s | 90.6-91.3 tok/s | 62% |
+| 3 | 67.6-70.7 tok/s | | 42% (a 300-token answer) |
+
+A verify of more rows reads more routed experts: from the runs' forward counts, a
+verify of two rows costs about 1.5 decode steps and one of three about 2. With a
+draft row at 1.5 to 1.7 ms, one draft is the depth that pays. The greedy story of 232
+words is the same text on both chains, with and without the head. On that machine's CPU alone
+(Core i5-13500, answers of 96 tokens) one draft takes decode from 13.7-13.9 to
+14.7-14.9 tok/s, 74% of the drafts accepted. Greedy answers with and without the head are byte-identical.
+`tests/vulkan_engines.sh qwen-spec` runs the harness below in the chain on Lavapipe.
+
+Historical measurements from the earlier MTP prototype, Radeon 8060S (Strix
+Halo, RADV), Qwen3.6-35B-A3B int4-g64, 24 GB tier, chain on, 256-token answer:
+
+| trunk | without head | with head | acceptance |
+|---|---|---|---|
+| int8 | 37.6 tok/s | 44.4 tok/s | 90.6% |
+| int4 | 45.6 tok/s | 52.0 tok/s | 89.0% |
+
+A separate depth comparison measured 65.3 / 63.0 / 63.0 tok/s and 1.78 / 2.07 /
+2.48 tokens per forward at depths 1 / 2 / 3. These are retained as historical
+context, **not measurements of this checkpoint port**: weights and hidden-state
+wiring changed, so acceptance and speed must be remeasured.
+
+`make -C c qwen36-tiny-mtp-check` generates a fixture with fused experts and a
+random head under the release names. On int8 and int4-g64 containers it checks
+draft logits against the independent reference (absolute tolerance `1e-6`),
+every depth through seven with natural/forced proposals, byte-identical output
+and final logits, vocabulary/probability controls, and multiple `serve` turns
+including prefix reuse and pin restore. `Q36_MTP_FORCE=reject|accept|mixed|cycle|row1..row7`
+and `Q36_MTP_DUMP=<file>` are test controls, following the Qwen3.8 harness.
 
 ## The expert kernel
 
@@ -441,14 +565,154 @@ cache.
 
 ![Qwen3-Coder-30B-A3B in coli web](media/qwen3-coder-web.png)
 
+### Flint
+
+[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint) (Apache-2.0) is
+a 40B MoE with 2.5B active (`model_type: flint`): 49 attention layers, the
+first two dense (one MLP of 6144), the other 47 with 256 experts top-6 (512
+wide) beside an ungated shared expert (1024 wide), routed by sigmoid and
+renormalised. Every attention head has a learned sink
+(`self_attn.softmax_offset`: one more logit in the softmax's denominator, with
+no value); 35 layers see a sliding window of 513 positions (their own
+included) with RoPE, the other 14 every position without it; 32 query heads,
+4 KV heads, head dim 128.
+
+The CPU, the Vulkan chain and the CUDA chain run all of it. The tokenizer
+splits digits by three and CJK runs before o200k's letter rules
+(`tests/test_qwen36_tokenizer_flint.c` against HF's tokenizers). The chat
+template is GLM's tool-call form with no thinking switch: the model writes
+`<think>` when it decides to reason, and the gateway files what follows as
+reasoning (`tests/test_flint_chat_template.py` holds the renderer to the
+release's template byte for byte). A turn ends on any of the four tokens the
+model declares (`<|end_of_text|>`, `<|user|>`, `<|observation|>`,
+`<|developer|>`: config.json's `eos_token_id`, a GGUF's `eog_token_ids`);
+after a tool call the model writes `<|observation|>`, and the tool answers
+there. `tools/make_flint_tiny.py` writes a tiny
+Flint with a float32 reference; CI runs it on the GGUF path (`Linux (generated
+qwen36 oracles)`).
+
+```bash
+hf download RecursiveSI/flint --local-dir flint                    # 75 GB, bf16
+python3 tools/convert_qwen36.py --model flint --out flint-i4 --ebits 4 --gs 64
+coli import flint-UD-Q3_K_XL.gguf                                   # or any unsloth/flint-GGUF file
+```
+
+Every file unsloth published and the int4 gs64 container, on an RTX PRO 4000
+(24 GB) with 62 GB of RAM: a 161-token prompt and 127 tokens, prompt / decode
+in tok/s, the median of three runs after a warm-up. NLL is the teacher-forced
+loss in nats per token over the first 2048 tokens of the GPL-3 text, on the
+Vulkan chain: a text the model knows nearly by heart, so every bit lost
+shows. (On a text it does not know, 2048 tokens of colibri's own docs and
+code, every file from BF16 to UD-IQ1_M lands between 2.30 and 2.42 and the
+order is lost in the noise.)
+
+| file | size | NLL | CPU | Vulkan chain | CUDA chain |
+|---|---|---|---|---|---|
+| BF16 | 79.6 GB | 0.534 | 9 / 2.4 | 66 / 28.1 | 9 / 2.4 |
+| Q8_0 | 42.3 GB | 0.537 | 89 / 13.9 | 81 / 54.5 | 57 / 29.8 |
+| UD-Q6_K_XL | 36.3 GB | 0.541 | 86 / 15.4 | 116 / 65.7 | 104 / 51.4 |
+| UD-Q5_K_XL | 29.9 GB | 0.547 | 89 / 15.4 | 208 / 79.6 | 153 / 62.5 |
+| UD-Q4_K_XL | 25.1 GB | 0.560 | 95 / 15.8 | 210 / 77.7 | 248 / 77.4 |
+| int4 gs64 (`convert_qwen36.py`) | 25.2 GB | 0.599 | 124 / 17.1 | 903 / 94.6 | 949 / 99.0 |
+| UD-Q3_K_XL | 18.5 GB | 0.661 | 73 / 15.8 | 748 / 95.9 | 745 / 113.8 |
+| UD-IQ3_XXS | 14.5 GB | 0.859 | 59 / 15.0 | 755 / 90.3 | 696 / 120.0 |
+| UD-Q2_K_XL | 13.6 GB | 0.864 | 64 / 16.6 | 802 / 97.7 | 734 / 128.1 |
+| UD-IQ2_XXS | 11.9 GB | 1.045 | 67 / 17.7 | 811 / 95.8 | 738 / 133.0 |
+| UD-IQ1_M | 11.4 GB | 1.139 | 65 / 17.3 | 816 / 95.8 | 743 / 131.3 |
+
+Up to UD-Q3_K_XL every expert sits on the card. From UD-Q4_K_XL on the GGUFs'
+do not, and the prompt falls to what the host pool and the CPU give; the
+Vulkan chain's host pool keeps more decode than the CUDA tier there. The BF16
+file's experts are not a type the CUDA chain computes: with `COLI_VULKAN`
+unset a CUDA build hands such a file to the Vulkan chain on the same card
+([gguf.md](gguf.md)); the CUDA column is its run with `COLI_VULKAN=0`, all on
+the CPU. UD-IQ3_XXS costs as much quality as UD-Q2_K_XL for one more GB:
+UD-Q3_K_XL is the smallest file that keeps most of it.
+
+### Muse Spark Open
+
+[meta-models/Muse-Spark-Open-816B-A42B](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B)
+runs from its GGUFs ([unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF),
+UD-IQ1_S at 176 GB to UD-Q4_K_XL at 505 GB), text only. Its license lets you use,
+change and redistribute it; a product that uses it shows "Built with Muse Spark
+Open", and a model-as-a-service business past 20 million dollars a year needs an
+agreement with Meta (LICENSE.md in the repository).
+
+62 attention layers, hidden 8192, 128 query heads of 64 over 16 KV heads: 46
+layers see a window of 2048 positions with RoPE, the other 16 every position
+without it. What the engine adds for it (`model_type: muse_spark`, the GGUF's
+`muse-spark`):
+
+- an RMSNorm without a weight on the embedding, on every attention head's
+  output and on the attention branch; the attention's gate is its own
+  projection of the attention's input;
+- a residual gate after attention and after the feed-forward:
+  x = alpha * x + beta * branch;
+- the router on the hidden width, its logits times 0.177, the top-8 of 256
+  chosen on sigmoid + bias and weighted by the sigmoid; the experts at a width
+  of 4096 between a projection down and one back up, normalised in front, and
+  every expert's output scaled, then normalised, before the sum;
+- the logits times 0.177, capped at 20 tanh(x / 20).
+
+The published GGUFs hold q's and k's rows with each head's two halves
+interleaved (rotary pairs adjacent); the engine puts them back at load, a
+byte copy of whole rows, so every kernel rotates the halves as for the other
+models (`Q36_GGUF_ROPE_PERM=0` keeps the file's order). The tokenizer is o200k's
+split with tiktoken's rule that a piece in the vocabulary is that token
+(`tests/test_qwen36_tokenizer_o200k.c`: HF's ids on 102 texts, on a fixture and
+on the release's 202048 pieces).
+
+The chat format is messages to recipients: the model writes `to=self` for its
+reasoning, `to=commentary` for updates between tool calls, `to=user` for the
+answer, and a function's name for a call, written as an `<atem:function_calls>`
+block. The gateway renders the release's `chat_template.jinja` byte for byte
+(`tests/test_muse_chat.py`; the template is not in the repository, its license
+travels with every copy: `COLI_MUSE_TEMPLATE=path/to/chat_template.jinja` runs
+the check), files the reasoning as `reasoning_content`, parses the calls with
+the tools' schemas, and stops at `<|eot|>`. `reasoning_effort` sets the reasoning
+strength (low 8, medium 32, high 256, xhigh 512, the template's default); the
+template has no switch to turn reasoning off, so thinking off is low.
+
+```bash
+coli import Muse-Spark-Open-816B-A42B-UD-IQ1_S-00001-of-00005.gguf    # every part next to it
+coli serve --model Muse-Spark-Open-816B-A42B-UD-IQ1_S.colibri
+```
+
+UD-IQ1_S (175.6 GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM and two NVMe
+drives in an md array, through `coli serve`: a 303-token prompt (the template's
+system message and a 120-word question) and 63 tokens, three runs each, tok/s:
+
+| path | prompt | decode |
+|---|---|---|
+| Vulkan chain, tier and host pool | 5.0-5.3 | 1.55-1.58 |
+| CUDA chain and tier | 3.5 | 1.34-1.40 |
+| the CPU | 3.0 | 0.83-0.89 |
+
+The dense part (17.3 GB of the file's blocks) sits on the card. The Vulkan tier
+holds 193 experts there and about 3600 more in a 34.5 GB host pool the card
+reads over PCIe; the RAM cache keeps 8 a layer, and the rest of the 15872 come
+from the disk. A prompt touches nearly every expert of every layer, so it runs
+at what the disk gives. On CUDA the experts the card does not hold are computed
+on the CPU, a prompt's in one batch per expert.
+
+`tools/make_muse_tiny.py` writes a tiny Muse Spark GGUF in the published
+files' layout, rotary order included, and its greedy continuation (CI: `Linux
+(generated qwen36 oracles)`): the CPU, the CUDA chain and tier, and the Vulkan
+chain and tier give its tokens. With Q8_0 experts, `--act f32` writes Vulkan's
+reference (it reads the experts' inputs as floats, the CPU and CUDA as int8),
+and `--max-new 8 --min-gap 0.2` keeps the int8 one clear of the rounding that
+differs from one CPU to the next. The Vulkan tier holds F32 experts as int8 per
+32 (blocks it cannot read as the file has them), so Vulkan gives an F32
+oracle's tokens with `COLI_VK_TIER=0`.
+
 ### The converter's tensor contract
 
 Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,
 `mlp.experts.down_proj`), a one-layer multi-token-prediction head (`mtp.*`,
 `mtp_num_hidden_layers: 1`), and the 35B additionally a vision tower
 (`visual.*`). `tools/qwen36_tensor_kinds.py` classifies every tensor name
-before the first shard is read: layer tensors are converted, `mtp.*` and
-`visual.*` are skipped **on purpose** and reported with a count, and a name
+before the first shard is read: layer tensors, the `mtp.*` head and the
+`visual.*` tower are converted into their own shards, and a name
 the contract does not know stops the conversion. A converter that silently
 drops what it does not recognise produces a container that loads and is
 quietly missing a tensor; this one refuses instead (the GLM-5.3 precedent).
@@ -460,7 +724,7 @@ quietly missing a tensor; this one refuses instead (the GLM-5.3 precedent).
 2.4T's structural numbers at toy widths -- 92 layers, interval 4, 512 experts
 top-10, 16:1 attention heads, 8:1 DeltaNet heads -- and rewrites the shard
 into the real layout: fused experts plus an `mtp.*` head. The converter must
-split the one and skip the other, and the engine must match the transformers
+split the experts and carry the head, and the engine must match the transformers
 reference token for token. CI runs it at cache capacities 1, 2 and 512, and
 under ASan/UBSan. Locally:
 

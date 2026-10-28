@@ -18,7 +18,17 @@
  *   - a frame that fails loses the device: the state is rebuilt on the CPU from the
  *     prefix record, the step and every later one run there, and the logits still
  *     equal the CPU path's;
- *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path.
+ *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path;
+ *   - speculative steps (prompt lookup, the MTP head) run under the tier only when it holds
+ *     every routed expert and the chain runs them (q36_cuda_tier_drafts).
+ *   - routed experts in the frame, all on the device or one layer's served by the host, give
+ *     the CPU path's logits and route books, with one copy of the route ids a frame;
+ *   - the MTP head on the chain picks its drafts on the device (cc_pick): the CPU head's ids,
+ *     and its probabilities to 1e-5; a listed vocabulary, Q36_MTP_DUMP or a backend without the
+ *     op keep bringing the scores down. With the adaptive list (Q36_MTP_VOCAB) it scores the
+ *     listed rows of the device's lm_head (cc_matmul_rows), and the device's copy of the list
+ *     follows every append and every rebuild, across requests too; a backend without
+ *     matmul_rows scores the whole vocabulary.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -30,6 +40,12 @@
 
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
+/* the MTP head's device copy of its adaptive list (the fake's CC_DEV buffers live on the host) is the list */
+static int vids_same(void) {
+    const DraftVocab *v = g_q36_mtp.voc;
+    return v && g_q36_mc.vids && g_q36_mc.vids_n == v->list_n &&
+           !memcmp(g_q36_mc.vids->d, v->list, (size_t)v->list_n * sizeof(int));
+}
 
 enum { D = 64, H = 4, KV = 2, HD = 16, QDIM = 2 * HD, ROT = 8, VH = 4, VK = 2, KD = 16, VD = 16, CONVK = 4 };
 enum { CD = 2 * VK * KD + VH * VD, VDIM = VH * VD, PD = CD + VDIM, E = 4, TOPK = 2, INTER = 32, SI = 32, V = 64, NL = 2, CAP = 48 };
@@ -64,7 +80,7 @@ static void make_weights(Weights *w) {
             l->dn_norm = fvec(VD, &s, 0.2f, 1.f);
         }
         mk_qw(&l->gate, D, E, &s);
-        mk_qw(&l->sh_g, D, SI, &s); mk_qw(&l->sh_u, D, SI, &s); mk_qw(&l->sh_d, SI, D, &s);
+        mk_qw(&l->sh_g, D, SI, &s); mk_qw(&l->sh_u, D, SI, &s); mk_qw(&l->sh_d, SI, D, &s); l->sh_I = SI;
         l->sh_gate = fvec(D, &s, 0.1f, 0.f);
         for (int e = 0; e < E; e++) {
             w->eg[i][e] = malloc((size_t)INTER * D); w->eu[i][e] = malloc((size_t)INTER * D); w->ed[i][e] = malloc((size_t)D * INTER);
@@ -145,7 +161,13 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
     return ok;
 }
 
+/* a hybrid layer on the fake, whose ops run when called: the host answers inside the device's
+ * wait (the engine serves it again after the next layer, the same rows) */
+static Q36CChain *serve_ch; static Model *serve_m; static int serve_n;
+static int serve_layer1(unsigned v) { return q36cc_dm_serve(serve_ch, serve_m, 1, serve_n, v); }
+
 int main(void) {
+    setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
     setenv("COLI_LMHEAD_GPU", "0", 1);
     setenv("COLI_DENSE_IDOT", "0", 1);          /* f32 activations on the CPU too: the chain's arithmetic */
@@ -178,7 +200,8 @@ int main(void) {
         int kv_ok = 1;
         for (int h = 0; h < KV; h++) {
             size_t off = (size_t)h * CAP * HD;
-            if (maxdiff(m.K[1] + off, ref.K[1] + off, (size_t)4 * HD) > 1e-4 || maxdiff(m.V[1] + off, ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
+            if (maxdiff((const float *)m.K[1] + off, (const float *)ref.K[1] + off, (size_t)4 * HD) > 1e-4 ||
+                maxdiff((const float *)m.V[1] + off, (const float *)ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
         }
         ck(kv_ok, "the K/V rows reached the host cache as the CPU path wrote them");
     }
@@ -249,8 +272,181 @@ int main(void) {
       /* cc_ops() caches the table once per process: ask the engine's gate directly */
       ck(coli_cuda_chain_ops() == NULL, "the backend has no table");
       fake_chain_absent = 0;
-      ck(q36cc_setup(&m2, 2) == NULL, "KV_SLOTS > 1 keeps the chain off");
+      /* KV_SLOTS > 1: the chain stays on, each conversation's state in a place of its own
+       * (q36cc_conv_*, serve_mux) */
+      Q36CChain *c2 = q36cc_setup(&m2, 2);
+      ck(c2 != NULL && c2->ok, "KV_SLOTS > 1 keeps the chain on");
       (void)m2; }
+
+    printf(" F. speculative steps under the tier\n");
+    g_cuda_chain = 1;
+    ck(!q36_cuda_tier_drafts(&m), "routed experts off the device: no speculative steps (residency would follow the drafts)");
+    for (int i = 0; i < NL; i++)
+        for (int e = 0; e < E; e++) {
+            const Slot *sl = &m.cache[i].slots[e];
+            qt_note_block(i, e, (const uint8_t *)sl->g, (const uint8_t *)sl->u, (const uint8_t *)sl->d, sl->gs, sl->us, sl->ds);
+        }
+    qt_fill_wait();
+    ck(q36_cuda_tier_drafts(&m), "every routed expert on the device, the chain on: speculative steps");
+    g_cuda_chain = 0;
+    ck(!q36_cuda_tier_drafts(&m), "the chain off: none");
+
+    printf(" G. routed experts in the frame: logits, route books, one ids copy a frame\n");
+    fake_chain_table.size = offsetof(ColiCudaChainOps, tensor_dev) + sizeof fake_chain_table.tensor_dev;
+    for (int hyb = 0; hyb < 2; hyb++) {   /* every expert on the device, then layer 1 with one on the host */
+        Model r3, m3; build_model(&r3, &w); build_model(&m3, &w);
+        for (int i = 0; i < NL; i++) {
+            r3.L[i].qth_dnout = m3.L[i].qth_dnout = ref.L[i].qth_dnout;
+            r3.L[i].qth_q = m3.L[i].qth_q = ref.L[i].qth_q; r3.L[i].qth_k = m3.L[i].qth_k = ref.L[i].qth_k;
+            r3.L[i].qth_v = m3.L[i].qth_v = ref.L[i].qth_v; r3.L[i].qth_o = m3.L[i].qth_o = ref.L[i].qth_o;
+            r3.L[i].qth_shg = m3.L[i].qth_shg = ref.L[i].qth_shg; r3.L[i].qth_shu = m3.L[i].qth_shu = ref.L[i].qth_shu;
+            r3.L[i].qth_shd = m3.L[i].qth_shd = ref.L[i].qth_shd;
+        }
+        r3.freq = calloc((size_t)NL * E, sizeof(uint64_t)); m3.freq = calloc((size_t)NL * E, sizeof(uint64_t));
+        r3.resident_collecting = m3.resident_collecting = 1;
+        if (hyb) setenv("COLI_CUDA_CHAIN_PROMOTE", "0", 1);   /* the chain promotes nothing */
+        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        ck(c3 != NULL && c3->ok && c3->dm_on, "routed experts in the frame enabled");
+        if (hyb) {   /* expert 3 of layer 1 on the host, and kept there: with the residents made hot,
+                      * the tier's swap (a quarter hotter than the coldest, tier_should_promote)
+                      * never takes it back */
+            res_set(qs(1, 3), 0);
+            for (int i = 0; i < NL; i++) for (int e = 0; e < E; e++) if (qs(i, e)->resident) qs(i, e)->heat = 1u << 20;
+            serve_ch = c3; serve_m = &m3; fake_wait_hook = serve_layer1;
+        }
+        /* a step's downloads: the attention layer's K and V, the hybrid layer's ids, weights and
+         * rows, then the ids of every layer in one copy */
+        const int want = 2 + 3 * hyb + 1;
+        g_cuda_chain = 1;
+        float *lr3 = step_ex(&r3, ids, 3, 0, 1); r3.kv_len = 3;
+        int down0 = fake_chain_down_copies;
+        serve_n = 3; float *lc3 = step_ex(&m3, ids, 3, 0, 1); m3.kv_len = 3;
+        same_logits(lc3, lr3, V, "three prompt rows with routed experts in the frame");
+        ck(fake_chain_down_copies - down0 == want, hyb ? "prompt chunk: the hybrid layer's three copies, then one ids copy" :
+                                                         "prompt chunk: one route-ids download, no route-weights download");
+        int books = !memcmp(m3.seen, r3.seen, (size_t)NL * E) && !memcmp(m3.freq, r3.freq, (size_t)NL * E * sizeof(uint64_t));
+        free(lr3); free(lc3);
+        /* five decode rows, the books checked after each: ids read at the old offsets
+         * (i * rows * K, rows the chunk's capacity) would be another step's */
+        int one = 1;
+        for (int t = 3; t < 8; t++) {
+            lr3 = step_ex(&r3, ids + t, 1, t, 1); r3.kv_len = t + 1;
+            down0 = fake_chain_down_copies;
+            serve_n = 1; lc3 = step_ex(&m3, ids + t, 1, t, 1); m3.kv_len = t + 1;
+            same_logits(lc3, lr3, V, "decode row with routed experts in the frame");
+            one &= fake_chain_down_copies - down0 == want;
+            books &= !memcmp(m3.seen, r3.seen, (size_t)NL * E) && !memcmp(m3.freq, r3.freq, (size_t)NL * E * sizeof(uint64_t));
+            free(lr3); free(lc3);
+        }
+        ck(one && c3->dm_steps == 6 * NL && (hyb ? c3->dm_hyb > 0 : c3->dm_hyb == 0),
+           hyb ? "decode steps: the hybrid layer's three copies, then one ids copy" :
+                 "decode steps: one route-ids download across all layers");
+        ck(books, "route books (seen and freq) equal the CPU path's after the prompt and every step");
+        if (hyb) { fake_wait_hook = NULL; res_set(qs(1, 3), 1); unsetenv("COLI_CUDA_CHAIN_PROMOTE"); }
+        g_cuda_chain = 0;
+    }
+    fake_chain_table.size = CC_OPS_BASE_SIZE;
+
+    printf(" H. the MTP head on the CUDA chain: its drafts picked on the device\n");
+    /* the whole vocabulary or the adaptive list: picked on the device; a listed vocabulary, or a
+     * backend without the op: the scores come down and the host picks, as before; the adaptive
+     * list on a backend without matmul_rows: the whole vocabulary. Each against the CPU head. */
+    for (int hc = 0; hc < 5; hc++) {
+        static const char *what[5] = {"the whole vocabulary", "a listed vocabulary", "a backend without the op",
+                                      "an adaptive list", "an adaptive list, a backend without matmul_rows"};
+        fake_chain_table.size = hc == 2 ? offsetof(ColiCudaChainOps, pick) :
+                                hc == 4 ? offsetof(ColiCudaChainOps, matmul_rows) : sizeof(ColiCudaChainOps);
+        uint32_t ms = 99;
+        Q36Mtp *p = &g_q36_mtp;
+        memset(p, 0, sizeof *p);
+        p->on = 1; p->E = E; p->K = TOPK; p->I = INTER; p->ish = SI;
+        if (hc == 1) {   /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] */
+            p->nvoc = 16; p->vid = malloc(16 * sizeof(int));
+            for (int j = 0; j < 16; j++) p->vid[j] = 3 + 2 * j;
+            mk_qw(&p->dvoc, D, 16, &ms);
+        }
+        p->enorm = fvec(D, &ms, 0.1f, 0.f); p->hnorm = fvec(D, &ms, 0.1f, 0.f); p->head_norm = fvec(D, &ms, 0.1f, 0.f);
+        p->L.in_ln = fvec(D, &ms, 0.1f, 0.f); p->L.post_ln = fvec(D, &ms, 0.1f, 0.f);
+        p->L.qn = fvec(HD, &ms, 0.1f, 0.f); p->L.kn = fvec(HD, &ms, 0.1f, 0.f);
+        mk_qw(&p->eh, 2 * D, D, &ms);
+        mk_qw(&p->L.q, D, H * QDIM, &ms); mk_qw(&p->L.k, D, KV * HD, &ms);
+        mk_qw(&p->L.v, D, KV * HD, &ms); mk_qw(&p->L.o, H * HD, D, &ms);
+        mk_qw(&p->sh_g, D, SI, &ms); mk_qw(&p->sh_u, D, SI, &ms); mk_qw(&p->sh_d, SI, D, &ms);
+        p->router = fvec(E * D, &ms, 0.2f, 0.f); p->sh_gate = fvec(D, &ms, 0.1f, 0.f);
+        p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
+        for (int e = 0; e < E; e++) { mk_qw(&p->eg[e], D, INTER, &ms); mk_qw(&p->eu[e], D, INTER, &ms); mk_qw(&p->ed[e], INTER, D, &ms); }
+        p->pend = falloc(D);
+        if (hc == 3) {   /* the CPU head's list too: ids 40..63, so no draft's place in it is its id */
+            p->voc = draft_vocab_new(V, 16);
+            for (int t = 40; t < V; t++) draft_vocab_count(p->voc, t);
+            const int hi[3] = {40, 51, 63};
+            q36_mtp_vocab_begin(hi, 3);
+        }
+        Model r3, m3; build_model(&r3, &w); build_model(&m3, &w);
+        for (int i = 0; i < NL; i++) {
+            r3.L[i].qth_dnout = m3.L[i].qth_dnout = ref.L[i].qth_dnout;
+            r3.L[i].qth_q = m3.L[i].qth_q = ref.L[i].qth_q; r3.L[i].qth_k = m3.L[i].qth_k = ref.L[i].qth_k;
+            r3.L[i].qth_v = m3.L[i].qth_v = ref.L[i].qth_v; r3.L[i].qth_o = m3.L[i].qth_o = ref.L[i].qth_o;
+            r3.L[i].qth_shg = m3.L[i].qth_shg = ref.L[i].qth_shg; r3.L[i].qth_shu = m3.L[i].qth_shu = ref.L[i].qth_shu;
+            r3.L[i].qth_shd = m3.L[i].qth_shd = ref.L[i].qth_shd;
+        }
+        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        ck(c3 != NULL && c3->ok, "chain model ready for the MTP head");
+
+        float *hid_in = fvec(3 * D, &ms, 0.3f, 0.f), h_cpu[D], h_gpu[D];
+        memset(&g_q36_mc, 0, sizeof g_q36_mc);   /* the reference on the CPU, not the last case's head */
+        g_cuda_chain = 0;
+        q36_mtp_feed_rows(&r3, ids, 3, 0, hid_in);
+        int d1_cpu = q36_mtp_draft(&r3, ids[3], 3, h_cpu);
+        float p1_cpu = p->last_p;
+        int d2_cpu = q36_mtp_draft_more(&r3, h_cpu, d1_cpu, 4);
+        float p2_cpu = p->last_p;
+
+        g_cuda_chain = 1;
+        memset(&g_q36_mc, 0, sizeof g_q36_mc);
+        p->on = 1;
+        if (hc == 4) { p->voc = draft_vocab_new(V, 16); q36_mtp_vocab_begin(ids, 3); }   /* dropped at init */
+        q36_mtp_feed_rows(&m3, ids, 3, 0, hid_in);
+        int d1_gpu = q36_mtp_draft(&m3, ids[3], 3, h_gpu);
+        float p1_gpu = p->last_p;
+        int d2_gpu = q36_mtp_draft_more(&m3, h_gpu, d1_gpu, 4);
+        float p2_gpu = p->last_p;
+
+        int dev = hc == 0 || hc >= 3;
+        if (hc == 4) ck(!p->voc, "an adaptive list, a backend without matmul_rows: the list is dropped");
+        char msg[160];
+        snprintf(msg, sizeof msg, "%s: %s", what[hc], dev ? "the logits stay in device memory, an 8-byte pick comes down" :
+                                                            "the logits come down to the host, as before");
+        ck(g_q36_mc.on && g_q36_mc.pick_dev == dev && g_q36_mc.outd->kind == (dev ? CC_DEV : CC_DOWN) &&
+           (!dev || (g_q36_mc.pick->kind == CC_DOWN && g_q36_mc.pick->bytes == 8)), msg);
+        snprintf(msg, sizeof msg, "%s: draft 1 and draft 2 equal the CPU head's, their probabilities to 1e-5", what[hc]);
+        ck(d1_gpu == d1_cpu && d2_gpu == d2_cpu && fabsf(p1_gpu - p1_cpu) <= 1e-5f * p1_cpu && fabsf(p2_gpu - p2_cpu) <= 1e-5f * p2_cpu,
+           msg);
+        if (hc == 3) ck(d1_gpu >= 40 && d2_gpu >= 40, "an adaptive list: the drafts are the list's ids, not their places in it");
+        if (hc == 0) {
+            setenv("Q36_MTP_DUMP", "/tmp/unused", 1);
+            memset(&g_q36_mc, 0, sizeof g_q36_mc);
+            ck(q36_mc_init(&m3) && !g_q36_mc.pick_dev && g_q36_mc.outd->kind == CC_DOWN,
+               "Q36_MTP_DUMP set when the head is set up: the logits buffer on the host, as before");
+            unsetenv("Q36_MTP_DUMP");
+        }
+        if (hc == 3) {   /* the device's copy of the list (read straight from the fake's buffer) */
+            q36_mtp_vocab_step(7);   /* an id outside the list: appended at its tail */
+            int d3 = q36_mtp_draft_more(&m3, h_gpu, d2_gpu, 5);
+            ck(p->voc->list[p->voc->list_n - 1] == 7 && vids_same(), "an adaptive list: an appended id reaches the device");
+            while (!p->voc->run.rebuilds) q36_mtp_vocab_step(5);   /* the counts halve: a rebuilt list */
+            int d4 = q36_mtp_draft_more(&m3, h_gpu, d3, 6);
+            ck(vids_same(), "an adaptive list: a rebuilt list reaches the device");
+            const int next[3] = {60, 33, 48};
+            q36_mtp_vocab_begin(next, 3);   /* the next request: after one rebuild the list changes again */
+            q36_mtp_draft_more(&m3, h_gpu, d4, 7);
+            ck(vids_same(), "an adaptive list: the next request's list reaches the device");
+        }
+        if (p->voc) { draft_vocab_free(p->voc); p->voc = NULL; }
+        free(hid_in);
+        g_cuda_chain = 0;
+    }
+    fake_chain_table.size = CC_OPS_BASE_SIZE;
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }

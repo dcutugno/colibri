@@ -22,6 +22,7 @@ COLI_SETUP_HOME):
 It installs nothing system-wide. When a package is missing it prints the exact
 command for this system and lets the user run it.
 """
+import http.client
 import json
 import os
 import re
@@ -274,6 +275,21 @@ def cuda_release_advice(sm, version=None):
     return None, f"install a CUDA toolkit whose `nvcc --list-gpu-arch` lists compute_{sm}"
 
 
+def _cc_finds_vulkan_h(cc):
+    """Whether the compiler the build would use finds <vulkan/vulkan.h> on its own include
+    path: a Nix shell's headers sit in the store, named by NIX_CFLAGS_COMPILE (the gcc
+    wrapper reads it), others by CPATH or C_INCLUDE_PATH; the build sees them the same way
+    (#2122). Only the preprocessor runs, on one line."""
+    if not cc:
+        return False
+    try:
+        r = subprocess.run([cc, "-E", "-x", "c", "-", "-o", os.devnull], input="#include <vulkan/vulkan.h>\n",
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
@@ -315,7 +331,7 @@ def toolchain(here=None):
         tc["vulkan_headers"] = False   # macOS: the GPU path is Metal, not offered here
     else:
         tc["vulkan_headers"] = any(os.path.isfile(os.path.join(p, "vulkan", "vulkan.h"))
-                                   for p in ("/usr/include", "/usr/local/include"))
+                                   for p in ("/usr/include", "/usr/local/include")) or _cc_finds_vulkan_h(tc["cc"])
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))
@@ -428,13 +444,20 @@ VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 #:     "Linux CUDA tier"); and dsv4_cuda_backend_arch_ok turns the tier on from
 #:     compute 6.0, so an older card would sit idle while the CPU did the work.
 #:
-#: glm53 links no CUDA object (its accelerator is Metal) and the remaining
-#: engines are CPU-only: none of them is here, so none of them is built with CUDA.
+#:   backend_cuda.o (glm53, deepseek_v41, mimo): the routed-expert tier on a CUDA
+#:     device (cu_tier.h). A build with Vulkan too runs on Vulkan unless
+#:     COLI_VULKAN=0 (CUDA_WITH_VULKAN), whose dense chain puts the trunk on the card.
+#:
+#: The remaining engines are CPU-only: none of them is here, so none of them is
+#: built with CUDA.
 CUDA_ENGINES = {
     "qwen36": {"object": "backend_cuda.o"},
     "qwen38": {"object": "backend_cuda.o"},
     "glm": {"object": "backend_cuda.o"},
     "kimi": {"object": "backend_cuda.o"},
+    "glm53": {"object": "backend_cuda.o"},
+    "deepseek_v41": {"object": "backend_cuda.o"},
+    "mimo": {"object": "backend_cuda.o"},
     "inkling": {"object": "backend_cuda_ink.o"},
     "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
                     "min_toolkit": (12, 0), "no_tc_below": (12, 8)},
@@ -694,6 +717,14 @@ def engine_path(directory, family):
 # ---------------------------------------------------------------- building
 
 
+#: CUDA engines built with Vulkan too, which run on it in a build with both where their CUDA
+#: path lacks the work: a GGUF (qwen36.c, qwen38.c, colibri.c: the CUDA backend takes no ggml
+#: block types; deepseek_v4: its CUDA tier mirrors native FP4 experts only), Kimi K3 (its
+#: CUDA experts upload every routed expert at every call) and Inkling (its CUDA backend
+#: leaves the routed experts on the CPU)
+CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4", "glm53", "deepseek_v41", "mimo")
+
+
 def make_command(family, backend, tc, make_args=()):
     """The make invocation for this engine and backend (argv, cwd, env).
     `make_args` are the extra variables the decision asked for
@@ -705,6 +736,11 @@ def make_command(family, backend, tc, make_args=()):
         args.append("VK=1")
     elif backend == "cuda":
         args.append("CUDA=1")
+        # Vulkan too where it builds, for the engines that run on it when their CUDA path
+        # lacks the work (CUDA_WITH_VULKAN; the Windows CUDA package has both already): a
+        # GGUF, Kimi K3's or Inkling's routed experts stay on the NVIDIA card
+        if family.id in CUDA_WITH_VULKAN and tc.get("can_build_vulkan") and host_os() != "win32":
+            args.append("VK=1")
         if not any(arg.startswith("CUDA_ARCH=") for arg in make_args):
             args.append(f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}")
     args += list(make_args)
@@ -858,8 +894,12 @@ def _download_asset(release, name, folder):
                                              headers={"User-Agent": "colibri-setup"})
             with urllib.request.urlopen(request, timeout=30) as response:
                 sums = parse_sha256sums(response.read().decode("utf-8", "replace"))
-        except (urllib.error.URLError, OSError):
-            sums = {}
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            raise SetupError(f"cannot read SHA256SUMS.txt for {name}: {error}") from error
+        if name not in sums:
+            raise SetupError(f"release {release['tag']}: SHA256SUMS.txt has no valid SHA256 for {name}")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, name)
     # The asset size is not in the listing we keep; HEAD-less: let the server tell.
@@ -1315,9 +1355,11 @@ def _pid_alive(pid):
         return False
 
 
-def _get_json(url, timeout=2.0):
+def _get_json(url, timeout=2.0, *, require_colibri=False):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
+            if require_colibri and (response.headers.get("Server") or "").split()[:1] != ["colibri"]:
+                return response.status, None
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as error:
         error.close()
@@ -1351,10 +1393,19 @@ def port_free(host, port):
 
 
 def pick_port(host, preferred, tries=20):
-    for port in range(preferred, preferred + tries):
+    # 0 is "any port" to bind() and a negative value makes connect_ex raise
+    # OverflowError. Neither is a port setup can advertise.
+    if preferred < 1:
+        raise SetupError("port must be from 1 to 65535; "
+                         "rerun `coli setup --port PORT`")
+    if preferred > 65535:
+        raise SetupError("no higher port is available (maximum 65535); "
+                         "rerun `coli setup --port PORT` with a lower port")
+    last = min(preferred + tries - 1, 65535)
+    for port in range(preferred, last + 1):
         if port_free(host, port):
             return port
-    raise SetupError(f"ports {preferred}-{preferred + tries - 1} are all in use; pass --port")
+    raise SetupError(f"ports {preferred}-{last} are all in use; pass --port")
 
 
 def last_turn_speed(profile):
@@ -1377,7 +1428,7 @@ def server_status(cfg):
         pid = None
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
-    code, health = _get_json(f"http://{shown}:{port}/health")
+    code, health = _get_json(f"http://{shown}:{port}/health", require_colibri=True)
     if code == 200 and isinstance(health, dict) and health.get("status") == "ok":
         state = "ready"
     elif alive:
@@ -2001,6 +2052,7 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
+    write_state("starting")
     overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
     if cfg and not picking and not overriding and config_ready(cfg):
         cfg = remember_split_dirs(cfg, out=ui.say)
@@ -2031,6 +2083,8 @@ def cmd_setup(a, ui=None):
                 save_config(cfg)
                 ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
+            write_state("ready", model=(cfg.get("model") or {}).get("id"),
+                        model_dir=cfg["model_dir"])
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
@@ -2184,7 +2238,8 @@ def _finish(ui, cfg, a):
         if not a.no_start:
             result["status"] = start_server(cfg, background=True, open_browser=not a.no_browser,
                                             out=lambda *_: None)
-            write_state("started", urls=cfg["urls"])
+            result["config"] = load_config() or cfg
+            write_state("started", urls=result["status"]["urls"])
         print(json.dumps(result, indent=2))
         return 0
     if a.no_start:
@@ -2193,8 +2248,8 @@ def _finish(ui, cfg, a):
         return 0
     ui.say("\nStarting colibri")
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
-        write_state("started", urls=cfg["urls"])
+        status = start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
+        write_state("started", urls=status["urls"])
         ui.say("  stop: coli stop")
         return 0
     return start_server(cfg, background=False, open_browser=not a.no_browser, out=ui.say)

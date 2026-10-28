@@ -28,7 +28,7 @@ def load_config(model_dir) -> dict:
     if model_dir:
         path = Path(model_dir) / "config.json"
         if path.is_file():
-            vision = json.loads(path.read_text()).get("vision_config") or {}
+            vision = json.loads(path.read_text(encoding="utf-8")).get("vision_config") or {}
             for key in DEFAULTS:
                 if key in vision:
                     settings[key] = vision[key]

@@ -9,6 +9,18 @@ import openai_server
 from test_openai_server import ScriptedEngine, _spawn_test_server, _post_chat, _error_body
 
 
+class WavHeaderTest(unittest.TestCase):
+    def test_data_chunk_after_declared_riff_boundary_is_rejected(self):
+        fmt = struct.pack('<HHIIHH', 1, 1, 16000, 32000, 2, 16)
+        inside = b'fmt ' + struct.pack('<I', len(fmt)) + fmt
+        outside = b'data' + struct.pack('<I', 16) + b'\0' * 16
+        wav = b'RIFF' + struct.pack('<I', len(inside) + 4) + b'WAVE' + inside + outside
+        with patch.object(openai_server, '_np', return_value=None), \
+                self.assertRaises(openai_server.APIError) as caught:
+            openai_server.decode_wav_mono16k(wav, "audio")
+        self.assertIn("missing fmt/data", str(caught.exception))
+
+
 class WavAudioTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +105,24 @@ class WavAudioTest(unittest.TestCase):
         wav = b'RIFF' + struct.pack('<I', len(chunks) + 4) + b'WAVE' + chunks
         decoded = openai_server.decode_wav_mono16k(wav, 'audio')
         self.np.testing.assert_array_equal(decoded, [0.25, -0.5])
+
+    def test_odd_trailing_chunk_may_omit_its_pad(self):
+        # RIFF ends on a 1-byte JUNK body. The pad byte is not in the file.
+        # wave reads the PCM; requiring the pad rejects a playable file.
+        data = struct.pack('<h', 16384)
+        chunks = self.chunk(b'fmt ', self.fmt()) + self.chunk(b'data', data)
+        chunks += b'JUNK' + struct.pack('<I', 1) + b'x'
+        wav = b'RIFF' + struct.pack('<I', 4 + len(chunks)) + b'WAVE' + chunks
+        decoded = openai_server.decode_wav_mono16k(wav, 'audio')
+        self.np.testing.assert_array_equal(decoded, [0.5])
+
+    def test_odd_chunk_missing_its_pad_before_the_end_is_rejected(self):
+        data = struct.pack('<h', 16384)
+        junk = b'JUNK' + struct.pack('<I', 1) + b'x'   # no pad, and data follows
+        chunks = self.chunk(b'fmt ', self.fmt()) + junk + self.chunk(b'data', data)
+        wav = b'RIFF' + struct.pack('<I', 4 + len(chunks)) + b'WAVE' + chunks
+        with self.assertRaises(openai_server.APIError):
+            openai_server.decode_wav_mono16k(wav, 'audio')
 
 
 if __name__ == '__main__':

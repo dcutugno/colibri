@@ -7,7 +7,9 @@
  * (tests/qwen36_fake_cuda.h, the kernels' arithmetic): once with the chain on, once
  * with a frame that fails mid-run (the state rebuilt on the CPU, the run finishing
  * there), once without the chain. Every run must stay within the oracle's limits
- * (ref.json), the chain runs must have set up and run every layer on the device. */
+ * (ref.json), the chain runs must have set up and run every layer on the device.
+ * Then the promotions' brake (q38cc_braked) on frames written by hand: the fixture has
+ * no GGUF, so no host pool and no promotion runs above. */
 #define main qwen38_main_unused
 #include "../qwen38.c"
 #undef main
@@ -24,6 +26,8 @@
 
 static int t_fails;
 static void tk(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); t_fails++; }
+/* a frame's books as q38cc_dm_books keeps them: its routes, miss of them read from the pool */
+static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes += routes; b->pool_reads += miss; return q38cc_braked(b); }
 
 int main(void) {
     setenv("SNAP", "./qwen38_tiny_fp8", 1);
@@ -81,6 +85,32 @@ int main(void) {
     unsetenv("Q38_MTP_FORCE");
     setenv("Q38_MTP", "0", 1);
     qt_shutdown();
+
+    printf(" the promotions' brake\n");
+    unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    tk(q38cc_promote_hits() == Q38CC_PROMO_HITS, "unset: the default threshold");
+    setenv("COLI_CUDA_CHAIN_PROMOTE_HITS", "150", 1);
+    int h_hi = q38cc_promote_hits();
+    setenv("COLI_CUDA_CHAIN_PROMOTE_HITS", "-3", 1);
+    tk(h_hi == 100 && q38cc_promote_hits() == 0, "the threshold clamped to 0-100");
+    unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    static Q38CChain b0;
+    Q38CChain b = b0; b.promo_hits = 90;
+    tk(brake_frame(&b, 0, 0) == 0, "no routes yet: no brake");
+    tk(brake_frame(&b, 1000, 100) == 1, "90 % of the routes on the card: the frame promotes nothing");
+    tk(brake_frame(&b, 1000, 300) == 0, "the window at 80 %: promotions again");
+    tk(brake_frame(&b, 100000, 2000) == 1, "a prompt chunk weighs its rows: 97.6 % over the window");
+    tk(b.pr_braked == 2, "the braked frames counted");
+    b = b0; b.promo_hits = 90;
+    tk(brake_frame(&b, 1000, 101) == 0, "just under the threshold: no brake");
+    b = b0; b.promo_hits = 90;
+    int held = 0;
+    brake_frame(&b, 100000, 100000);   /* a frame that found nothing on the card */
+    for (int f = 1; f < Q38CC_PROMO_WIN; f++) held += brake_frame(&b, 1000, 0);
+    tk(held == 0, "a frame of misses holds the window while it is in it");
+    tk(brake_frame(&b, 1000, 0) == 1, "past the window it is forgotten");
+    b = b0; b.promo_hits = 0;
+    tk(brake_frame(&b, 1000, 0) == 0 && b.pr_braked == 0, "COLI_CUDA_CHAIN_PROMOTE_HITS=0: never");
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");

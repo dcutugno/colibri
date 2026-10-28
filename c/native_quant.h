@@ -198,4 +198,30 @@ static inline int coli_v4_vk_fp8(float *output, const ColiTensorView *weight,
 }
 #endif
 
+#include "ggml_view.h"   /* coli_ggml_matmul: a GGUF matrix on the CPU */
+
+/* A GGUF's dense matrix on the CUDA device the expert tier opened (deepseek_v4.c, v4_cu_ggml):
+ * output[batch, rows] = input[batch, columns] W^T. 0 = done there, anything else = the CPU's
+ * path. NULL in a build or a run without it. The dense entries (fp8 matvec and batch, the
+ * compressors, the head) come through coli_v4_ggml_mm; the routed experts' fp4 entries do not. */
+#ifdef COLI_CUDA
+typedef int (*ColiV4CuGgml)(float *output, const ColiTensorView *weight, const float *input, int batch);
+extern ColiV4CuGgml coli_v4_cu_ggml;
+#endif
+static inline int coli_v4_ggml_mm(float *y, const ColiTensorView *w, const float *x, int S) {
+#ifdef COLI_CUDA
+    if (coli_v4_cu_ggml && coli_v4_cu_ggml(y, w, x, S) == 0) return 0;
+#endif
+    return coli_ggml_matmul(y, w, x, S);
+}
+/* two matrices on the same input (the shared expert's gate and up) */
+static inline int coli_v4_ggml_mm2(float *y1, const ColiTensorView *w1, float *y2, const ColiTensorView *w2,
+                                   const float *x, int S) {
+#ifdef COLI_CUDA
+    if (coli_v4_cu_ggml && coli_v4_cu_ggml(y1, w1, x, S) == 0)
+        return coli_v4_ggml_mm(y2, w2, x, S);
+#endif
+    return coli_ggml_matmul2(y1, w1, y2, w2, x, S);
+}
+
 #endif

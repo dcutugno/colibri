@@ -345,6 +345,9 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
     part = dest + ".part"
     if os.path.exists(part) and os.path.getsize(part) > size:
         os.remove(part)
+    if size == 0:
+        with open(part, "wb"):
+            pass
     if not (os.path.exists(part) and os.path.getsize(part) == size):
         target = wsl_windows_path(part)
         if not target:
@@ -463,6 +466,9 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
 
         found = locate(model_dir, spec, extra_dirs) if extra_dirs else None
         if found and found != dest:
+            if verify and not verify_file(found, spec):
+                raise DownloadError(f"{found}: checksum mismatch for the requested revision; "
+                                    "replace the shard on the split drive and rerun")
             done_before += int(spec["size"])
             on_bytes(int(spec["size"]), int(spec["size"]))
             continue

@@ -113,6 +113,11 @@ GEOMETRIES = {
     "qwen3-coder-30b": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=1, head_dim=16,
                             rope_dim=16, n_experts=16, topk=4, inter=32,
                             fused_experts=False, mtp=False, plain_qwen3=True),
+    # Qwen/Qwen3-8B, config.json: Qwen3ForCausalLM (qwen3), the dense Qwen3: 36 attention
+    # layers, 32:8 heads of 128, one SwiGLU MLP per layer, full rotary, plain RMSNorm.
+    "qwen3-8b-dense": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=2, head_dim=16,
+                           rope_dim=16, n_experts=0, topk=0, inter=128,
+                           fused_experts=False, mtp=False, plain_qwen3=True),
 }
 
 
@@ -122,7 +127,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     transformers saves routed experts one tensor per expert and never writes an
     mtp head. The real 35B and 2.4T checkpoints do the opposite on both counts,
     and those are the two paths the converter's tensor contract has to be seen
-    handling: splitting the fused tensor, and skipping mtp.* on purpose.
+    handling: splitting the fused tensor and carrying the MTP block.
     """
     from safetensors.torch import load_file, save_file
     path = out / "model.safetensors"
@@ -147,7 +152,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     if mtp:
         # One MTP layer shaped like the last transformer layer (an attention
         # layer, since (n_layers-1) % 4 == 3 for every geometry here), plus the
-        # four glue tensors the real checkpoints carry. Random, never read.
+        # four glue tensors the real checkpoints carry. Random, checked by qwen36_mtp_ref.py.
         g = torch.Generator().manual_seed(seed + 1)
         src = f"model.layers.{n_layers - 1}."
         for k in list(tens):
@@ -184,7 +189,8 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         model = _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts,
                              topk, inter, vocab)
         return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
-                                   "full", fused_experts, mtp, hidden, seed, "qwen3_moe_tiny")
+                                   "full", fused_experts, mtp, hidden, seed,
+                                   "qwen3_moe_tiny" if n_experts else "qwen3_tiny")
     ModelCls, ConfigCls = get_classes(dense)
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
@@ -233,13 +239,15 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
 
 def _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts, topk, inter,
                  vocab):
-    """Qwen3-MoE as transformers ships it (Qwen3MoeForCausalLM). The RMSNorm weights
+    """Qwen3-MoE as transformers ships it (Qwen3MoeForCausalLM), or with no experts the
+    dense Qwen3 (Qwen3ForCausalLM, intermediate_size = inter). The RMSNorm weights
     are drawn around 1 instead of left at 1, so a container that applied them as
     zero-centered (1 + w), the Qwen3.5/3.6 convention, could not pass."""
     import transformers
-    ModelCls = getattr(transformers, "Qwen3MoeForCausalLM", None)
+    cls_name = "Qwen3MoeForCausalLM" if n_experts else "Qwen3ForCausalLM"
+    ModelCls = getattr(transformers, cls_name, None)
     if ModelCls is None:
-        sys.exit("this transformers build has no Qwen3MoeForCausalLM")
+        sys.exit(f"this transformers build has no {cls_name}")
     ConfigCls = ModelCls.config_class
     base = dict(
         vocab_size=vocab, hidden_size=hidden, intermediate_size=hidden * 2,
@@ -251,6 +259,11 @@ def _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts, topk,
         attention_bias=False, use_sliding_window=False, hidden_act="silu",
         rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
         pad_token_id=0, bos_token_id=1, eos_token_id=vocab - 1)
+    if not n_experts:
+        for key in ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                    "norm_topk_prob", "decoder_sparse_step", "mlp_only_layers"):
+            base.pop(key)
+        base["intermediate_size"] = inter
     try:
         cfg = ConfigCls(**base)
     except TypeError:

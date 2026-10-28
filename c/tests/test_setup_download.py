@@ -68,6 +68,19 @@ class DownloadTest(unittest.TestCase):
         return [r["headers"].get("Range") for r in self.hub.requests
                 if r["path"].endswith("/" + name) and "/cdn/" in r["path"]]
 
+    def test_windows_empty_file_needs_no_transport(self):
+        dest = os.path.join(self.dst, "empty.txt")
+        spec = {"size": 0, "git_oid": hashlib.sha1(b"blob 0\0").hexdigest()}
+        with mock.patch.object(setup_download, "wsl_windows_path", return_value=None) as translate:
+            result = setup_download.download_file_windows(
+                "https://example.test/empty.txt", dest, spec, "unused-curl")
+        self.assertEqual(result, "downloaded")
+        self.assertEqual(Path(dest).read_bytes(), b"")
+        self.assertFalse(Path(dest + ".part").exists())
+        translate.assert_not_called()
+        self.assertEqual(setup_download.download_file_windows(
+            "unused", dest, spec, "unused-curl"), "present")
+
     def test_listing_sizes_hashes_and_filters(self):
         files = {f["path"]: f for f in self.listing()}
         self.assertEqual(set(files), set(self.files))
@@ -263,6 +276,46 @@ class DownloadTest(unittest.TestCase):
         Path(other, "model-00001.safetensors").write_bytes(self.files["model-00001.safetensors"])
         os.replace(os.path.join(self.dst, "config.json"), os.path.join(other, "config.json"))
         self.assertFalse(setup_download.is_complete(self.dst, [other]))
+
+    def test_split_shard_checks_requested_digest_before_completing(self):
+        name = "model-00001.safetensors"
+        previous = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = self.files[name]
+        shard.write_bytes(stale)
+        Path(self.src, name).write_bytes(b"x" * previous["size"])
+        spec = self.spec(name)
+        self.assertEqual(spec["size"], previous["size"])
+        self.assertNotEqual(spec["sha256"], previous["sha256"])
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.download_repo(REPO, "current", self.dst, [spec],
+                                         base=self.hub.base, extra_dirs=[str(other)])
+        self.assertIn(str(shard), str(caught.exception))
+        self.assertIn("checksum", str(caught.exception))
+        self.assertFalse(setup_download.read_manifest(self.dst)["complete"])
+        self.assertEqual(shard.read_bytes(), stale)
+        self.assertFalse(Path(self.dst, name).exists())
+
+    def test_split_shard_disabled_verification_and_absent_digest(self):
+        name = "model-00001.safetensors"
+        spec = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = b"x" * spec["size"]
+        shard.write_bytes(stale)
+        for verify, listed in ((False, spec), (True, dict(spec, sha256=None, git_oid=None))):
+            with self.subTest(verify=verify):
+                before = len(self.hub.requests)
+                setup_download.download_repo(REPO, "current", self.dst, [listed],
+                                             base=self.hub.base, extra_dirs=[str(other)],
+                                             verify=verify)
+                self.assertTrue(setup_download.read_manifest(self.dst)["complete"])
+                self.assertEqual(shard.read_bytes(), stale)
+                self.assertEqual(len(self.hub.requests), before)
+                self.assertFalse(Path(self.dst, name).exists())
 
     def test_repository_download_refuses_existing_symlinks_outside_model_dir(self):
         os.makedirs(self.dst)

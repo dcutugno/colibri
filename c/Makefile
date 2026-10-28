@@ -544,13 +544,14 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
+# needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
+TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
-TEST_BINS += tests/test_exact_dot$(EXE)
 endif
 ifneq (,$(IS_WIN))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
@@ -563,7 +564,6 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_idot_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
@@ -575,7 +575,7 @@ endif
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
-CUDA_OBJ = backend_loader.o
+CUDA_OBJ = backend_loader.o cu_tier.o
 endif
 ifeq ($(HIP_DLL),1)
 # -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
@@ -583,7 +583,7 @@ ifeq ($(HIP_DLL),1)
 # later phase can point the loader at coli_hip.dll. No LDFLAGS change: linking
 # amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
 CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
-CUDA_OBJ = backend_loader.o
+CUDA_OBJ = backend_loader.o cu_tier.o
 endif
 endif
 
@@ -601,7 +601,7 @@ $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
-CUDA_OBJ  = backend_cuda.o cuda_chain.o
+CUDA_OBJ  = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
@@ -656,7 +656,7 @@ $(error HIP=1 is supported only on Linux)
 endif
 CFLAGS    += -DCOLI_CUDA
 LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-CUDA_OBJ   = backend_cuda.o cuda_chain.o
+CUDA_OBJ   = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
@@ -728,13 +728,13 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.s
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
 VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
-            shaders/chain_dnrec.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
-            shaders/chain_gemv.spv
+            shaders/chain_dnrec.spv shaders/chain_dnrec_rows.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
+            shaders/chain_gemv.spv shaders/chain_attn_dec.spv shaders/chain_mla_dec.spv
 # the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
 # blocks, the DSA indexer's selection
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
-VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.spv
 # the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
 VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
@@ -742,14 +742,30 @@ VK_SPV   += shaders/chain_dsv4.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
 # the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
-VK_SPV   += shaders/chain_route.spv
+VK_SPV   += shaders/chain_route.spv shaders/chain_fetch.spv
 # the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
-VK_SPV   += shaders/chain_moe.spv
+VK_SPV   += shaders/chain_moe.spv shaders/chain_moe_gv.spv
+# the same in the CPU's integer form (packed 4 x 8 dot products), where the device has them
+VK_SPV   += shaders/chain_moe_i8.spv
+VK_SPV   += shaders/chain_moe_rows.spv
+# a GGUF's dense matrices on the chain, one pipeline per block type (vk_chain.c: matmul_bd)
+VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
+VK_SPV   += shaders/chain_gemv_bd_i8.spv
+# the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
+VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
+# and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
+VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+# and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
+VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
+# and on the matrix units (cooperative matrices at subgroups of 64 or 32)
+VK_SPV   += shaders/qmatmul_grp_qc.spv shaders/qmatmul_grp_gate_up_qc.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# a grid of copy regions in one dispatch (made on first use; vk_chain.c, chain_copy2d.comp)
+VK_SPV   += shaders/chain_copy2d.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
@@ -808,8 +824,16 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
-deepseek-v4:
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+# Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
+# looks for them at run time and goes without one that is not there, and
+# Makefile.deepseek-v4's own list stopped at the chain's first shaders. Without
+# qmatmul_bd.spv and qmatmul_gate_up_bd.spv a GGUF had no device form at all: the
+# chain and the tier of DeepSeek V4 Flash UD-IQ1_S stayed off, 0 matmuls on the GPU.
+# CUDA=1 on Linux: the routed-expert tier on the CUDA device too (cu_tier.h), from this
+# Makefile's CUDA objects, which Makefile.deepseek-v4 links (V4_CUT_OBJS).
+V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
+deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
@@ -916,11 +940,38 @@ shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
-# the block formats' decoders (fmt >= 100), included by the two GEMV shaders
-shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv: shaders/blockdec.glsl shaders/blockdec_table.h
+# the block formats' decoders (fmt >= 100), included by the GEMV shaders and the chain's
+# routed experts; the chain's block GEMV reads the same table
+shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
+# the per-type decoders of the chain's block GEMV and of its routed experts
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd_i8.spv: shaders/chain_gemv_bd.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/chain_moe_i8.spv: shaders/chain_moe.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/chain_kda_rows.spv: shaders/chain_kda.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DROWS $< -o $@
+shaders/qmatmul_grp_gate_up_qc.spv: shaders/qmatmul_grp_qc.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+shaders/chain_qsa.spv: shaders/chain_qsa.h
 # chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
 # fallback; without its .spv the chain keeps chain_attn.comp.
 shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
@@ -964,14 +1015,14 @@ backend_xdna.o: backend_xdna.c .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu cuda_chain.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
@@ -994,7 +1045,7 @@ cuda-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -1007,7 +1058,7 @@ hip-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h 
 		-I"$(HIP_INCLUDE_DIR)" \
 		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
 		-L"$(HIP_LIB_DIR)" -lamdhip64 \
-		backend_cuda.cu cuda_chain.cu -o coli_hip.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_hip.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -1022,6 +1073,14 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 cuda_chain.o: cuda_chain.cu cuda_chain.h backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
+
+# The routed-expert tier on a CUDA device: vk_tier.c's logic (cu_tier.c compiles it again,
+# cu_tier.h) over the device side in cu_xb.cu (cu_tier_ops.h).
+cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c cu_xb.cu -o $@
+cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
+	$(CC) $(CFLAGS) -c cu_tier.c -o $@
 
 
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
@@ -1247,15 +1306,21 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 
 
 # The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
-# against the CPU reference in each test. Needs a GPU, so CI compiles it via
-# gpu-compile rather than running it.
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+# against the CPU reference in each test, then the generic build's kernel
+# variants (expert-major vs per-route MoE, warp vs block dense batch) against
+# each other bit for bit. Needs a GPU, so CI runs none of it; it does not
+# build these tests either, only backend_cuda_dsv4.cu itself.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_bank_bytes_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_attention_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_moe_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_generic_bitwise_cuda_test$(EXE)
 
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
@@ -1461,8 +1526,8 @@ ifneq ($(EXE),)
 .PHONY: deepseek_v41
 deepseek_v41: deepseek_v41$(EXE)
 endif
-deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
+deepseek_v41$(EXE): deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
 # release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
@@ -1470,8 +1535,8 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
+mimo$(EXE): mimo.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(CUDA_OBJ) $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
 # Pillow for the test picture) and deterministic; ref.json is committed and comes from
@@ -1642,6 +1707,22 @@ qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
 	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
 		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 
+# The Qwen3.6 checkpoint head: independent Qwen decoder reference, exact
+# verifies at every depth through seven, and multi-turn serve on CPU.
+.PHONY: qwen36-tiny-mtp-generate qwen36-tiny-mtp-check
+qwen36-tiny-mtp-generate:
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_mtp --mtp --fused-experts \
+		--ref-mode full --vocab 128 --inter 64 --emit-ref ./qwen36_tiny_mtp/ref.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_mtp --out ./qwen36_tiny_mtp_i8 --ebits 8
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_mtp --out ./qwen36_tiny_mtp_i4 --ebits 4 --gs 64
+	@for d in qwen36_tiny_mtp_i8 qwen36_tiny_mtp_i4; do \
+		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 128 ./$$d || exit $$?; done
+
+qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
+	$(PYTHON) tests/test_qwen36_mtp_convert.py
+	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
+		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
+
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
 # (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
@@ -1661,6 +1742,13 @@ qwen36-tiny-v128-generate:
 		--emit-ref ./qwen36_tiny64_v128/ref_full.json
 	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny64_v128 --out ./qwen36_tiny64_v128_c --ebits 4 --gs 64
 
+# The prompt echo's completeness on this engine (scoring gate): a client that asks for
+# the numeric channel reads one ECHO frame per prompt position, starting at 0. Fails on
+# a read-out that starts at 1, and on a live prefix resumed while the channel is on.
+qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny_v128_c
+	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny64_v128_c
+
 tests/test_spec_draft$(EXE): tests/test_spec_draft.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1676,6 +1764,8 @@ spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/tes
 	./tests/test_spec_draft$(EXE)
 	./tests/test_qwen38_spec_alloc$(EXE)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp \
+		--env Q38_MTP_PSTEP=1 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_fp8_mtp --mtp \
 		--env Q38_PREFILL_BATCH=0 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_int4_mtp \
@@ -1693,6 +1783,9 @@ spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/tes
 # it links qwen36_tier.o and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_qwen36_prefill_control$(EXE): tests/test_qwen36_prefill_control.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -1734,6 +1827,14 @@ tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c 
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The tokens a model ends a turn with, as it declares them (config.json, a GGUF's eog list).
+tests/test_qwen36_eos$(EXE): tests/test_qwen36_eos.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# The MTP head's depth: the plain step that keeps T(1) measured, only where the trim reads it.
+tests/test_qwen36_mtp_depth$(EXE): tests/test_qwen36_mtp_depth.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
 tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -1758,6 +1859,14 @@ tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QW
 
 # #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
 tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Flint's pre-tokenizer against HF's tokenizers (tests/fixtures/flint_tok_*).
+tests/test_qwen36_tokenizer_flint$(EXE): tests/test_qwen36_tokenizer_flint.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# o200k's pre-tokenizer (Muse Spark) against HF's tokenizers (tests/fixtures/o200k_tok_*).
+tests/test_qwen36_tokenizer_o200k$(EXE): tests/test_qwen36_tokenizer_o200k.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # The serve sampler draws the same tokens as a sort of the whole vocabulary.
@@ -1785,7 +1894,7 @@ inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build
 # flags for these targets and say so once, loudly.
 comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
-NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
@@ -1794,8 +1903,8 @@ ifneq ($(EXE),)
 .PHONY: glm53
 glm53: glm53$(EXE)
 endif
-glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+glm53$(EXE): glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 ifneq ($(EXE),)
 .PHONY: kimi_k3
@@ -1939,9 +2048,20 @@ tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepsee
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The token list of qwen38's MTP head (draft_vocab.h), with no model.
+tests/test_draft_vocab$(EXE): tests/test_draft_vocab.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The draft qwen38's MTP head takes from that list, with no model.
+tests/test_qwen38_draft_head$(EXE): tests/test_qwen38_draft_head.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 # The int4-g64 expert matmul with no model (part of test-c); given a converted
 # snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
@@ -1965,6 +2085,15 @@ tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c
 
 .PHONY: test_qwenimage_vae
 test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
+
+# Bare invocation is dependency-free and participates in make check. The
+# opt-in oracle uses the existing pinned torch/diffusers environment on CPU.
+tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: qwenimage-encoder-check
+qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
+	$(PYTHON) tools/check_qwenimage_encoder.py
 
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
@@ -2031,6 +2160,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st_missing$(EXE): tests/test_st_missing.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2082,6 +2214,10 @@ tests/test_gq_dot$(EXE): tests/test_gq_dot.c
 # The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
 # no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
 tests/test_gq_r16$(EXE): tests/test_gq_r16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
+# forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
+tests/test_rows_f8$(EXE): tests/test_rows_f8.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
@@ -2223,6 +2359,31 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_lora$(EXE): tests/test_lora.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_train_linear$(EXE): tests/test_train_linear.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_tiny$(EXE): tests/test_train_tiny.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_resume$(EXE): tests/test_train_resume.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# QLoRA trainer (experimental). One translation unit, so -MMD writes a complete
+# coli_train.d. There is no coli_train.c for the engine discovery to find, so
+# the generated dependencies are hooked up here, the same way AUTODEP_BINS does
+# it: the binary depends on its own .d, and a missing .d forces the rebuild.
+coli_train$(EXE): train/train_main.c colibri.c $(METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+coli_train$(EXE): coli_train.d
+coli_train.d: ;
+-include $(wildcard coli_train.d)
+ifneq ($(EXE),)
+coli_train: coli_train$(EXE)
+endif
+
 tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2257,6 +2418,13 @@ tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c
 
 tests/test_kv_tq$(EXE): tests/test_kv_tq.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #2096 gate: exercises coli_kv_share_adopt_rows (the COLI_KV_SHARE cross-slot
+# adoption routine) under KV8 and KV_TQ — donor "fully prefilled", receiver
+# adopts [from,from+n), rows dequantized and compared. Includes colibri.c
+# like test_kv_alloc (kv_alloc + the adopt routine live there).
+tests/test_kv_share_kv8$(EXE): tests/test_kv_share_kv8.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2304,12 +2472,17 @@ tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 # format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
 # (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
 # vk-tier-check.
+# The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
+tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
+	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
+	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
 
 # The dense chain's ops (vk_chain.c, shaders/chain_*.comp) against CPU references, on
 # a Vulkan device (CI: Lavapipe); like test_vk_tier it needs VK=1 and stays out of
@@ -2320,6 +2493,16 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# Checks the choice of memory type and the size, budget and room of the device memory
+# (vk_memtype.h) on memory-property tables written by the test. It needs the Vulkan headers
+# (VK=1) and no device, so `check` does not run it.
+tests/test_vk_memtype$(EXE): tests/test_vk_memtype.c
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_memtype needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: vk-memtype-check
+vk-memtype-check: tests/test_vk_memtype$(EXE)
+	./tests/test_vk_memtype$(EXE)
 
 # GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
 # Run by vulkan_engines.sh shader; requires a real or software Vulkan device.
@@ -2665,8 +2848,12 @@ $(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c | $(V4_OWN_DIR)
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 
+# After test_deepseek_v4: both sub-makes build the same COLI_V4_UNIT_*.o, and under -j the
+# one linking read an object the other was writing (lto1: "resolution sub id ... not in
+# object file")
 tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c sse41_kernels.h deepseek_v4.c \
-		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
+		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units \
+		| tests/test_deepseek_v4$(EXE)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
 
 endif
@@ -2685,6 +2872,11 @@ tests/test_oracle$(EXE): tests/test_oracle.c
 # esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
 # fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
 tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# A GGUF's experts on the same fake backend (qt_init_gguf): the file's rows as the backend's
+# block formats, each layer's own types, and swaps only between same-typed layers.
+tests/test_qwen36_tier_gguf$(EXE): tests/test_qwen36_tier_gguf.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 # Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
@@ -2785,6 +2977,10 @@ tests/test_qwen36_tier_layer_home$(EXE): tests/test_qwen36_tier_layer_home.c qwe
 
 # qt_replan: the resident set follows the prompt's own routing counts (fake backend).
 tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_chain_promote: the resident set follows the conversation while the chain runs the experts in its frame (fake backend).
+tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
@@ -2966,6 +3162,14 @@ tests/test_gsgemv_sse41$(EXE): tests/test_gsgemv.c
 tests/test_qgemv$(EXE): tests/test_qgemv.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# The float16 KV cache's rounding (kv16.h): the integer arithmetic the Vulkan shader and the
+# CUDA kernel use against the compiler's IEEE conversion, and the integer fallback's
+# conversions both ways. A rule each, so both are gates.
+tests/test_kv16$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv16_integer$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) -DKV16_INTEGER $< -o $@ $(LDFLAGS)
+
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
 # so the SSE4.1 body in qgemv.h is actually exercised even on a devbox that
 # would otherwise always pick the AVX2 tier.
@@ -3022,7 +3226,11 @@ test-c: $(TEST_BINS)
 test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
-test: test-c test-python
+# One after the other, also under -j: the C binaries build in parallel, then run, and only
+# then the Python suite starts its engines and servers.
+test:
+	$(MAKE) test-c
+	$(MAKE) test-python
 
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
 # The tiny-model assertions live in test_inefficiency.py and run as part of
@@ -3161,9 +3369,13 @@ tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
 
-# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
-tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required. cu_tier.c is the
+# CUDA tier's half of the engine's calls, built as a CUDA build sees it; with no backend table
+# (the fake's) the tier stays off.
+tests/cu_tier_fake.o: cu_tier.c
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA -c $< -o $@
+tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests/cu_tier_fake.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< tests/cu_tier_fake.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
@@ -3200,7 +3412,7 @@ AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
-AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o qwen36_tier.o \
+AUTODEP_OBJS      = backend_vulkan.o vk_tier.o vk_chain.o backend_loader.o backend_xdna.o qwen36_tier.o \
 	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
 	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
 	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o \

@@ -72,7 +72,9 @@ static void case_layout(void) {
     for (int i = 0; i < m.c.n_layers; i++) {
         if (!m.c.is_attn[i]) continue;
         int64_t last = (int64_t)m.c.kv_heads * m.max_t * m.c.k_head_dim - 1;
-        m.K[i][last] = 1.f; m.V[i][last] = 2.f;
+        /* the element's last byte: q36_kv_es() bytes an element (float16 or float) */
+        size_t end = (size_t)(last + 1) * q36_kv_es() - 1;
+        ((unsigned char *)m.K[i])[end] = 1; ((unsigned char *)m.V[i])[end] = 2;
     }
     ck(1, "last element of every cache is writable");
 }
@@ -83,7 +85,7 @@ static void case_growth(void) {
     printf("growth across requests\n");
 
     m.max_t = 512;  ensure_kv(&m);
-    float *first = m.K[3];
+    void *first = m.K[3];
     m.max_t = 256;  ensure_kv(&m);
     ck(m.K[3] == first && m.kv_cap == 512,
        "a shorter request leaves the cache alone (never shrinks)");
@@ -91,7 +93,7 @@ static void case_growth(void) {
     m.max_t = 2048; ensure_kv(&m);
     ck(m.kv_cap == 2048, "a longer request grows the cache");
     int64_t last = (int64_t)m.c.kv_heads * m.max_t * m.c.k_head_dim - 1;
-    m.K[3][last] = 1.f;    /* the re-allocation must be sized to the NEW max_t */
+    ((unsigned char *)m.K[3])[(size_t)(last + 1) * q36_kv_es() - 1] = 1;   /* the re-allocation must be sized to the NEW max_t */
     ck(1, "the grown cache is writable to its last element");
 }
 

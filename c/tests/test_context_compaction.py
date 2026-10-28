@@ -31,6 +31,24 @@ QWEN36_35B_CONFIG = {
     "linear_conv_kernel_dim": 4,
 }
 
+# DeepSeek V4.1 Flash's shape: four compressing KV sources (ratios 2, 2, 2, 1), and a
+# prompt prefilled in one forward through four residual streams of 5120.
+DSV41_FLASH_CONFIG = {
+    "model_type": "deepseek_v41",
+    "text_config": {
+        "model_type": "deepseek_v41_text",
+        "num_hidden_layers": 40,
+        "n_routed_experts": 384,
+        "hidden_size": 5120,
+        "head_dim": 512,
+        "sliding_window": 128,
+        "index_head_dim": 128,
+        "hc_mult": 4,
+        "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0],
+        "kv_source_layer_ids": [2, 8, 14, 20],
+    },
+}
+
 
 def turn(role, text):
     return {"role": role, "content": text}
@@ -140,6 +158,22 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(env["Q36_MAXT"], "65536")
         env = {"Q36_MAXT": "12000"}
         self.assertEqual(gateway.chat_context_env(env, family, self.model), 12000)
+
+    def test_a_cache_the_plan_sizes_keeps_room_for_the_prompt(self):
+        # V4.1's state is 6.4 KB a token, its prompt's workspace 200 KB: the state alone
+        # took 131072 tokens on 16 GB and 262144 on 64 GB, where the plan then reserved
+        # 53.7 GB of workspace and gave the expert cache no slot (the server refused to
+        # start). Counted together: 16384 (3.5 GB), 65536 (13.8 GB of a quarter of 64 GB),
+        # and 131072 (27.7 GB, a tenth) only from 277 GB.
+        (Path(self.tmp.name) / "config.json").write_text(json.dumps(DSV41_FLASH_CONFIG))
+        for available, expected in ((8 * GB, None), (16 * GB, 16384), (64 * GB, 65536),
+                                    (256 * GB, 65536), (512 * GB, 131072),
+                                    (1024 * GB, 262144)):
+            with self.subTest(gb=available / GB):
+                context, why = chat_context(self.model, {}, available=available)
+                self.assertEqual(context, expected)
+                if context:
+                    self.assertIn("GB of prompt workspace", why)
 
 
 

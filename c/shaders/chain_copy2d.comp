@@ -1,0 +1,37 @@
+#version 450
+// vkc_copy_regions' grid (vk_chain.c, cp2_grid): n regions of len floats, region i at
+// (q, h) = (i / per, i % per) copying src[s0 + q*sq + h*sh ..] to dst[d0 + q*dq + h*dh ..],
+// one invocation a float. A prompt chunk's K and V rows into the head-major cache are
+// such a grid (a region per row and head), one dispatch instead of a copy command with
+// a region each.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Src { float s[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float d[]; };
+// H16 (vkc_copy_regions_h): dst a float16 cache, two halves a word (its offsets, lengths and
+// strides in halves, even), each value rounded to the nearest float16; an invocation a pair
+layout(constant_id = 0) const bool H16 = false;
+layout(std430, binding = 1) writeonly buffer DstH { uint dh[]; };
+
+layout(push_constant) uniform Pc {
+    uint d0, s0;
+    int dh, sh, dq, sq;
+    uint len, per, n;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (H16) {
+        uint l2 = p.len / 2u;
+        if (gid >= p.n * l2) return;
+        uint i = gid / l2, j = 2u * (gid - i * l2);
+        int q = int(i / p.per), h = int(i - uint(q) * p.per);
+        uint so = p.s0 + uint(q * p.sq + h * p.sh) + j;
+        dh[(p.d0 + uint(q * p.dq + h * p.dh) + j) >> 1u] = packHalf2x16(vec2(s[so], s[so + 1u]));
+        return;
+    }
+    if (gid >= p.n * p.len) return;
+    uint i = gid / p.len, j = gid - i * p.len;
+    int q = int(i / p.per), h = int(i - uint(q) * p.per);
+    d[p.d0 + uint(q * p.dq + h * p.dh) + j] = s[p.s0 + uint(q * p.sq + h * p.sh) + j];
+}
