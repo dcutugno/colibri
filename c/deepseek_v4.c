@@ -13217,10 +13217,20 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
 /* One cache's miss handling: grow while its VRAM reserve allows, else — only
  * when allowed — recycle its LRU slot in place. 0 with the view's handles
  * set; -1 when this cache cannot take the expert now. */
+/* uploader breakdown (decode queued uploads): mutex wait, slot pick, refill enqueues */
+static double g_v4_up_lock_s, g_v4_up_pick_s, g_v4_up_copy_s;
+static unsigned long long g_v4_up_prof_n;
+static double v4_up_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
                                ColiExpertView *view, int sync,
                                int allow_recycle) {
+    double up_t0 = v4_up_now();
     pthread_mutex_lock(&cache->mutex);
+    double up_t1 = v4_up_now();
+    if (sync >= 2) { g_v4_up_lock_s += up_t1 - up_t0; g_v4_up_prof_n++; }
     /* Growth guard: new mirrors may only claim VRAM while the reserve stays
      * free for the transient prefill allocations. Below the reserve, recycle
      * the LRU slot instead of growing — decode keeps its hottest experts and
@@ -13312,6 +13322,8 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
          * cudaFree + cudaMalloc + pageable copy x3 — at long context
          * decode misses this cache for nearly every expert (~3 GB and
          * ~1500 driver calls per token). */
+        double up_t2 = v4_up_now();
+        if (sync >= 2) g_v4_up_pick_s += up_t2 - up_t1;
         if (cache->entries[found].gate && cache->entries[found].up &&
             cache->entries[found].down &&
             view->gate.data && view->gate.scales &&
@@ -13329,6 +13341,7 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].down, (const uint8_t *)view->down.data,
                 (const uint8_t *)view->down.scales, (int)view->down.rows,
                 (int)view->down.columns, sync)) {
+            if (sync >= 2) g_v4_up_copy_s += v4_up_now() - up_t2;
             cache->entries[found].layer = view->key.layer;
             cache->entries[found].expert = view->key.expert;
             cache->entries[found].clock = ++cache->clock;
@@ -13638,6 +13651,11 @@ void coli_v4_gpu_expert_upload_stats(unsigned long long *jobs0,
             fprintf(stderr, "v4_gpu uploader[%d] jobs=%llu placed=%llu avg=%.2f ms\n",
                     i, g_v4_up[i].jobs, g_v4_up[i].placed,
                     1e3 * g_v4_up[i].seconds / (double)g_v4_up[i].jobs);
+    if (g_v4_up_prof_n)
+        fprintf(stderr, "v4_gpu uploader breakdown per job: lock=%.3f pick=%.3f copies=%.3f ms (n=%llu)\n",
+                1e3 * g_v4_up_lock_s / (double)g_v4_up_prof_n,
+                1e3 * g_v4_up_pick_s / (double)g_v4_up_prof_n,
+                1e3 * g_v4_up_copy_s / (double)g_v4_up_prof_n, g_v4_up_prof_n);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
