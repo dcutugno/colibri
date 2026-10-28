@@ -1021,6 +1021,19 @@ int coli_v4_gpu_indexer_score_batch(
     const ColiDeepSeekV4LayerWeights *weights, float *scores,
     const float *queries, const float *keys, const float *head_w,
     const int *counts, int tokens, int heads, int dim, int count);
+/* V4_IDX_FUSED: the indexer selection as one device round trip over resident
+ * weights and keys. prepare uploads a layer's weights at mirror time; select
+ * scores tokens x max_count (optional verify downloads of the prepared
+ * queries and head weights); keys_reset drops the layer's resident keys. */
+int coli_v4_gpu_indexer_fused_wanted(void);
+int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights, int device);
+int coli_v4_gpu_indexer_select_fused(
+    const ColiDeepSeekV4LayerWeights *weights, int layer, unsigned long long owner,
+    const ColiTensorView *wq, const uint16_t *head_w, int heads, int dim, int rope_dim,
+    int hidden, const float *keys, int key_count, const float *x_qdq,
+    const float *inputs, const float *cosv, const float *sinv, const int *counts,
+    int tokens, int max_count, float *scores, float *queries_out, float *head_w_out);
+void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, int layer);
 int coli_v4_gpu_sparse_attention_batch_cached_idx(
     const ColiDeepSeekV4LayerWeights *weights, float *attended,
     const float *q, const float *chunk, int chunk_start, const float *sinks,

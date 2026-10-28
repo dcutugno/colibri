@@ -60,6 +60,22 @@ int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *k
 int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
                              int rows,int cols,int packed_rows8,const float *x,
                              int tokens,float *y);
+/* Device-resident indexer selection (one round trip): the layer's wq_b bytes
+ * + f32 block scales (CPU reference layout) and bf16 head-weight rows go up
+ * once; keys are appended per call (count 0, another owner or a regressed
+ * count re-seed); select runs projection -> prep -> head weights -> scoring
+ * into scores[tokens][count] (queries_out/head_w_out: verify downloads). */
+int dsv4_cuda_indexer_resident(int device,int layer,const uint8_t *w,const float *bscale,
+                               int rows,int cols,int packed_rows8,const uint16_t *head_w,
+                               int heads,int hidden);
+int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
+                                const float *keys,int count,int dim);
+int dsv4_cuda_indexer_select_fused(int device,int layer,const float *x,const float *inputs,
+                                   const float *cosv,const float *sinv,const int *counts,
+                                   int tokens,int heads,int dim,int rope_dim,int hidden,
+                                   int count,float had_scale,float wscale,int rope_fma,
+                                   int hw_fma,float *scores,float *queries_out,
+                                   float *head_w_out);
 /* Build/GPU compatibility (loader DLL selection). */
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);

@@ -1214,6 +1214,324 @@ extern "C" int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t*w,const float*b
            ok(cudaStreamSynchronize(c->stream),"fp8 ref matmul sync");
 }
 
+/* ---- Device-resident indexer selection (V4_IDX_FUSED) ----------------------
+ * Per layer the card keeps the indexer's wq_b bytes and f32 block scales in
+ * the CPU reference layout, the bf16 head-weight rows, and the compressed keys
+ * (append-only; re-seeded when the owner changes or the count regresses). One
+ * round trip per selection: projection replica -> query prep (bf16 round,
+ * RoPE, hadamard, fp4 round trip) -> head weights -> scoring; the host keeps
+ * the sort. The arithmetic mirrors the GCC build of the reference, which fuses
+ * the head-weight accumulate and the cosine products of the RoPE into FMAs
+ * (read off the binary) and nothing else, so the scores are bitwise the
+ * CPU's and the top-k boundary cannot move. */
+static uint8_t *g_idx_w[DSV4_KV_CACHE_LAYERS];
+static float *g_idx_s[DSV4_KV_CACHE_LAYERS];
+static uint16_t *g_idx_hw[DSV4_KV_CACHE_LAYERS];
+static const void *g_idx_w_src[DSV4_KV_CACHE_LAYERS];
+static int g_idx_rows[DSV4_KV_CACHE_LAYERS],g_idx_cols[DSV4_KV_CACHE_LAYERS],g_idx_packed[DSV4_KV_CACHE_LAYERS],
+           g_idx_heads[DSV4_KV_CACHE_LAYERS],g_idx_hidden[DSV4_KV_CACHE_LAYERS],g_idx_dev[DSV4_KV_CACHE_LAYERS];
+static float *g_idx_keys[DSV4_KV_CACHE_LAYERS];
+static int g_idx_keys_cap[DSV4_KV_CACHE_LAYERS],g_idx_keys_n[DSV4_KV_CACHE_LAYERS],g_idx_keys_dim[DSV4_KV_CACHE_LAYERS];
+static unsigned long long g_idx_keys_owner[DSV4_KV_CACHE_LAYERS];
+static void *g_idx_stage;static size_t g_idx_stage_cap;
+
+__device__ __forceinline__ float bf16_round_dev(float v){
+    unsigned b=__float_as_uint(v);
+    if((b&0x7f800000u)!=0x7f800000u){unsigned tie=(b>>16)&1u;b+=0x7fffu+tie;}
+    return __uint_as_float(b&0xffff0000u);
+}
+__constant__ float c_idx_e2m1[16]={0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f,0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+
+/* Query prep in place, grid (heads, tokens), block = dim threads, dim floats of
+ * shared memory: bf16 round, RoPE on the last rope_dim (rope_fma 1 = the
+ * cosine product fused, the GCC build's vfmaddsub; 2 = the sine product fused;
+ * 0 = none), hadamard butterflies + scale + bf16 round, fp4 (e2m1 per 32,
+ * e8m0 scale) round trip + bf16 round. Same operations in the same order as
+ * indexer_prepare_queries. */
+__global__ void indexer_prep_kernel(float*q,const float*cosv,const float*sinv,int heads,int dim,
+        int rope_dim,float had_scale,int rope_fma){
+    int h=blockIdx.x,t=blockIdx.y,i=threadIdx.x,pairs=rope_dim/2;
+    float*row=q+((long long)t*heads+h)*dim;
+    extern __shared__ float s[];
+    __shared__ float bsc[32];
+    s[i]=bf16_round_dev(row[i]);
+    __syncthreads();
+    if(i<pairs){
+        int base=dim-rope_dim+2*i;
+        float re=s[base],im=s[base+1];
+        float c=cosv[(long long)t*pairs+i],sn=sinv[(long long)t*pairs+i];
+        float a,b;
+        if(rope_fma==1){a=fmaf(re,c,-__fmul_rn(im,sn));b=fmaf(im,c,__fmul_rn(re,sn));}
+        else if(rope_fma==2){a=fmaf(-im,sn,__fmul_rn(re,c));b=fmaf(re,sn,__fmul_rn(im,c));}
+        else{a=__fsub_rn(__fmul_rn(re,c),__fmul_rn(im,sn));b=__fadd_rn(__fmul_rn(re,sn),__fmul_rn(im,c));}
+        s[base]=bf16_round_dev(a);s[base+1]=bf16_round_dev(b);
+    }
+    __syncthreads();
+    for(int width=1;width<dim;width*=2){
+        if(i<dim/2){
+            int base=(i/width)*2*width,j=i-(i/width)*width;
+            float l=s[base+j],r=s[base+width+j];
+            s[base+j]=__fadd_rn(l,r);s[base+width+j]=__fsub_rn(l,r);
+        }
+        __syncthreads();
+    }
+    s[i]=bf16_round_dev(__fmul_rn(s[i],had_scale));
+    __syncthreads();
+    if(i<dim/32){
+        float m=0.f;
+        for(int k=0;k<32;k++)m=fmaxf(m,fabsf(s[i*32+k]));
+        m=fmaxf(m,6.0f*ldexpf(1.0f,-126));
+        int e;float fr=frexpf(__fdiv_rn(m,6.0f),&e);
+        int ex=(fr==0.5f)?e-1:e;
+        if(ex<-127)ex=-127;
+        if(ex>127)ex=127;
+        bsc[i]=ldexpf(1.0f,ex);
+    }
+    __syncthreads();
+    float sc=bsc[i>>5];
+    float v=fmaxf(-6.0f,fminf(6.0f,__fdiv_rn(s[i],sc)));
+    int best=0;float d=fabsf(__fsub_rn(v,c_idx_e2m1[0]));
+    for(int code=1;code<16;code++){float cd=fabsf(__fsub_rn(v,c_idx_e2m1[code]));if(cd<d){d=cd;best=code;}}
+    row[i]=bf16_round_dev(__fmul_rn(c_idx_e2m1[best],sc));
+}
+
+/* head_w[t][h] = (sum_c bf16(w[h][c]) * x[t][c]) * wscale, sequential fp32;
+ * hw_fma 1 = the accumulate fused (vfmadd132ss in the build), 0 = separate. */
+__global__ void indexer_headw_kernel(float*hw,const uint16_t*w,const float*x,int heads,int hidden,
+        float wscale,int hw_fma){
+    int t=blockIdx.x,h=threadIdx.x;
+    if(h>=heads)return;
+    const uint16_t*row=w+(long long)h*hidden;const float*xi=x+(long long)t*hidden;
+    float sum=0.f;
+    if((hidden&7)==0&&!((uintptr_t)row&15)&&!((uintptr_t)xi&15)){
+        /* 8 columns per step through 16-byte loads (the chain is latency-bound
+         * on the loads, not the FMAs); the same elements in the same order. */
+        const uint4*rv=(const uint4*)row;const float4*xv=(const float4*)xi;
+        for(int c=0;c<hidden/8;c++){
+            uint4 wv=rv[c];float4 x0=xv[2*c],x1=xv[2*c+1];
+            float w0=__uint_as_float(wv.x<<16),w1=__uint_as_float(wv.x&0xffff0000u),
+                  w2=__uint_as_float(wv.y<<16),w3=__uint_as_float(wv.y&0xffff0000u),
+                  w4=__uint_as_float(wv.z<<16),w5=__uint_as_float(wv.z&0xffff0000u),
+                  w6=__uint_as_float(wv.w<<16),w7=__uint_as_float(wv.w&0xffff0000u);
+            if(hw_fma){
+                sum=fmaf(w0,x0.x,sum);sum=fmaf(w1,x0.y,sum);sum=fmaf(w2,x0.z,sum);sum=fmaf(w3,x0.w,sum);
+                sum=fmaf(w4,x1.x,sum);sum=fmaf(w5,x1.y,sum);sum=fmaf(w6,x1.z,sum);sum=fmaf(w7,x1.w,sum);
+            }else{
+                sum=__fadd_rn(sum,__fmul_rn(w0,x0.x));sum=__fadd_rn(sum,__fmul_rn(w1,x0.y));
+                sum=__fadd_rn(sum,__fmul_rn(w2,x0.z));sum=__fadd_rn(sum,__fmul_rn(w3,x0.w));
+                sum=__fadd_rn(sum,__fmul_rn(w4,x1.x));sum=__fadd_rn(sum,__fmul_rn(w5,x1.y));
+                sum=__fadd_rn(sum,__fmul_rn(w6,x1.z));sum=__fadd_rn(sum,__fmul_rn(w7,x1.w));
+            }
+        }
+    }else if(hw_fma)for(int c=0;c<hidden;c++)sum=fmaf(__uint_as_float((unsigned)row[c]<<16),xi[c],sum);
+    else for(int c=0;c<hidden;c++)sum=__fadd_rn(sum,__fmul_rn(__uint_as_float((unsigned)row[c]<<16),xi[c]));
+    hw[(long long)t*heads+h]=__fmul_rn(sum,wscale);
+}
+
+static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what);
+
+/* Batch of one: one thread per output row (the per-token kernels above give a
+ * block of 32 threads to each row and leave 31 idle), the same per-row
+ * accumulation. */
+__global__ void fp8_ref_matmul_rows8_t1_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
+    int o=blockIdx.x*blockDim.x+threadIdx.x;
+    if(o>=rows)return;
+    int nblk=cols/128;
+    const float*scl=bscale+(long long)(o/128)*nblk;
+    long long tile=o>>3;int r=o&7;
+    float sum=0.f;
+    for(int base=0;base<cols;base+=128){
+        float sc=scl[base/128];
+        for(int i=base;i<base+128;i++){
+            float v=e4m3_dev(w[((tile*cols)+i)*8+r]);
+            sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(x[i],v),sc));
+        }
+    }
+    y[o]=sum;
+}
+__global__ void fp8_ref_matmul_t1_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
+    int o=blockIdx.x*blockDim.x+threadIdx.x;
+    if(o>=rows)return;
+    const uint8_t*wr=w+(long long)o*cols;
+    int nblk=(cols+127)/128;
+    const float*scl=bscale+(long long)(o/128)*nblk;
+    double a=0.0;
+    for(int bi=0;bi*128<cols;bi++){
+        int base=bi*128,blen=cols-base<128?cols-base:128;
+        float acc=0.f;
+        for(int i=base;i<base+blen;i++)acc=__fadd_rn(acc,__fmul_rn(e4m3_dev(wr[i]),x[i]));
+        a=__dadd_rn(a,__dmul_rn((double)acc,(double)scl[bi]));
+    }
+    y[o]=__double2float_rn(a);
+}
+
+/* Few tokens: a block of `heads` threads per (token, candidate). Thread h runs
+ * head h's dot sequentially over dim, then thread 0 folds the heads in order:
+ * the reference's arithmetic with the independent heads side by side instead
+ * of one thread per candidate walking 820 strided key rows. Shared q is
+ * padded to dim+1 so the per-head rows sit in distinct banks. */
+__global__ void indexer_score_small_kernel(float*scores,const float*queries,const float*keys,
+        const float*head_w,const int*counts,int heads,int dim,int count){
+    int t=blockIdx.y,c=blockIdx.x,h=threadIdx.x;
+    extern __shared__ float sm_[];
+    float*qs=sm_;                      /* heads x (dim+1) */
+    float*ks=sm_+(size_t)heads*(dim+1);  /* dim */
+    float*dots=ks+dim;                 /* heads */
+    int qn=heads*dim;
+    for(int i=h;i<qn;i+=blockDim.x){int hh=i/dim,d=i-hh*dim;qs[hh*(dim+1)+d]=queries[(long long)t*qn+i];}
+    for(int i=h;i<dim;i+=blockDim.x)ks[i]=keys[(long long)c*dim+i];
+    __syncthreads();
+    {
+        const float*q=qs+h*(dim+1);
+        float dot=0.f;
+        for(int i=0;i<dim;i++)dot=__fadd_rn(dot,__fmul_rn(q[i],ks[i]));
+        dots[h]=dot;
+    }
+    __syncthreads();
+    if(!h){
+        float score=0.f;
+        if(c<counts[t])
+            for(int hh=0;hh<heads;hh++)
+                score=__fadd_rn(score,__fmul_rn(fmaxf(dots[hh],0.f),head_w[(long long)t*heads+hh]));
+        scores[(long long)t*count+c]=score;
+    }
+}
+
+static int g_idx_kprof=-1;
+
+extern "C" int dsv4_cuda_indexer_resident(int device,int layer,const uint8_t*w,const float*bscale,int rows,int cols,
+        int packed_rows8,const uint16_t*head_w,int heads,int hidden){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!w||!bscale||!head_w||rows<1||cols<1||cols%128||heads<1||hidden<1||
+       (packed_rows8&&rows%8)||!ok(cudaSetDevice(device),"select indexer resident device"))return 0;
+    if(g_idx_w[layer]&&g_idx_w_src[layer]==w&&g_idx_dev[layer]==device&&g_idx_rows[layer]==rows&&
+       g_idx_cols[layer]==cols&&g_idx_heads[layer]==heads&&g_idx_hidden[layer]==hidden)return 1;
+    if(g_idx_w[layer]){cudaFree(g_idx_w[layer]);g_idx_w[layer]=NULL;}
+    if(g_idx_s[layer]){cudaFree(g_idx_s[layer]);g_idx_s[layer]=NULL;}
+    if(g_idx_hw[layer]){cudaFree(g_idx_hw[layer]);g_idx_hw[layer]=NULL;}
+    size_t wb=(size_t)rows*cols,sb=(size_t)((rows+127)/128)*(cols/128)*4,hb=(size_t)heads*hidden*2;
+    if(!alloc_ok(cudaMalloc((void**)&g_idx_w[layer],wb),"indexer weight residency")||
+       !alloc_ok(cudaMalloc((void**)&g_idx_s[layer],sb),"indexer scale residency")||
+       !alloc_ok(cudaMalloc((void**)&g_idx_hw[layer],hb),"indexer head-weight residency")||
+       !h2d(c,g_idx_w[layer],w,wb,"indexer weight upload")||!h2d(c,g_idx_s[layer],bscale,sb,"indexer scale upload")||
+       !h2d(c,g_idx_hw[layer],head_w,hb,"indexer head-weight upload")){
+        if(g_idx_w[layer])cudaFree(g_idx_w[layer]);
+        if(g_idx_s[layer])cudaFree(g_idx_s[layer]);
+        if(g_idx_hw[layer])cudaFree(g_idx_hw[layer]);
+        g_idx_w[layer]=NULL;g_idx_s[layer]=NULL;g_idx_hw[layer]=NULL;return 0;}
+    g_idx_w_src[layer]=w;g_idx_rows[layer]=rows;g_idx_cols[layer]=cols;g_idx_packed[layer]=packed_rows8;
+    g_idx_heads[layer]=heads;g_idx_hidden[layer]=hidden;g_idx_dev[layer]=device;
+    return 1;
+}
+
+/* Rows [n, count) of the host's append-only key cache go up; count 0, another
+ * owner, another dim or a count below what is resident re-seed from row 0. */
+extern "C" int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,const float*keys,int count,int dim){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||count<0||dim<1||(count&&!keys)||
+       !ok(cudaSetDevice(device),"select indexer key device"))return 0;
+    if(!count||g_idx_keys_owner[layer]!=owner||g_idx_keys_dim[layer]!=dim||count<g_idx_keys_n[layer]||
+       (g_idx_keys[layer]&&g_idx_dev[layer]!=device)){
+        g_idx_keys_n[layer]=0;g_idx_keys_owner[layer]=owner;g_idx_keys_dim[layer]=dim;}
+    if(!count)return 1;
+    if(g_idx_keys_cap[layer]<count){
+        int cap=g_idx_keys_cap[layer]?g_idx_keys_cap[layer]:512;
+        while(cap<count)cap*=2;
+        float*grown=NULL;
+        if(!alloc_ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"indexer key residency"))return 0;
+        int have=g_idx_keys_n[layer];
+        if(g_idx_keys[layer]&&have&&
+           !ok(cudaMemcpyAsync(grown,g_idx_keys[layer],(size_t)have*dim*4,cudaMemcpyDeviceToDevice,c->stream),"indexer key grow copy")){
+            cudaFree(grown);return 0;}
+        if(g_idx_keys[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_idx_keys[layer]);}
+        g_idx_keys[layer]=grown;g_idx_keys_cap[layer]=cap;}
+    int have=g_idx_keys_n[layer];
+    if(count>have){
+        if(!ok(cudaMemcpyAsync(g_idx_keys[layer]+(size_t)have*dim,keys+(size_t)have*dim,(size_t)(count-have)*dim*4,
+                               cudaMemcpyHostToDevice,c->stream),"indexer key append"))return 0;
+        g_idx_keys_n[layer]=count;}
+    return 1;
+}
+
+/* x [tokens][cols] fp8-qdq'd query ranks, inputs [tokens][hidden], cosv/sinv
+ * [tokens][rope_dim/2], counts[tokens]; scores [tokens][count]. One staged
+ * upload, four launches, one download, one sync. */
+extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x,const float*inputs,const float*cosv,
+        const float*sinv,const int*counts,int tokens,int heads,int dim,int rope_dim,int hidden,int count,
+        float had_scale,float wscale,int rope_fma,int hw_fma,float*scores,float*queries_out,float*head_w_out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_idx_w[layer]||!g_idx_keys[layer]||!x||!inputs||!cosv||!sinv||
+       !counts||!scores||tokens<1||tokens>1024||heads<1||heads>1024||dim<32||dim>1024||(dim&(dim-1))||
+       rope_dim<2||rope_dim>dim||(rope_dim&1)||hidden<1||count<1||count>g_idx_keys_n[layer]||
+       g_idx_keys_dim[layer]!=dim||g_idx_rows[layer]!=heads*dim||g_idx_heads[layer]!=heads||
+       g_idx_hidden[layer]!=hidden)return 0;
+    int cols=g_idx_cols[layer],rows=g_idx_rows[layer],pairs=rope_dim/2;
+    size_t xb=(size_t)tokens*cols*4,ib=(size_t)tokens*hidden*4,rb=(size_t)tokens*pairs*4,cb=(size_t)tokens*sizeof(int);
+    size_t stage=xb+ib+2*rb+cb,qb=(size_t)tokens*rows*4,sb=(size_t)tokens*count*4,hb=(size_t)tokens*heads*4,sm=(size_t)rows*4;
+    if(sm>96*1024||!ok(cudaSetDevice(device),"select fused indexer device"))return 0;
+    if(g_idx_stage_cap<stage){
+        if(g_idx_stage)cudaFreeHost(g_idx_stage);
+        g_idx_stage=NULL;g_idx_stage_cap=0;
+        if(!ok(cudaHostAlloc(&g_idx_stage,stage,cudaHostAllocPortable),"indexer staging allocation"))return 0;
+        g_idx_stage_cap=stage;}
+    char*st=(char*)g_idx_stage;
+    memcpy(st,x,xb);memcpy(st+xb,inputs,ib);memcpy(st+xb+ib,cosv,rb);memcpy(st+xb+ib+rb,sinv,rb);
+    memcpy(st+xb+ib+2*rb,counts,cb);
+    if(!buf((void**)&c->p1,&c->p1cap,stage)||!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,sb)||
+       !buf((void**)&c->aux3,&c->aux3cap,hb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p1,st,stage,cudaMemcpyHostToDevice,c->stream),"fused indexer upload"))return 0;
+    const char*base=(const char*)c->p1;
+    const float*dx=(const float*)base;const float*din=(const float*)(base+xb);
+    const float*dcos=(const float*)(base+xb+ib);const float*dsin=(const float*)(base+xb+ib+rb);
+    const int*dcnt=(const int*)(base+xb+ib+2*rb);
+    if(g_idx_kprof<0){const char*e=getenv("DSV4_IDX_KPROF");g_idx_kprof=e&&*e&&*e!='0';}
+    cudaEvent_t ev[6];
+    if(g_idx_kprof)for(int i=0;i<6;i++)cudaEventCreate(&ev[i]);
+    if(g_idx_kprof)cudaEventRecord(ev[0],c->stream);
+    if(tokens==1){
+        if(g_idx_packed[layer])
+            fp8_ref_matmul_rows8_t1_kernel<<<(rows+255)/256,256,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+        else
+            fp8_ref_matmul_t1_kernel<<<(rows+255)/256,256,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+    }else{
+        int threads=tokens<32?32:((tokens+31)/32)*32;
+        if(g_idx_packed[layer])
+            fp8_ref_matmul_rows8_kernel<<<rows,threads,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols,tokens);
+        else
+            fp8_ref_matmul_kernel<<<rows,threads,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols,tokens);
+    }
+    if(!ok(cudaGetLastError(),"fused indexer projection launch"))return 0;
+    if(g_idx_kprof)cudaEventRecord(ev[1],c->stream);
+    indexer_prep_kernel<<<dim3(heads,tokens),dim,(size_t)dim*4,c->stream>>>(c->p2,dcos,dsin,heads,dim,rope_dim,had_scale,rope_fma);
+    if(!ok(cudaGetLastError(),"fused indexer prep launch"))return 0;
+    if(g_idx_kprof)cudaEventRecord(ev[2],c->stream);
+    indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    if(!ok(cudaGetLastError(),"fused indexer head-weight launch"))return 0;
+    if(g_idx_kprof)cudaEventRecord(ev[3],c->stream);
+    size_t sm_small=((size_t)heads*(dim+1)+dim+heads)*4;
+    if(tokens<=4&&sm_small<=48*1024){
+        indexer_score_small_kernel<<<dim3(count,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
+    }else{
+        if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+        indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
+    }
+    if(!ok(cudaGetLastError(),"fused indexer score launch"))return 0;
+    if(g_idx_kprof)cudaEventRecord(ev[4],c->stream);
+    if(!ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"fused indexer score download"))return 0;
+    if(queries_out&&!ok(cudaMemcpyAsync(queries_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"fused indexer query download"))return 0;
+    if(head_w_out&&!ok(cudaMemcpyAsync(head_w_out,c->aux3,hb,cudaMemcpyDeviceToHost,c->stream),"fused indexer head-weight download"))return 0;
+    if(g_idx_kprof)cudaEventRecord(ev[5],c->stream);
+    int done=ok(cudaStreamSynchronize(c->stream),"fused indexer sync");
+    if(g_idx_kprof){
+        float ms[5];
+        for(int i=0;i<5;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
+        fprintf(stderr,"idxkprof layer=%d tokens=%d cand=%d proj=%.3f prep=%.3f headw=%.3f score=%.3f down=%.3f ms\n",
+                layer,tokens,count,ms[0],ms[1],ms[2],ms[3],ms[4]);
+        for(int i=0;i<6;i++)cudaEventDestroy(ev[i]);
+    }
+    return done;
+}
+
 __global__ void sparse_attn_batch_kernel(float*out,const float*q,const float*vals,const float*sink,
         const int*meta,int comp_base,int heads,int dim,float scale){
     int t=blockIdx.y,h=blockIdx.x;

@@ -480,7 +480,9 @@ other CPU slot costs the primary half its lanes (x16 → x8, uploads 2× slower)
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
-`DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring vs CPU, bitwise),
+`DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
+vs CPU, bitwise: `idxproj`, `idxverify`, `idxfused`), `DSV4_IDX_KPROF=1`
+(device time per stage of the fused selection),
 `V4_PREFIX_LOG=1` (checkpoint/hint decisions), `v4_mirror` per-drive I/O
 telemetry after each request.
 
@@ -604,6 +606,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `COLI_WIN_COMMIT_BOUND` (auto) | Windows: whether the commit still grantable bounds the RAM plan. Auto = only with a fixed page file; a system-managed one grows the commit on demand (measured: 9 GB of commit free beside 14.7 GB physical, and the plan fell to dense=streamed, 10x slower). `1` forces the bound, `0` lifts it |
 | `V4_DECODE_GPU_PROJ` (1) | decode: the compressor's and the indexer-compressor's wkv/wgate projections on the card (the prefill kernel with a batch of one; needs the `COLI_CUDA_ATTN_BATCH=1` mirrors); `0` = the CPU loops. 3.3k context: attention 127 -> 111 ms/token |
+| `V4_IDX_FUSED` (1) | the indexer selection as one device round trip (decode and prefill chunks): the layer's `wq_b` bytes + f32 block scales in the CPU reference layout and its bf16 head-weight rows resident on the card (uploaded with the attention mirrors, 8 MB per indexer layer), the compressed keys appended as the host produces them, and projection -> query prep (bf16 round, RoPE, hadamard, fp4 round trip) -> head weights -> scoring in four launches; the sort stays on the host. Bitwise the CPU path: `DSV4_IDX_VERIFY=1` compares the prepared queries, head weights and scores (651 of 651 selections identical on the reference box, prefill chunks and decode tokens). 3.3k context: attention 111 -> 72 ms/token, decode 19.40 -> 18.20 s / 36 tokens, text unchanged. `0` = the projection replica + scoring kernel with their per-call uploads (8 MB of weights per indexer layer per token) |
+| `DSV4_IDX_ROPE_FMA` (1), `DSV4_IDX_HW_FMA` (1) | which products the fused prep fuses, matching the GCC build of the reference (read off the binary: the RoPE's cosine products — `vfmaddsub` — and the head-weight accumulate are FMAs, nothing else). For a build with another contraction pattern (`DSV4_IDX_VERIFY` would report mismatches): `0` = none fused, ROPE `2` = the sine products instead |
+| `DSV4_IDX_KPROF` (0, `.cu`) | per-call device time of the fused selection's stages (`idxkprof`); 0.16 + 0.01 + 0.10 + 0.09 + 0.02 ms per indexer layer at one token / 820 candidates |
 | `DSV4_CUDA_SCHED` (unset = runtime default, `.cu`) | how the host waits in a stream sync: `spin`, `yield`, `blocking`. Measured on the reference box: spin 19.35 s, yield 19.42, default 19.40, blocking 20.6 (36 tokens) — the default already spins there |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -678,8 +683,10 @@ GPU tier evidence (2026-08): each stage was accepted with greedy text
 byte-identical to the engine's own reference chain at the time (826- and
 3324-token benchmark prompts, 8 tokens; strip the CLI's trailing
 `TUNE decode:` line before comparing); the GPU indexer projection/scoring and
-the CPU-replica fp8 matmul are checked bitwise by `DSV4_IDX_VERIFY=1`; the CUDA
-numerics test is `c/tests/test_dsv4_sparse_attn_batch_cuda.c`. Different
+the CPU-replica fp8 matmul are checked bitwise by `DSV4_IDX_VERIFY=1` (the fused
+selection too: queries after the device prep, head weights, scores — the
+device prep reproduces the CPU build's FMA pattern, see `DSV4_IDX_ROPE_FMA`);
+the CUDA numerics test is `c/tests/test_dsv4_sparse_attn_batch_cuda.c`. Different
 kernels are not bit-identical to each other in general — a GPU run and a CPU
 run of the same prompt diverge by a rounding flip after some tokens, exactly
 as two CPU runs with different hot-expert sets do (next section) — so text

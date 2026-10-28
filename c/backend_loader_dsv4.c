@@ -167,6 +167,17 @@ typedef int             (*fn_indexer_score_batch)(int device, const float *queri
 typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const float *bscale,
                                              int rows, int cols, int packed_rows8, const float *x,
                                              int tokens, float *y);
+typedef int             (*fn_indexer_resident)(int device, int layer, const uint8_t *w, const float *bscale,
+                                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                                               int heads, int hidden);
+typedef int             (*fn_indexer_keys_sync)(int device, int layer, unsigned long long owner,
+                                                const float *keys, int count, int dim);
+typedef int             (*fn_indexer_select_fused)(int device, int layer, const float *x, const float *inputs,
+                                                   const float *cosv, const float *sinv, const int *counts,
+                                                   int tokens, int heads, int dim, int rope_dim, int hidden,
+                                                   int count, float had_scale, float wscale, int rope_fma,
+                                                   int hw_fma, float *scores, float *queries_out,
+                                                   float *head_w_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int             (*fn_backend_arch_ok)(int device);
@@ -311,6 +322,9 @@ static struct {
     fn_sparse_attn_batch_cached_idx sparse_attn_batch_cached_idx;
     fn_indexer_score_batch indexer_score_batch;
     fn_fp8_ref_matmul fp8_ref_matmul;
+    fn_indexer_resident indexer_resident;
+    fn_indexer_keys_sync indexer_keys_sync;
+    fn_indexer_select_fused indexer_select_fused;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -509,6 +523,9 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    RESOLVE(indexer_resident, fn_indexer_resident);
+    RESOLVE(indexer_keys_sync, fn_indexer_keys_sync);
+    RESOLVE(indexer_select_fused, fn_indexer_select_fused);
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
@@ -874,6 +891,32 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
                              int tokens, float *y){
     if(!g_dsv4.available) return 0;
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
+}
+
+int dsv4_cuda_indexer_resident(int device, int layer, const uint8_t *w, const float *bscale,
+                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                               int heads, int hidden){
+    if(!g_dsv4.available) return 0;
+    return g_dsv4.indexer_resident(device, layer, w, bscale, rows, cols, packed_rows8, head_w,
+                                   heads, hidden);
+}
+
+int dsv4_cuda_indexer_keys_sync(int device, int layer, unsigned long long owner,
+                                const float *keys, int count, int dim){
+    if(!g_dsv4.available) return 0;
+    return g_dsv4.indexer_keys_sync(device, layer, owner, keys, count, dim);
+}
+
+int dsv4_cuda_indexer_select_fused(int device, int layer, const float *x, const float *inputs,
+                                   const float *cosv, const float *sinv, const int *counts,
+                                   int tokens, int heads, int dim, int rope_dim, int hidden,
+                                   int count, float had_scale, float wscale, int rope_fma,
+                                   int hw_fma, float *scores, float *queries_out,
+                                   float *head_w_out){
+    if(!g_dsv4.available) return 0;
+    return g_dsv4.indexer_select_fused(device, layer, x, inputs, cosv, sinv, counts, tokens, heads,
+                                       dim, rope_dim, hidden, count, had_scale, wscale, rope_fma,
+                                       hw_fma, scores, queries_out, head_w_out);
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
