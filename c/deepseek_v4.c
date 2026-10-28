@@ -2251,6 +2251,26 @@ double g_v4_ap_comp_c, g_v4_ap_comp_a;
 
 /* V4_DECODE_GPU_PROJ (1): decode's compressor and indexer-compressor
  * projections on the card when their mirrors exist; 0 = the CPU loops. */
+/* V4_WO_CHAIN (1): decode's attention tail (inverse RoPE, wo_a, wo_b) on
+ * the device right after the cached sparse attention, one round trip for
+ * the four; 0 = download the attended vector and run the tail as before. */
+static int v4_wo_chain_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_WO_CHAIN");
+        on = !e || !*e || atoi(e) != 0;
+    }
+    return on;
+}
+static int v4_wo_verify_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DSV4_WO_VERIFY");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
 static int v4_decode_gpu_proj_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -2448,7 +2468,8 @@ static int attention_token_impl(float *output,
 
     AP_MARK(g_v4_ap_kv);
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
-    int gpu_attn_done = 0;
+    int gpu_attn_done = 0, chain_done = 0, chain_checked = 0;
+    float *chain_out = NULL, *chain_att = NULL, *chain_oa = NULL;
 #ifdef COLI_V4_GPU_TIER
     /* DECODE on the persistent device KV (same ring/compressed buffers the
      * batched prefill fills, same kernels): at long context the CPU sparse
@@ -2469,7 +2490,35 @@ static int attention_token_impl(float *output,
         if (coli_v4_gpu_kv_cache_sync(weights, state->kv, window, head_dim,
                                       position, state->compressed,
                                       comp_total)) {
-            int rc = state->indexer
+            int rc = -1;
+            /* V4_WO_CHAIN: the attended vector stays on the card through the
+             * inverse RoPE, wo_a and wo_b (the mirrors' mv kernels, as the
+             * separate calls below run them: one round trip for the four);
+             * the output comes back bf16-rounded. Under DSV4_WO_VERIFY the chain
+             * runs into side buffers and the usual path follows for the
+             * comparison. Any refusal falls through to the attention-only call. */
+            if (v4_wo_chain_on() && wo_a.gpu && wo_b.gpu) {
+                int verify = v4_wo_verify_on();
+                if (verify) {
+                    chain_out = malloc((size_t)hidden * sizeof(*chain_out));
+                    chain_att = malloc((size_t)heads * head_dim * sizeof(*chain_att));
+                    chain_oa = malloc((size_t)groups * o_rank * sizeof(*chain_oa));
+                }
+                if (!verify || (chain_out && chain_att && chain_oa)) {
+                    rc = coli_v4_gpu_attention_decode_chain(
+                        weights, q, kv, position, sinks, meta,
+                        state->indexer ? compressed_indices : NULL,
+                        config->index_topk, first, comp_total, heads, head_dim,
+                        cosines, sines, rope_dim, &wo_a, groups, &wo_b,
+                        verify ? chain_out : output, verify ? chain_att : NULL,
+                        verify ? chain_oa : NULL);
+                    if (rc == 0) {
+                        if (verify) { chain_checked = 1; rc = -1; }
+                        else chain_done = 1;
+                    }
+                }
+            }
+            if (rc != 0) rc = state->indexer
                 ? coli_v4_gpu_sparse_attention_batch_cached_idx(
                       weights, attended, q, kv, position, sinks, meta,
                       compressed_indices, config->index_topk, first,
@@ -2541,7 +2590,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++)
             head_output[i] = coli_bf16_round(kv[i] * attention_weight);
     }
-    for (int head = 0; !result && head < heads; head++) {
+    for (int head = 0; !result && !chain_done && head < heads; head++) {
         float *head_output = attended + (size_t)head * head_dim;
         float *rope = head_output + head_dim - rope_dim;
         coli_v4_rope_apply(rope, 1, rope_dim, cosines, sines, 1);
@@ -2553,7 +2602,7 @@ static int attention_token_impl(float *output,
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !chain_done) {
 #ifdef COLI_V4_GPU_TIER
         if (wo_a.gpu) {
             result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
@@ -2581,11 +2630,36 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !chain_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !chain_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !chain_done) coli_bf16_round_array(output, (size_t)hidden);
     AP_MARK(g_v4_ap_wo);
 #undef AP_MARK
+    if (!result && chain_checked) {
+        /* DSV4_WO_VERIFY: the device chain's attended (after the inverse RoPE),
+         * oa and output against the path above, bitwise. */
+        long long ba = 0, bo = 0, bh = 0;
+        double wa_ = 0, wo_ = 0, wh = 0;
+        for (size_t i = 0; i < (size_t)heads * head_dim; i++) {
+            double d = fabs((double)chain_att[i] - attended[i]);
+            if (chain_att[i] != attended[i]) ba++;
+            if (d > wa_) wa_ = d;
+        }
+        for (size_t i = 0; i < (size_t)groups * o_rank; i++) {
+            double d = fabs((double)chain_oa[i] - oa[i]);
+            if (chain_oa[i] != oa[i]) bo++;
+            if (d > wo_) wo_ = d;
+        }
+        for (size_t i = 0; i < (size_t)hidden; i++) {
+            double d = fabs((double)chain_out[i] - output[i]);
+            if (chain_out[i] != output[i]) bh++;
+            if (d > wh) wh = d;
+        }
+        fprintf(stderr, "woverify layer=%d position=%d att_mismatch=%lld (max %g) "
+                "oa_mismatch=%lld (max %g) out_mismatch=%lld (max %g)\n",
+                weights->plan.layer, position, ba, wa_, bo, wo_, bh, wh);
+    }
+    free(chain_out); free(chain_att); free(chain_oa);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -14618,6 +14692,29 @@ int coli_v4_gpu_indexer_select_fused(
                v4_idx_env_int("DSV4_IDX_ROPE_FMA", 1),
                v4_idx_env_int("DSV4_IDX_HW_FMA", 1), scores, queries_out,
                head_w_out)
+        ? 0 : -1;
+}
+
+int coli_v4_gpu_attention_decode_chain(
+    const ColiDeepSeekV4LayerWeights *weights, const float *q, const float *kv,
+    int position, const float *sinks, const int *meta, const int *sel, int selstride,
+    int first, int comp_total, int heads, int head_dim, const float *cosines,
+    const float *sines, int rope_dim, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out) {
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !q || !kv || !sinks ||
+        !meta || !cosines || !sines || !wo_a || !wo_b || !wo_a->gpu || !wo_b->gpu ||
+        !output || position < 0 || first < 0 || heads < 1 || head_dim < 1 ||
+        groups < 1)
+        return -1;
+    int device = v4_gpu_layer_device(weights);
+    if (device < 0) return -1;
+    return dsv4_cuda_attn_decode_chain(
+               device, weights->plan.layer, q, kv, position, sinks, meta, sel,
+               selstride, first, comp_total, heads, head_dim,
+               1.0f / sqrtf((float)head_dim), cosines, sines, rope_dim,
+               v4_idx_env_int("DSV4_WO_ROPE_FMA", 1),
+               (Dsv4CudaTensor *)wo_a->gpu, groups, (Dsv4CudaTensor *)wo_b->gpu,
+               output, attended_out, oa_out)
         ? 0 : -1;
 }
 

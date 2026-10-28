@@ -482,7 +482,8 @@ Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
 vs CPU, bitwise: `idxproj`, `idxverify`, `idxfused`), `DSV4_IDX_KPROF=1`
-(device time per stage of the fused selection),
+(device time per stage of the fused selection), `DSV4_WO_VERIFY=1` /
+`DSV4_WO_KPROF=1` (the decode attention tail chain: bitwise check, stage times),
 `V4_PREFIX_LOG=1` (checkpoint/hint decisions), `v4_mirror` per-drive I/O
 telemetry after each request.
 
@@ -609,6 +610,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_IDX_FUSED` (1) | the indexer selection as one device round trip (decode and prefill chunks): the layer's `wq_b` bytes + f32 block scales in the CPU reference layout and its bf16 head-weight rows resident on the card (uploaded with the attention mirrors, 8 MB per indexer layer), the compressed keys appended as the host produces them, and projection -> query prep (bf16 round, RoPE, hadamard, fp4 round trip) -> head weights -> scoring in four launches; the sort stays on the host. Bitwise the CPU path: `DSV4_IDX_VERIFY=1` compares the prepared queries, head weights and scores (651 of 651 selections identical on the reference box, prefill chunks and decode tokens). 3.3k context: attention 111 -> 72 ms/token, decode 19.40 -> 18.20 s / 36 tokens, text unchanged. `0` = the projection replica + scoring kernel with their per-call uploads (8 MB of weights per indexer layer per token) |
 | `DSV4_IDX_ROPE_FMA` (1), `DSV4_IDX_HW_FMA` (1) | which products the fused prep fuses, matching the GCC build of the reference (read off the binary: the RoPE's cosine products — `vfmaddsub` — and the head-weight accumulate are FMAs, nothing else). For a build with another contraction pattern (`DSV4_IDX_VERIFY` would report mismatches): `0` = none fused, ROPE `2` = the sine products instead |
 | `DSV4_IDX_KPROF` (0, `.cu`) | per-call device time of the fused selection's stages (`idxkprof`); 0.16 + 0.01 + 0.10 + 0.09 + 0.02 ms per indexer layer at one token / 820 candidates |
+| `V4_WO_CHAIN` (1) | decode: the attention tail on the device right after the cached sparse attention — inverse RoPE + bf16 round, the grouped `wo_a` and `wo_b` matvecs through the mirrors' own mv kernels (what the separate calls run: `coli_fp8_matvec_ref` dispatches to the mirror when one exists), one download of the bf16-rounded hidden vector. Three syncs per layer become one; arithmetic unchanged, `DSV4_WO_VERIFY=1` compares attended, `oa` and output bitwise (215 of 215 layer-tokens identical on the reference box). 3.3k context: sparse attention + wo 36 -> 28 ms/token, decode 17.71 -> 17.47 s / 36 tokens, text unchanged. `0` = download the attended vector and run the tail as before |
+| `DSV4_WO_ROPE_FMA` (1) | the inverse RoPE's fused products on the device, as `DSV4_IDX_ROPE_FMA` |
+| `DSV4_WO_KPROF` (0, `.cu`) | per-layer device time of the chain's stages (`wokprof`): rope 0.005, wo_a 0.14, round 0.004, wo_b 0.14, download 0.01 ms |
 | `DSV4_CUDA_SCHED` (unset = runtime default, `.cu`) | how the host waits in a stream sync: `spin`, `yield`, `blocking`. Measured on the reference box: spin 19.35 s, yield 19.42, default 19.40, blocking 20.6 (36 tokens) — the default already spins there |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |

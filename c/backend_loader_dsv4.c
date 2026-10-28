@@ -178,6 +178,13 @@ typedef int             (*fn_indexer_select_fused)(int device, int layer, const 
                                                    int count, float had_scale, float wscale, int rope_fma,
                                                    int hw_fma, float *scores, float *queries_out,
                                                    float *head_w_out);
+typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
+                                                int chunk_start, const float *sinks, const int *meta,
+                                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                                int heads, int dim, float scale, const float *icos,
+                                                const float *isin, int rope_dim, int rope_fma,
+                                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                                float *out, float *att_out, float *oa_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int             (*fn_backend_arch_ok)(int device);
@@ -325,6 +332,7 @@ static struct {
     fn_indexer_resident indexer_resident;
     fn_indexer_keys_sync indexer_keys_sync;
     fn_indexer_select_fused indexer_select_fused;
+    fn_attn_decode_chain attn_decode_chain;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -526,6 +534,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(indexer_resident, fn_indexer_resident);
     RESOLVE(indexer_keys_sync, fn_indexer_keys_sync);
     RESOLVE(indexer_select_fused, fn_indexer_select_fused);
+    RESOLVE(attn_decode_chain, fn_attn_decode_chain);
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
@@ -917,6 +926,19 @@ int dsv4_cuda_indexer_select_fused(int device, int layer, const float *x, const 
     return g_dsv4.indexer_select_fused(device, layer, x, inputs, cosv, sinv, counts, tokens, heads,
                                        dim, rope_dim, hidden, count, had_scale, wscale, rope_fma,
                                        hw_fma, scores, queries_out, head_w_out);
+}
+
+int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,
+                                int chunk_start, const float *sinks, const int *meta,
+                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                int heads, int dim, float scale, const float *icos,
+                                const float *isin, int rope_dim, int rope_fma,
+                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                float *out, float *att_out, float *oa_out){
+    if(!g_dsv4.available) return 0;
+    return g_dsv4.attn_decode_chain(device, layer, q, chunk, chunk_start, sinks, meta, sel, selstride,
+                                    abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
+                                    rope_fma, wa, groups, wb, out, att_out, oa_out);
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){

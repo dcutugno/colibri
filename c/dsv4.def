@@ -51,6 +51,7 @@ EXPORTS
     dsv4_cuda_indexer_resident
     dsv4_cuda_indexer_keys_sync
     dsv4_cuda_indexer_select_fused
+    dsv4_cuda_attn_decode_chain
     dsv4_cuda_tensor_refill_fp4
     dsv4_cuda_backend_arch_ok
     dsv4_cuda_backend_name
