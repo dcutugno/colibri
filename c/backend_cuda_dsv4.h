@@ -73,14 +73,18 @@ int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
 /* Decode attention tail on the device: cached sparse attention (sel NULL =
  * every compressed row) -> inverse RoPE + bf16 round -> grouped wo_a (mv
  * kernel) -> bf16 round -> wo_b (mv kernel over its mirror) -> bf16-rounded
- * out[wb->O]. att_out / oa_out: verify downloads. */
+ * out[wb->O]. att_out / oa_out: verify downloads. With qa (q NULL) the query
+ * is made on the card first: wq_b mv kernel, bf16 round, per-head rmsnorm
+ * (eps, norm_fma), forward RoPE; q_out: its verify download. */
 int dsv4_cuda_attn_decode_chain(int device,int layer,const float *q,const float *chunk,
                                 int chunk_start,const float *sinks,const int *meta,
                                 const int *sel,int selstride,int abs_base,int comp_limit,
                                 int heads,int dim,float scale,const float *icos,
                                 const float *isin,int rope_dim,int rope_fma,
                                 Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,
-                                float *out,float *att_out,float *oa_out);
+                                float *out,float *att_out,float *oa_out,
+                                const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,
+                                int norm_fma,float *q_out);
 int dsv4_cuda_indexer_select_fused(int device,int layer,const float *x,const float *inputs,
                                    const float *cosv,const float *sinv,const int *counts,
                                    int tokens,int heads,int dim,int rope_dim,int hidden,

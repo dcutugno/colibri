@@ -184,7 +184,9 @@ typedef int             (*fn_attn_decode_chain)(int device, int layer, const flo
                                                 int heads, int dim, float scale, const float *icos,
                                                 const float *isin, int rope_dim, int rope_fma,
                                                 Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
-                                                float *out, float *att_out, float *oa_out);
+                                                float *out, float *att_out, float *oa_out,
+                                                const float *qa, int q_rank, Dsv4CudaTensor *wqb,
+                                                float eps, int norm_fma, float *q_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int             (*fn_backend_arch_ok)(int device);
@@ -934,11 +936,14 @@ int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const flo
                                 int heads, int dim, float scale, const float *icos,
                                 const float *isin, int rope_dim, int rope_fma,
                                 Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
-                                float *out, float *att_out, float *oa_out){
+                                float *out, float *att_out, float *oa_out,
+                                const float *qa, int q_rank, Dsv4CudaTensor *wqb, float eps,
+                                int norm_fma, float *q_out){
     if(!g_dsv4.available) return 0;
     return g_dsv4.attn_decode_chain(device, layer, q, chunk, chunk_start, sinks, meta, sel, selstride,
                                     abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
-                                    rope_fma, wa, groups, wb, out, att_out, oa_out);
+                                    rope_fma, wa, groups, wb, out, att_out, oa_out, qa, q_rank, wqb,
+                                    eps, norm_fma, q_out);
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){

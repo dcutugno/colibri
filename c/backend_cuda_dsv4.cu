@@ -1541,11 +1541,14 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
  * engine's coli_fp8_matvec_ref dispatches to when the mirror exists), then
  * one download of the bf16-rounded hidden vector. Three syncs per layer
  * become one; the arithmetic is the separate calls' exactly. */
-__global__ void attn_inv_rope_kernel(float*att,const float*cosv,const float*sinv,int dim,int rope_dim,int fma_mode){
+/* Per-head RoPE on the last rope_dim of each head's dim, bf16-rounded after:
+ * the reference's coli_v4_rope_apply (sine * direction, direction +-1 exact)
+ * + coli_bf16_round_array. fma_mode as the indexer prep. */
+__global__ void attn_inv_rope_kernel(float*att,const float*cosv,const float*sinv,int dim,int rope_dim,int fma_mode,int inverse){
     int h=blockIdx.x,i=threadIdx.x,pairs=rope_dim/2;
     if(i>=pairs)return;
     float*v=att+(long long)h*dim+dim-rope_dim+2*i;
-    float re=v[0],im=v[1],c=cosv[i],sn=-sinv[i];   /* sine * direction, direction -1: exact */
+    float re=v[0],im=v[1],c=cosv[i],sn=inverse?-sinv[i]:sinv[i];
     float a,b;
     if(fma_mode==1){a=fmaf(re,c,-__fmul_rn(im,sn));b=fmaf(im,c,__fmul_rn(re,sn));}
     else if(fma_mode==2){a=fmaf(-im,sn,__fmul_rn(re,c));b=fmaf(re,sn,__fmul_rn(im,c));}
@@ -1556,6 +1559,25 @@ __global__ void bf16_round_ref_kernel(float*x,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n)x[i]=bf16_round_dev(x[i]);
 }
+/* The decode query's per-head rmsnorm, the reference's arithmetic: one
+ * sequential fp32 mean-square (fma_on: the accumulate fused, as the GCC
+ * build contracts it), scale = 1 / sqrtf(ms / dim + eps), bf16 round. */
+__global__ void head_rmsnorm_ref_kernel(float*q,int dim,float eps,int fma_on){
+    int h=blockIdx.x;
+    float*v=q+(long long)h*dim;
+    extern __shared__ float sv[];
+    __shared__ float sc;
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x)sv[i]=v[i];
+    __syncthreads();
+    if(!threadIdx.x){
+        float ms=0.f;
+        if(fma_on)for(int i=0;i<dim;i++)ms=fmaf(sv[i],sv[i],ms);
+        else for(int i=0;i<dim;i++)ms=__fadd_rn(ms,__fmul_rn(sv[i],sv[i]));
+        sc=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(__fdiv_rn(ms,(float)dim),eps)));
+    }
+    __syncthreads();
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x)v[i]=bf16_round_dev(__fmul_rn(sv[i],sc));
+}
 /* The CPU reference matvec over a fmt-8 mirror, one thread per output row.
  * rows8 order: sum += (x*w)*scale sequentially over all columns (the AVX2
  * resident-layout kernel); block order: fp32 per 128-column block, double
@@ -1563,9 +1585,11 @@ __global__ void bf16_round_ref_kernel(float*x,int n){
 extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,const float*chunk,int chunk_start,
         const float*sinks,const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,
         float scale,const float*icos,const float*isin,int rope_dim,int rope_fma,Dsv4CudaTensor*wa,int groups,
-        Dsv4CudaTensor*wb,float*out,float*att_out,float*oa_out){
+        Dsv4CudaTensor*wb,float*out,float*att_out,float*oa_out,
+        const float*qa,int q_rank,Dsv4CudaTensor*wqb,float eps,int norm_fma,float*q_out){
     Dev*c=ctx(device);
-    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!q||!chunk||!sinks||!meta||!out||!icos||!isin||
+    if(qa&&(!wqb||wqb->device!=device||(wqb->fmt!=8&&wqb->fmt!=9)||wqb->I!=q_rank||(long long)wqb->O!=(long long)heads*dim||q_rank<1))return 0;
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||(!q&&!qa)||!chunk||!sinks||!meta||!out||!icos||!isin||
        !wa||!wb||wa->device!=device||wb->device!=device||groups<1||wa->O%groups||(long long)wa->I*groups!=(long long)heads*dim||
        wb->I!=wa->O||(wb->fmt!=8&&wb->fmt!=9)||(wa->fmt!=8&&wa->fmt!=9)||
        abs_base<0||chunk_start<0||heads<1||dim<1||rope_dim<2||rope_dim>dim||(rope_dim&1)||!(scale>0.f))return 0;
@@ -1576,19 +1600,38 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
     if(sel){if(selstride<1||cn>selstride)return 0;for(int i=0;i<cn;i++){int o=sel[i];if(o<0||o>=comp_limit)return 0;}}
     size_t qb=(size_t)heads*dim*4,cb=(size_t)dim*4,sb=(size_t)heads*4,mb=3*sizeof(int),
            ib=sel?(size_t)cn*sizeof(int):0,rb=(size_t)pairs*4,sm=(size_t)total*4,
-           ob=(size_t)wa->O*4,hb=(size_t)wb->O*4;
+           ob=(size_t)wa->O*4,hb=(size_t)wb->O*4,qab=qa?(size_t)q_rank*4:0;
     if(sm>96*1024||!ok(cudaSetDevice(device),"select decode chain device"))return 0;
     if(!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,qb)||!buf((void**)&c->p3,&c->p3cap,cb)||
        !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
-       (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->p1,&c->p1cap,2*rb)||
+       (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->p1,&c->p1cap,2*rb+qab)||
        !buf((void**)&c->dy,&c->ycap,ob)||!buf((void**)&c->dx,&c->xcap,hb))return 0;
-    if(!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"decode chain query upload")||
+    if(qa){
+        /* q from qa on the card: the wq_b mv kernel (what coli_fp8_matvec_ref
+         * dispatches to over the mirror), bf16 round, per-head rmsnorm,
+         * forward RoPE + bf16 round — the host's q, never crossing. */
+        const float*dqa=(const float*)((char*)c->p1+2*rb);
+        if(!ok(cudaMemcpyAsync((void*)dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"decode chain qa upload")||
+           !ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
+           !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))return 0;
+        if(wqb->fmt==9)run_mv<9>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);
+        else run_mv<8>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);
+        if(!ok(cudaGetLastError(),"decode chain wq_b launch"))return 0;
+        bf16_round_ref_kernel<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p2,heads*dim);
+        head_rmsnorm_ref_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
+        if(!ok(cudaGetLastError(),"decode chain q norm launch"))return 0;
+        attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p2,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,0);
+        if(!ok(cudaGetLastError(),"decode chain q rope launch"))return 0;
+        if(q_out&&!ok(cudaMemcpyAsync(q_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"decode chain q download"))return 0;
+    }
+    if(!qa&&!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"decode chain query upload"))return 0;
+    if(
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"decode chain kv upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"decode chain sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"decode chain meta upload")||
        (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"decode chain index upload"))||
-       !ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
-       !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))return 0;
+       (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
+              !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))))return 0;
     if(sel)
         sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
@@ -1602,7 +1645,7 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
     if(kprof<0){const char*e=getenv("DSV4_WO_KPROF");kprof=e&&*e&&*e!='0';}
     cudaEvent_t ev[7];
     if(kprof){for(int i=0;i<7;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
-    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma);
+    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
     if(kprof)cudaEventRecord(ev[1],c->stream);
     if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->p4,c->dy,wa->O,wa->I,groups,c->stream);

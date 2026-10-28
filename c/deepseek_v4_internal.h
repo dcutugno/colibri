@@ -1035,14 +1035,17 @@ int coli_v4_gpu_indexer_select_fused(
     int tokens, int max_count, float *scores, float *queries_out, float *head_w_out);
 void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, int layer);
 /* V4_WO_CHAIN: decode's cached sparse attention -> inverse RoPE -> wo_a ->
- * wo_b on the device in one round trip; output[hidden] bf16-rounded.
- * attended_out / oa_out: verify downloads (DSV4_WO_VERIFY). */
+ * wo_b on the device in one round trip; output[hidden] bf16-rounded. With qa
+ * (q NULL) the query is made on the card from the wq_b mirror (bf16 round,
+ * per-head rmsnorm with eps, forward RoPE). attended_out / oa_out / q_out:
+ * verify downloads (DSV4_WO_VERIFY). */
 int coli_v4_gpu_attention_decode_chain(
     const ColiDeepSeekV4LayerWeights *weights, const float *q, const float *kv,
     int position, const float *sinks, const int *meta, const int *sel, int selstride,
     int first, int comp_total, int heads, int head_dim, const float *cosines,
     const float *sines, int rope_dim, const ColiTensorView *wo_a, int groups,
-    const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out);
+    const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out,
+    const float *qa, int q_rank, const ColiTensorView *wq_b, float eps, float *q_out);
 int coli_v4_gpu_sparse_attention_batch_cached_idx(
     const ColiDeepSeekV4LayerWeights *weights, float *attended,
     const float *q, const float *chunk, int chunk_start, const float *sinks,

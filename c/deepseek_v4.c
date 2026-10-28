@@ -2262,6 +2262,30 @@ static int v4_wo_chain_on(void) {
     }
     return on;
 }
+/* The decode query from its rank: wq_b matvec, bf16 round, per-head rmsnorm
+ * (bf16), forward RoPE on the last rope_dim of each head (bf16). The chain
+ * (V4_WO_CHAIN) makes the same on the card; the host runs this only when
+ * the chain is off, refused, or under DSV4_WO_VERIFY. */
+static int v4_decode_q_project(float *q, const ColiTensorView *wq_b, const float *qa,
+                               int heads, int head_dim, int rope_dim, float eps,
+                               const float *cosines, const float *sines) {
+    int result = coli_fp8_matvec_ref(q, wq_b, qa);
+    if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
+    for (int head = 0; !result && head < heads; head++) {
+        float *values = q + (size_t)head * head_dim;
+        float mean_square = 0.0f;
+        for (int i = 0; i < head_dim; i++) mean_square += values[i] * values[i];
+        float scale = 1.0f / sqrtf(mean_square / head_dim + eps);
+        for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
+    }
+    for (int head = 0; !result && head < heads; head++) {
+        float *rope = q + (size_t)head * head_dim + head_dim - rope_dim;
+        coli_v4_rope_apply(rope, 1, rope_dim, cosines, sines, 0);
+        coli_bf16_round_array(rope, (size_t)rope_dim);
+    }
+    return result;
+}
+
 static int v4_wo_verify_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -2417,16 +2441,17 @@ static int attention_token_impl(float *output,
         }
     }
     AP_MARK(g_v4_ap_comp);
-    if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
-    if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
-    for (int head = 0; !result && head < heads; head++) {
-        float *values = q + (size_t)head * head_dim;
-        float mean_square = 0.0f;
-        for (int i = 0; i < head_dim; i++) mean_square += values[i] * values[i];
-        float scale = 1.0f / sqrtf(mean_square / head_dim + config->rms_norm_eps);
-        for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
-    }
-
+    /* The query projection + norm + RoPE run together in v4_decode_q_project
+     * once the RoPE tables exist; with the device chain they are deferred
+     * and skipped altogether when the chain takes the token. */
+    int q_defer = 0;
+#ifdef COLI_V4_GPU_TIER
+    q_defer = v4_wo_chain_on() && !v4_wo_verify_on() && wq_b.gpu && wo_a.gpu &&
+              wo_b.gpu && state && layer_data(weights, "attn.attn_sink", NULL) &&
+              coli_v4_gpu_attn_batch_wanted() &&
+              state->compressed_count <= 8192 &&
+              (!state->indexer || compressed_indices);
+#endif
     AP_MARK(g_v4_ap_qb);
     if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
@@ -2445,12 +2470,10 @@ static int attention_token_impl(float *output,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
     }
+    if (!result && !q_defer)
+        result = v4_decode_q_project(q, &wq_b, qa, heads, head_dim, rope_dim,
+                                     config->rms_norm_eps, cosines, sines);
     if (!result) {
-        for (int head = 0; head < heads; head++) {
-            float *rope = q + (size_t)head * head_dim + head_dim - rope_dim;
-            coli_v4_rope_apply(rope, 1, rope_dim, cosines, sines, 0);
-            coli_bf16_round_array(rope, (size_t)rope_dim);
-        }
         float *kv_rope = kv + head_dim - rope_dim;
         coli_v4_rope_apply(kv_rope, 1, rope_dim, cosines, sines, 0);
         coli_bf16_round_array(kv_rope, (size_t)rope_dim);
@@ -2469,7 +2492,7 @@ static int attention_token_impl(float *output,
     AP_MARK(g_v4_ap_kv);
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
     int gpu_attn_done = 0, chain_done = 0, chain_checked = 0;
-    float *chain_out = NULL, *chain_att = NULL, *chain_oa = NULL;
+    float *chain_out = NULL, *chain_att = NULL, *chain_oa = NULL, *chain_q = NULL;
 #ifdef COLI_V4_GPU_TIER
     /* DECODE on the persistent device KV (same ring/compressed buffers the
      * batched prefill fills, same kernels): at long context the CPU sparse
@@ -2503,22 +2526,32 @@ static int attention_token_impl(float *output,
                     chain_out = malloc((size_t)hidden * sizeof(*chain_out));
                     chain_att = malloc((size_t)heads * head_dim * sizeof(*chain_att));
                     chain_oa = malloc((size_t)groups * o_rank * sizeof(*chain_oa));
+                    chain_q = malloc((size_t)heads * head_dim * sizeof(*chain_q));
                 }
-                if (!verify || (chain_out && chain_att && chain_oa)) {
+                int q_on_device = wq_b.gpu != NULL;
+                if (!verify || (chain_out && chain_att && chain_oa && chain_q)) {
                     rc = coli_v4_gpu_attention_decode_chain(
-                        weights, q, kv, position, sinks, meta,
+                        weights, q_on_device ? NULL : q, kv, position, sinks, meta,
                         state->indexer ? compressed_indices : NULL,
                         config->index_topk, first, comp_total, heads, head_dim,
                         cosines, sines, rope_dim, &wo_a, groups, &wo_b,
                         verify ? chain_out : output, verify ? chain_att : NULL,
-                        verify ? chain_oa : NULL);
+                        verify ? chain_oa : NULL, q_on_device ? qa : NULL, q_rank,
+                        &wq_b, config->rms_norm_eps,
+                        verify && q_on_device ? chain_q : NULL);
                     if (rc == 0) {
                         if (verify) { chain_checked = 1; rc = -1; }
                         else chain_done = 1;
                     }
                 }
             }
-            if (rc != 0) rc = state->indexer
+            if (rc != 0 && q_defer) {
+                /* the chain declined: the host query after all */
+                result = v4_decode_q_project(q, &wq_b, qa, heads, head_dim, rope_dim,
+                                             config->rms_norm_eps, cosines, sines);
+                q_defer = 0;
+            }
+            if (rc != 0 && !result) rc = state->indexer
                 ? coli_v4_gpu_sparse_attention_batch_cached_idx(
                       weights, attended, q, kv, position, sinks, meta,
                       compressed_indices, config->index_topk, first,
@@ -2536,6 +2569,12 @@ static int attention_token_impl(float *output,
         }
     }
 #endif
+    if (!result && q_defer && !chain_done) {
+        /* no device attention at all: the host query for the reference loop */
+        result = v4_decode_q_project(q, &wq_b, qa, heads, head_dim, rope_dim,
+                                     config->rms_norm_eps, cosines, sines);
+        q_defer = 0;
+    }
     if (!result && state && gpu_attn_done) {
         int slot = position % state->window_size;
         memcpy(state->kv + (size_t)slot * head_dim, kv,
@@ -2638,8 +2677,13 @@ static int attention_token_impl(float *output,
     if (!result && chain_checked) {
         /* DSV4_WO_VERIFY: the device chain's attended (after the inverse RoPE),
          * oa and output against the path above, bitwise. */
-        long long ba = 0, bo = 0, bh = 0;
-        double wa_ = 0, wo_ = 0, wh = 0;
+        long long ba = 0, bo = 0, bh = 0, bq = 0;
+        double wa_ = 0, wo_ = 0, wh = 0, wq_ = 0;
+        for (size_t i = 0; chain_q && wq_b.gpu && i < (size_t)heads * head_dim; i++) {
+            double d = fabs((double)chain_q[i] - q[i]);
+            if (chain_q[i] != q[i]) bq++;
+            if (d > wq_) wq_ = d;
+        }
         for (size_t i = 0; i < (size_t)heads * head_dim; i++) {
             double d = fabs((double)chain_att[i] - attended[i]);
             if (chain_att[i] != attended[i]) ba++;
@@ -2655,11 +2699,12 @@ static int attention_token_impl(float *output,
             if (chain_out[i] != output[i]) bh++;
             if (d > wh) wh = d;
         }
-        fprintf(stderr, "woverify layer=%d position=%d att_mismatch=%lld (max %g) "
-                "oa_mismatch=%lld (max %g) out_mismatch=%lld (max %g)\n",
-                weights->plan.layer, position, ba, wa_, bo, wo_, bh, wh);
+        fprintf(stderr, "woverify layer=%d position=%d q_mismatch=%lld (max %g) "
+                "att_mismatch=%lld (max %g) oa_mismatch=%lld (max %g) "
+                "out_mismatch=%lld (max %g)\n",
+                weights->plan.layer, position, bq, wq_, ba, wa_, bo, wo_, bh, wh);
     }
-    free(chain_out); free(chain_att); free(chain_oa);
+    free(chain_out); free(chain_att); free(chain_oa); free(chain_q);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -14700,8 +14745,10 @@ int coli_v4_gpu_attention_decode_chain(
     int position, const float *sinks, const int *meta, const int *sel, int selstride,
     int first, int comp_total, int heads, int head_dim, const float *cosines,
     const float *sines, int rope_dim, const ColiTensorView *wo_a, int groups,
-    const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out) {
-    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !q || !kv || !sinks ||
+    const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out,
+    const float *qa, int q_rank, const ColiTensorView *wq_b, float eps, float *q_out) {
+    if (qa && (!wq_b || !wq_b->gpu || q_rank < 1)) return -1;
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || (!q && !qa) || !kv || !sinks ||
         !meta || !cosines || !sines || !wo_a || !wo_b || !wo_a->gpu || !wo_b->gpu ||
         !output || position < 0 || first < 0 || heads < 1 || head_dim < 1 ||
         groups < 1)
@@ -14714,7 +14761,9 @@ int coli_v4_gpu_attention_decode_chain(
                1.0f / sqrtf((float)head_dim), cosines, sines, rope_dim,
                v4_idx_env_int("DSV4_WO_ROPE_FMA", 1),
                (Dsv4CudaTensor *)wo_a->gpu, groups, (Dsv4CudaTensor *)wo_b->gpu,
-               output, attended_out, oa_out)
+               output, attended_out, oa_out, qa, q_rank,
+               qa ? (Dsv4CudaTensor *)wq_b->gpu : NULL, eps,
+               v4_idx_env_int("DSV4_Q_NORM_FMA", 1), q_out)
         ? 0 : -1;
 }
 
