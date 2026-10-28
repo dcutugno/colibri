@@ -551,6 +551,31 @@ weigh. Two changes:
    6.4 and 5.4 GB/s here, 10 GB/s striped), upload tail 1.1, group 1.0
    (0.17 ms of kernels; the rest is the WDDM round trip), shared 0.25.
 
+Fourth measurement (2026-10-28, night): the uploader's exit report now
+breaks a queued upload down (`v4_gpu uploader breakdown per job`): of its
+0.90 ms, 0.66 ms were the six enqueue-only `cudaMemcpyAsync` of the three
+mirror tensors (~110 µs each under WDDM, serialized on the card's one
+uploader thread), the lock and the LRU pick nothing. `V4_MIRROR_BLOCK`
+(on): a mirror is ONE device allocation — the record's scale run, then its
+weight run 16-byte aligned — refilled with two copies and re-pointed, so an
+expert's tensor order (it varies by shard; the file also keeps a ~3.6 KB
+gap between an expert's scales and its weights) never matters: uploader
+0.90 → 0.23 ms per job, the join (`attach`) 63 → 4 ms/token on one card.
+What it buys depends on the card count: on **two cards** the two uploader
+threads were the tail, 36 tokens MoE 293 → 270 ms/token; on **one card**
+the time moved into the group's fence wait (`compute` 38 → 87) and MoE
+stayed at 278 — there the tail is the link itself: a layer's 2–3 misses
+finish reading together and their ~33 MB then cross the gen4 x8 link in
+~3 ms, of which ~1.7 ms sit after the last read. Steady state (last 100 of
+300 tokens, 3.3k context, `--ram 16`): one card 327 → 329 ms/token (unchanged within noise; `attach` 53 → 3, `compute` 38 → 84: the wait moved to the fence), two cards
+306 → 306 (second card 651 mirrors).
+
+   The lever that remains for one card is to start each expert's copy
+   before its read ends: read the record in a few striped pieces and
+   enqueue each piece as it lands (the block mirror makes the destination
+   one contiguous run), so the link works under the reads and the tail
+   shrinks to the last piece.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -672,6 +697,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DEV2_EARLY` (1) | with a second card, launch its expert group at routing time (its experts are resident there, nothing to read) and join it after this layer's reads and uploads; `0` = launch it at the partition, after them (measured: +22 ms/token at 3.3k context) |
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
+| `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
 | `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
 | `DSV4_MOE_MV` (1, `.cu`) | decode expert group / fused MoE: bandwidth-shaped fp4 and fp8 matvecs (one warp per row, 16-byte loads; kernels 1.14 → 0.29 ms per layer on the 5080); `0` = the byte-per-lane `mv_fp4_grouped` / `mv<8>` kernels (a different summation order) |

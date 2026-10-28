@@ -12422,6 +12422,11 @@ typedef struct {
     Dsv4CudaTensor *up;
     Dsv4CudaTensor *down;
     uint64_t clock;
+    /* one-block mirror (V4_MIRROR_BLOCK): the three tensors inside one
+     * allocation, refilled with two copies (the record's scale run and
+     * weight run) for any expert of the same shape */
+    int block;
+    int dims[4];   /* Og, Ig, Od, Id */
 } V4GpuExpertMirror;
 
 /* Backend entry points a mirror cache calls. The primary cache uses the
@@ -12441,9 +12446,20 @@ typedef struct {
     int (*device_unified)(int);
     int (*stream_drain)(int);
     int (*group_fence)(int);   /* optional: 1 when the expert group fences the aux-stream uploads */
+    int (*mirror_alloc)(Dsv4CudaTensor **, Dsv4CudaTensor **, Dsv4CudaTensor **,
+                        int, int, int, int, int);   /* optional: one-block mirrors */
+    int (*mirror_refill)(Dsv4CudaTensor *, Dsv4CudaTensor *, Dsv4CudaTensor *,
+                         const uint8_t *, long long, const long long *,
+                         const uint8_t *, long long, const long long *, int);
 } V4GpuBackendOps;
 extern int dsv4_cuda_stream_drain(int device);
 extern int dsv4_cuda_group_fence(int device);
+extern int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **g, Dsv4CudaTensor **u, Dsv4CudaTensor **d,
+                                  int Og, int Ig, int Od, int Id, int device);
+extern int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d,
+                                   const uint8_t *scales, long long S, const long long *soff,
+                                   const uint8_t *weights, long long Wb, const long long *woff,
+                                   int sync);
 
 #ifdef _WIN32
 /* Windows loader: the secondary module (backend_loader_dsv4.c). */
@@ -12463,6 +12479,12 @@ long long dsv4_cuda2_mem_free_mb(int device);
 int dsv4_cuda2_device_unified(int device);
 int dsv4_cuda2_stream_drain(int device);
 int dsv4_cuda2_group_fence(int device);
+int dsv4_cuda2_mirror_alloc(Dsv4CudaTensor **g, Dsv4CudaTensor **u, Dsv4CudaTensor **d,
+                            int Og, int Ig, int Od, int Id, int device);
+int dsv4_cuda2_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d,
+                             const uint8_t *scales, long long S, const long long *soff,
+                             const uint8_t *weights, long long Wb, const long long *woff,
+                             int sync);
 const char *dsv4_cuda2_backend_name(void);
 #else
 /* One linked backend elsewhere: a second card is usable only when this
@@ -12483,18 +12505,22 @@ static void dsv4_cuda2_shutdown(void) {}
 #define dsv4_cuda2_device_unified dsv4_cuda_device_unified
 #define dsv4_cuda2_stream_drain dsv4_cuda_stream_drain
 #define dsv4_cuda2_group_fence dsv4_cuda_group_fence
+#define dsv4_cuda2_mirror_alloc dsv4_cuda_mirror_alloc
+#define dsv4_cuda2_mirror_refill dsv4_cuda_mirror_refill
 #define dsv4_cuda2_backend_name dsv4_cuda_backend_name
 #endif
 
 static const V4GpuBackendOps v4_gpu_ops_primary = {
     dsv4_cuda_upload_fp4, dsv4_cuda_tensor_refill_fp4, dsv4_cuda_tensor_free,
     dsv4_cuda_expert_group, dsv4_cuda_mem_free_mb, dsv4_cuda_device_unified,
-    dsv4_cuda_stream_drain, dsv4_cuda_group_fence
+    dsv4_cuda_stream_drain, dsv4_cuda_group_fence,
+    dsv4_cuda_mirror_alloc, dsv4_cuda_mirror_refill
 };
 static const V4GpuBackendOps v4_gpu_ops_second = {
     dsv4_cuda2_upload_fp4, dsv4_cuda2_tensor_refill_fp4, dsv4_cuda2_tensor_free,
     dsv4_cuda2_expert_group, dsv4_cuda2_mem_free_mb, dsv4_cuda2_device_unified,
-    dsv4_cuda2_stream_drain, dsv4_cuda2_group_fence
+    dsv4_cuda2_stream_drain, dsv4_cuda2_group_fence,
+    dsv4_cuda2_mirror_alloc, dsv4_cuda2_mirror_refill
 };
 
 struct V4GpuExpertMirrorCache {
@@ -13219,7 +13245,67 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
  * set; -1 when this cache cannot take the expert now. */
 /* uploader breakdown (decode queued uploads): mutex wait, slot pick, refill enqueues */
 static double g_v4_up_lock_s, g_v4_up_pick_s, g_v4_up_copy_s;
-static unsigned long long g_v4_up_prof_n;
+static unsigned long long g_v4_up_prof_n, g_v4_up_block_n, g_v4_up_split_n;
+
+/* V4_MIRROR_BLOCK (1): a mirror is ONE device allocation (the three
+ * tensors' scales, then their weights), refilled with two copies of the
+ * host record's runs instead of six per-tensor copies (measured: ~110 us
+ * per enqueue under WDDM, 0.66 of the 0.90 ms a queued upload cost on its
+ * thread). The record's tensor order varies by shard; the refill re-points
+ * the tensors, so any expert fits any entry of its shape. 0 = three
+ * tensors, six copies. Needs the DLL's mirror_alloc/mirror_refill. */
+static int v4_mirror_block_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_MIRROR_BLOCK"); on = !e || !*e || atoi(e) != 0; }
+    return on;
+}
+/* One run of three segments: contiguous in some order, no gaps or overlap.
+ * Sets the run's base and length and each segment's offset within it. */
+static int v4_view_run(const unsigned char *const seg[3], const long long sz[3],
+                       const unsigned char **lo_out, long long *len, long long off[3]) {
+    const unsigned char *lo = NULL, *hi = NULL;
+    long long sum = 0;
+    for (int k = 0; k < 3; k++) {
+        if (!seg[k] || sz[k] <= 0) return 0;
+        if (!lo || seg[k] < lo) lo = seg[k];
+        if (!hi || seg[k] + sz[k] > hi) hi = seg[k] + sz[k];
+        sum += sz[k];
+    }
+    if (sum != hi - lo) return 0;
+    for (int k = 0; k < 3; k++) off[k] = seg[k] - lo;
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            if (a != b && off[a] < off[b] + sz[b] && off[b] < off[a] + sz[a]) return 0;
+    *lo_out = lo;
+    *len = hi - lo;
+    return 1;
+}
+/* The record as its two runs (the direct window read and the RAM cache
+ * keep the record as it is in the file: the scale tensors together, the
+ * weight tensors together). A fallback read that scattered them: no block. */
+static int v4_view_block_runs(const ColiExpertView *v,
+                              const unsigned char **scales, long long *S, long long soff[3],
+                              const unsigned char **weights, long long *Wb, long long woff[3]) {
+    const unsigned char *sseg[3] = { (const unsigned char *)v->gate.scales,
+                                     (const unsigned char *)v->up.scales,
+                                     (const unsigned char *)v->down.scales };
+    const long long ssz[3] = { (long long)v->gate.scale_bytes, (long long)v->up.scale_bytes,
+                               (long long)v->down.scale_bytes };
+    const unsigned char *wseg[3] = { (const unsigned char *)v->gate.data,
+                                     (const unsigned char *)v->up.data,
+                                     (const unsigned char *)v->down.data };
+    const long long wsz[3] = { (long long)v->gate.data_bytes, (long long)v->up.data_bytes,
+                               (long long)v->down.data_bytes };
+    return v4_view_run(sseg, ssz, scales, S, soff) && v4_view_run(wseg, wsz, weights, Wb, woff);
+}
+static int v4_view_block_dims(const ColiExpertView *v, int dims[4]) {
+    if (v->gate.rows <= 0 || v->gate.columns <= 0 || v->down.rows <= 0 || v->down.columns <= 0 ||
+        v->up.rows != v->gate.rows || v->up.columns != v->gate.columns)
+        return 0;
+    dims[0] = (int)v->gate.rows; dims[1] = (int)v->gate.columns;
+    dims[2] = (int)v->down.rows; dims[3] = (int)v->down.columns;
+    return 1;
+}
 static double v4_up_now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -13324,6 +13410,29 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
          * ~1500 driver calls per token). */
         double up_t2 = v4_up_now();
         if (sync >= 2) g_v4_up_pick_s += up_t2 - up_t1;
+        {
+            const unsigned char *bs = NULL, *bw = NULL;
+            long long S = 0, Wb = 0, soff[3], woff[3];
+            int dims[4];
+            V4GpuExpertMirror *en = &cache->entries[found];
+            if (en->block && en->gate && en->up && en->down && cache->ops->mirror_refill &&
+                v4_mirror_block_on() && v4_view_block_dims(view, dims) &&
+                memcmp(dims, en->dims, sizeof(dims)) == 0 &&
+                v4_view_block_runs(view, &bs, &S, soff, &bw, &Wb, woff) &&
+                cache->ops->mirror_refill(en->gate, en->up, en->down, bs, S, soff,
+                                          bw, Wb, woff, sync)) {
+                if (sync >= 2) { g_v4_up_copy_s += v4_up_now() - up_t2; g_v4_up_block_n++; }
+                en->layer = view->key.layer;
+                en->expert = view->key.expert;
+                en->clock = ++cache->clock;
+                view->gate.gpu = en->gate;
+                view->up.gpu = en->up;
+                view->down.gpu = en->down;
+                view->gpu_second = cache->second;
+                pthread_mutex_unlock(&cache->mutex);
+                return 0;
+            }
+        }
         if (cache->entries[found].gate && cache->entries[found].up &&
             cache->entries[found].down &&
             view->gate.data && view->gate.scales &&
@@ -13341,7 +13450,7 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].down, (const uint8_t *)view->down.data,
                 (const uint8_t *)view->down.scales, (int)view->down.rows,
                 (int)view->down.columns, sync)) {
-            if (sync >= 2) g_v4_up_copy_s += v4_up_now() - up_t2;
+            if (sync >= 2) { g_v4_up_copy_s += v4_up_now() - up_t2; g_v4_up_split_n++; }
             cache->entries[found].layer = view->key.layer;
             cache->entries[found].expert = view->key.expert;
             cache->entries[found].clock = ++cache->clock;
@@ -13368,21 +13477,40 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
     cache->entries[found].up = NULL;
     cache->entries[found].down = NULL;
     Dsv4CudaTensor *gate = NULL, *up = NULL, *down = NULL;
-    int ok = (view->gate.data && view->gate.scales &&
+    const unsigned char *bs = NULL, *bw = NULL;
+    long long S = 0, Wb = 0, soff[3], woff[3];
+    int dims[4] = {0, 0, 0, 0};
+    int blk = 0;
+    if (cache->ops->mirror_alloc && cache->ops->mirror_refill && v4_mirror_block_on() &&
+        v4_view_block_dims(view, dims) &&
+        v4_view_block_runs(view, &bs, &S, soff, &bw, &Wb, woff) &&
+        cache->ops->mirror_alloc(&gate, &up, &down, dims[0], dims[1], dims[2], dims[3],
+                                 cache->device)) {
+        if (cache->ops->mirror_refill(gate, up, down, bs, S, soff, bw, Wb, woff, 1))
+            blk = 1;   /* synchronous, as the three uploads below are */
+        else {
+            cache->ops->tensor_free(gate); cache->ops->tensor_free(up);
+            cache->ops->tensor_free(down);
+            gate = up = down = NULL;
+        }
+    }
+    int ok = blk;
+    if (!ok)
+        ok = (view->gate.data && view->gate.scales &&
               view->gate.rows > 0 && view->gate.columns > 0 &&
               cache->ops->upload_fp4(
                   &gate, (const uint8_t *)view->gate.data,
                   (const uint8_t *)view->gate.scales,
                   (int)view->gate.rows, (int)view->gate.columns,
                   cache->device));
-    if (ok)
+    if (ok && !blk)
         ok = (view->up.data && view->up.scales && view->up.rows > 0 &&
               view->up.columns > 0 &&
               cache->ops->upload_fp4(
                   &up, (const uint8_t *)view->up.data,
                   (const uint8_t *)view->up.scales, (int)view->up.rows,
                   (int)view->up.columns, cache->device));
-    if (ok)
+    if (ok && !blk)
         ok = (view->down.data && view->down.scales &&
               view->down.rows > 0 && view->down.columns > 0 &&
               cache->ops->upload_fp4(
@@ -13415,6 +13543,8 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
     cache->entries[found].gate = gate;
     cache->entries[found].up = up;
     cache->entries[found].down = down;
+    cache->entries[found].block = blk;
+    memcpy(cache->entries[found].dims, dims, sizeof(dims));
     cache->entries[found].clock = ++cache->clock;
     view->gate.gpu = gate;
     view->up.gpu = up;
@@ -13652,10 +13782,11 @@ void coli_v4_gpu_expert_upload_stats(unsigned long long *jobs0,
                     i, g_v4_up[i].jobs, g_v4_up[i].placed,
                     1e3 * g_v4_up[i].seconds / (double)g_v4_up[i].jobs);
     if (g_v4_up_prof_n)
-        fprintf(stderr, "v4_gpu uploader breakdown per job: lock=%.3f pick=%.3f copies=%.3f ms (n=%llu)\n",
+        fprintf(stderr, "v4_gpu uploader breakdown per job: lock=%.3f pick=%.3f copies=%.3f ms (n=%llu; two-copy=%llu six-copy=%llu)\n",
                 1e3 * g_v4_up_lock_s / (double)g_v4_up_prof_n,
                 1e3 * g_v4_up_pick_s / (double)g_v4_up_prof_n,
-                1e3 * g_v4_up_copy_s / (double)g_v4_up_prof_n, g_v4_up_prof_n);
+                1e3 * g_v4_up_copy_s / (double)g_v4_up_prof_n, g_v4_up_prof_n,
+                g_v4_up_block_n, g_v4_up_split_n);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be

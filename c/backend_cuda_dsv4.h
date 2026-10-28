@@ -109,6 +109,9 @@ int dsv4_cuda_device_count(void);
 int dsv4_cuda_stream_drain(int device);
 /* the expert group orders itself after the aux-stream uploads (decode uploader threads); 1 when supported */
 int dsv4_cuda_group_fence(int device);
+/* one-block expert mirror: three fp4 tensors inside one allocation (the scale run, then the weight run); a refill copies the host record's two runs (soff/woff: each tensor's offset within its run) and re-points the tensors */
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **g,Dsv4CudaTensor **u,Dsv4CudaTensor **d,int Og,int Ig,int Od,int Id,int device);
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g,Dsv4CudaTensor *u,Dsv4CudaTensor *d,const uint8_t *scales,long long S,const long long *soff,const uint8_t *weights,long long Wb,const long long *woff,int sync);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
