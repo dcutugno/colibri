@@ -1110,6 +1110,9 @@ int coli_v4_expert_store_cached(ColiExpertStore *store, ColiExpertKey key);
 /* Decode uploader threads (one per card): queue a missed expert's upload,
  * join before computing; the view stays in place until the join. */
 int coli_v4_upload_threads_enabled(void);
+/* DSV4_DECODE_PROF: the decode attention's stages, per token across layers. */
+extern double g_v4_ap_qa, g_v4_ap_comp, g_v4_ap_qb, g_v4_ap_kv, g_v4_ap_sattn, g_v4_ap_wo;
+extern double g_v4_ap_comp_c, g_v4_ap_comp_a;
 /* Free LRU primary mirrors until need_mb of VRAM is free (prefill bank). */
 int coli_v4_gpu_expert_mirrors_make_room(ColiExpertStore *store, long long need_mb);
 int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view);

@@ -2247,6 +2247,20 @@ static int decode_bf16(float *output, const void *data, size_t count) {
     return 0;
 }
 
+double g_v4_ap_comp_c, g_v4_ap_comp_a;
+
+/* V4_DECODE_GPU_PROJ (1): decode's compressor and indexer-compressor
+ * projections on the card when their mirrors exist; 0 = the CPU loops. */
+static int v4_decode_gpu_proj_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_DECODE_GPU_PROJ");
+        on = !e || !*e || atoi(e) != 0;
+    }
+    return on;
+}
+double g_v4_ap_qa, g_v4_ap_comp, g_v4_ap_qb, g_v4_ap_kv, g_v4_ap_sattn, g_v4_ap_wo;
+
 static int attention_token_impl(float *output,
                                 ColiDeepSeekV4WindowAttentionState *state,
                                 const ColiDeepSeekV4LayerWeights *weights,
@@ -2301,6 +2315,11 @@ static int attention_token_impl(float *output,
     int result = (!input_act || !input_act_scales ||
                   coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
                                               (size_t)wq_a.columns, 128)) ? -1 : 0;
+    static int aprof = -1;
+    struct timespec ap0, ap1;
+    if (aprof < 0) aprof = getenv("DSV4_DECODE_PROF") != NULL;
+    if (aprof) clock_gettime(CLOCK_MONOTONIC, &ap0);
+#define AP_MARK(acc) do { if (aprof) { clock_gettime(CLOCK_MONOTONIC, &ap1); acc += (ap1.tv_sec - ap0.tv_sec) + (ap1.tv_nsec - ap0.tv_nsec) * 1e-9; ap0 = ap1; } } while (0)
     if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
@@ -2308,17 +2327,39 @@ static int attention_token_impl(float *output,
                     coli_v4_rmsnorm(qa, qa, norm_weight, q_rank,
                                     config->rms_norm_eps))) result = -1;
     if (!result) coli_bf16_round_array(qa, (size_t)q_rank);
+    AP_MARK(g_v4_ap_qa);
     if (!result && state && weights->plan.compression_ratio) {
         result = prepare_compressed_state(state, weights, config,
                                           error, error_size);
         if (!result && (position + 1) % state->ratio == 0)
             result = grow_compressed_state(state, error, error_size);
         int produced = 0;
-        if (!result) result = coli_v4_compressor_step(
-            state->compressor,
-            state->compressed + (size_t)state->compressed_count * head_dim,
-            &produced, input, position, error, error_size);
+        float *emit_row = state->compressed +
+                          (size_t)state->compressed_count * head_dim;
+        int gpu_proj = 0;
+#ifdef COLI_V4_GPU_TIER
+        /* The wkv/wgate projections on the card: the batched prefill kernel
+         * with a batch of one, over the mirrors COLI_CUDA_ATTN_BATCH=1
+         * uploads; the pooling, norm, RoPE and the sliding state stay on the
+         * CPU (coli_v4_compressor_advance). The CPU projection is a scalar
+         * bf16 loop over 8-16 MB per layer: measured 75 ms of a 3.3k-context
+         * token's 129 ms of attention went to it and the indexer's. */
+        float comp_kv[1024], comp_gate[1024];
+        int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
+        if (!result && v4_decode_gpu_proj_on() && comp_rows <= 1024 &&
+            coli_v4_gpu_compressor_project_batch(
+                weights, "attn.compressor.wkv", "attn.compressor.wgate",
+                comp_rows, comp_kv, comp_gate, input, 1) == 0)
+            gpu_proj = 1;
+#endif
+        if (!result) result = gpu_proj
+            ? coli_v4_compressor_advance(state->compressor, emit_row, &produced,
+                                         comp_kv, comp_gate, position,
+                                         error, error_size)
+            : coli_v4_compressor_step(state->compressor, emit_row, &produced,
+                                      input, position, error, error_size);
         if (!result && produced) state->compressed_count++;
+        AP_MARK(g_v4_ap_comp_c);
         if (!result && state->indexer) {
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
@@ -2328,9 +2369,23 @@ static int attention_token_impl(float *output,
                  * batch of one): past index_topk the selection runs the GPU
                  * projection replica + scoring kernel instead of the scalar
                  * per-token loops (~6 ms per indexer layer at 3k context). */
+                const float *idx_kv_p = NULL, *idx_gate_p = NULL;
+#ifdef COLI_V4_GPU_TIER
+                float idx_kv[256], idx_gate[256];
+                int idx_rows = 2 * config->index_head_dim;
+                if (v4_decode_gpu_proj_on() && idx_rows <= 256 &&
+                    coli_v4_gpu_compressor_project_batch(
+                        weights, "attn.indexer.compressor.wkv",
+                        "attn.indexer.compressor.wgate", idx_rows,
+                        idx_kv, idx_gate, input, 1) == 0) {
+                    idx_kv_p = idx_kv;
+                    idx_gate_p = idx_gate;
+                }
+#endif
                 int visible = coli_v4_indexer_advance(
-                    state->indexer, input, position, NULL, NULL,
+                    state->indexer, input, position, idx_kv_p, idx_gate_p,
                     error, error_size);
+                AP_MARK(g_v4_ap_comp_a);
                 if (visible < 0) result = -1;
                 else if (coli_v4_indexer_select_batch(
                              state->indexer, compressed_indices,
@@ -2341,6 +2396,7 @@ static int attention_token_impl(float *output,
             if (compressed_selected < 0) result = -1;
         }
     }
+    AP_MARK(g_v4_ap_comp);
     if (!result) result = coli_fp8_matvec_ref(q, &wq_b, qa);
     if (!result) coli_bf16_round_array(q, (size_t)heads * head_dim);
     for (int head = 0; !result && head < heads; head++) {
@@ -2351,6 +2407,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
+    AP_MARK(g_v4_ap_qb);
     if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
@@ -2389,6 +2446,7 @@ static int attention_token_impl(float *output,
         free(scales); free(qdq);
     }
 
+    AP_MARK(g_v4_ap_kv);
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
     int gpu_attn_done = 0;
 #ifdef COLI_V4_GPU_TIER
@@ -2490,6 +2548,7 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    AP_MARK(g_v4_ap_sattn);
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
@@ -2525,6 +2584,8 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
     if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    AP_MARK(g_v4_ap_wo);
+#undef AP_MARK
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -6498,7 +6559,8 @@ static int block_token_pipeline(float *output_hc,
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
-                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu)\n",
+                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu; "
+                        "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms)\n",
                 position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
                 g_v4_dp_compute * 1e3, g_v4_dp_second * 1e3,
@@ -6510,7 +6572,12 @@ static int block_token_pipeline(float *output_hc,
                 (unsigned long long)g_v4_dp_pair_ok, (unsigned long long)g_v4_dp_pair_fail,
                 (unsigned long long)g_v4_dp_pair_err,
                 g_v4_overlap_total ? 100.0 * g_v4_overlap_hit / g_v4_overlap_total : 0.0,
-                g_v4_pf_enqueued, g_v4_pf_read, g_v4_pf_dropped);
+                g_v4_pf_enqueued, g_v4_pf_read, g_v4_pf_dropped,
+                g_v4_ap_qa * 1e3, (g_v4_ap_comp + g_v4_ap_comp_c + g_v4_ap_comp_a) * 1e3,
+                g_v4_ap_comp_c * 1e3, g_v4_ap_comp_a * 1e3, g_v4_ap_qb * 1e3,
+                g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3);
+        g_v4_ap_qa = g_v4_ap_comp = g_v4_ap_qb = g_v4_ap_kv = g_v4_ap_sattn = g_v4_ap_wo = 0;
+        g_v4_ap_comp_c = g_v4_ap_comp_a = 0;
         dp_hc = dp_attn = dp_moe = 0; dp_layers = 0;
         g_v4_dp_shared = g_v4_dp_loads = g_v4_dp_attach = g_v4_dp_compute = 0;
         g_v4_dp_second = 0;
