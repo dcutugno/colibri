@@ -1038,6 +1038,16 @@ int coli_v4_gpu_indexer_select_fused(
     int hidden, const float *keys, int key_count, const float *x_qdq,
     const float *inputs, const float *cosv, const float *sinv, const int *counts,
     int tokens, int max_count, float *scores, float *queries_out, float *head_w_out);
+/* V4_PREFILL_CHAIN: the batched prefill attention tail on the card (query
+ * projection, norm, RoPE, cached sparse attention, inverse RoPE, wo); 0 on
+ * success with outputs filled (unrounded), -1 when declined */
+int coli_v4_gpu_attention_prefill_chain(
+    const ColiDeepSeekV4LayerWeights *weights, const float *qa, int q_rank,
+    const ColiTensorView *wq_b, float eps, const float *cosines, const float *sines,
+    int rope_dim, const float *kv, int start_position, const float *sinks,
+    const int *meta, const int *sel, int selstride, int first, int comp_total,
+    int heads, int head_dim, int batch, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, float *outputs);
 void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, int layer);
 /* V4_WO_CHAIN: decode's cached sparse attention -> inverse RoPE -> wo_a ->
  * wo_b on the device in one round trip; output[hidden] bf16-rounded. With qa

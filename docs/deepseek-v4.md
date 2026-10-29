@@ -636,6 +636,21 @@ text is unchanged). Measured (3.3k context, `--ram 16`): attention 43 -> 37 ms/t
    would pass 48 KB of shared memory. The batched prefill shares the
    kernel: time to first token 62.4 -> 60.9 s at 3.3k context; decode attention 37 -> 36 ms/token, steady state one card 260 -> 259 ms/token, two cards 244 (unchanged).
 
+Ninth measurement (2026-10-29): `V4_PREFILL_CHAIN` (1): the batched
+prefill attention's tail as one device chain (`dsv4_cuda_attn_prefill_chain`):
+the normalized query ranks go up once; the wq_b GEMM (the batched dense
+path the host's matmul already took), the bf16 round, the per-head rmsnorm
+and the forward RoPE (the decode chain's kernels, batched over the chunk),
+the cached sparse attention, the inverse RoPE and the grouped wo_a + wo_b
+follow on the stream; the outputs come down once. Before, per 128-token
+chunk, the query came down (16 MB), was normed and RoPE'd on the CPU, went
+up again for the attention, and the attended came down for its inverse
+RoPE and went up again for wo: `DSV4_ATTN_PROF` summed over a 3.3k prompt
+gave qb 7.4 s, rope 1.1 s, attn 7.3 s and wo 3.3 s of 48 s of attention.
+A chunk the chain declines (no device attention for it) computes its query
+on the host then and takes the usual paths. Same arithmetic in the same
+order as the host (the kernels the decode chain verified bitwise). Measured (3.3k prompt): time to first token 60.9 -> 53.3 s; the profiled attention 48.4 -> 36.5 s (qb 7.4 -> 0.3, rope 1.1 -> 0.0, wo 3.3 -> 0.2, attn 7.3 -> 6.0); the greedy text unchanged. What remains of the prefill's attention: the indexer's selection (13.3 s), the sparse attention kernel (6.0 s), the compressor (3.7 s) and the qa projection (2.5 s).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -758,6 +773,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
+| `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
 | `DSV4_SATTN_HPB` (4) | heads per block of the shaped sparse attention from 256 rows up (`1` = one head per block, the rows read once per head) |
 | `DSV4_SATTN_V2` (1) | the cached sparse attention kernel shaped for latency (same arithmetic, same order, bitwise); `0` = the old kernel |
 | `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the byte-per-lane kernel, bitwise the reference (slower by ~0.27 ms per layer) |

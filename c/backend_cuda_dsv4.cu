@@ -1683,6 +1683,20 @@ __global__ void attn_inv_rope_kernel(float*att,const float*cosv,const float*sinv
     else{a=__fsub_rn(__fmul_rn(re,c),__fmul_rn(im,sn));b=__fadd_rn(__fmul_rn(re,sn),__fmul_rn(im,c));}
     v[0]=bf16_round_dev(a);v[1]=bf16_round_dev(b);
 }
+/* the per-token RoPE of attn_inv_rope_kernel over a batch: blockIdx.y the
+ * token (its own cos/sin row), blockIdx.x the head */
+__global__ void attn_rope_batch_kernel(float*att,const float*cosv,const float*sinv,int dim,int rope_dim,int fma_mode,int inverse,int heads){
+    int t=blockIdx.y,h=blockIdx.x,i=threadIdx.x,pairs=rope_dim/2;
+    if(i>=pairs)return;
+    float*v=att+((long long)t*heads+h)*dim+dim-rope_dim+2*i;
+    const float*cr=cosv+(long long)t*pairs,*sr=sinv+(long long)t*pairs;
+    float re=v[0],im=v[1],c=cr[i],sn=inverse?-sr[i]:sr[i];
+    float a,b;
+    if(fma_mode==1){a=fmaf(re,c,-__fmul_rn(im,sn));b=fmaf(im,c,__fmul_rn(re,sn));}
+    else if(fma_mode==2){a=fmaf(-im,sn,__fmul_rn(re,c));b=fmaf(re,sn,__fmul_rn(im,c));}
+    else{a=__fsub_rn(__fmul_rn(re,c),__fmul_rn(im,sn));b=__fadd_rn(__fmul_rn(re,sn),__fmul_rn(im,c));}
+    v[0]=bf16_round_dev(a);v[1]=bf16_round_dev(b);
+}
 __global__ void bf16_round_ref_kernel(float*x,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n)x[i]=bf16_round_dev(x[i]);
@@ -1710,6 +1724,76 @@ __global__ void head_rmsnorm_ref_kernel(float*q,int dim,float eps,int fma_on){
  * rows8 order: sum += (x*w)*scale sequentially over all columns (the AVX2
  * resident-layout kernel); block order: fp32 per 128-column block, double
  * across blocks. Both end with the reference's bf16 round of the output. */
+/* V4_PREFILL_CHAIN: the batched prefill attention on the card end to end.
+ * qa [tokens][q_rank] (host, the normalized query ranks) goes up once; the
+ * wq_b GEMM (the batched dense path the host's matmul already takes), the
+ * bf16 round, the per-head rmsnorm and the forward RoPE (the decode chain's
+ * kernels, batched), the cached sparse attention over the chunk's kv rows,
+ * the inverse RoPE and the grouped wo_a + wo_b follow on the stream; out
+ * [tokens][hidden] comes down once (the host rounds it to bf16 as it does
+ * for its own wo). Everything the host did between — the query's two
+ * crossings of the link, its norm and RoPE, the attended's inverse RoPE —
+ * is gone. 0 = refused (the host takes its usual path). */
+extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,int q_rank,Dsv4CudaTensor*wqb,float eps,int norm_fma,
+        const float*icos,const float*isin,int rope_dim,int rope_fma,const float*chunk,int chunk_start,const float*sinks,
+        const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,float scale,int tokens,
+        Dsv4CudaTensor*wa,int groups,Dsv4CudaTensor*wb,float*out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!qa||!wqb||!icos||!isin||!chunk||!sinks||!meta||!out||
+       !wa||!wb||q_rank<1||tokens<1||heads<1||dim<1||rope_dim<2||rope_dim>dim||(rope_dim&1)||!(scale>0.f)||
+       wqb->device!=device||(wqb->fmt!=8&&wqb->fmt!=9)||wqb->I!=q_rank||(long long)wqb->O!=(long long)heads*dim||
+       wa->device!=device||wb->device!=device||groups<1||wa->O%groups||(long long)wa->I*groups!=(long long)heads*dim||wb->I!=wa->O)return 0;
+    if(comp_limit>0&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_limit))return 0;
+    int window=g_kv_ring_rows[layer],max_total=0,pairs=rope_dim/2;
+    for(int t=0;t<tokens;t++){
+        int wn=meta[3*t+1],cn=meta[3*t+2],tt=wn+cn;
+        if(meta[3*t]<0||wn<1||wn>window||cn<0||cn>comp_limit||(sel&&cn>selstride)||(!sel&&cn>0&&cn>comp_limit))return 0;
+        if(abs_base+meta[3*t]+wn>chunk_start+tokens)return 0;
+        if(sel)for(int i=0;i<cn;i++){int o=sel[(long long)t*selstride+i];if(o<0||o>=comp_limit)return 0;}
+        if(tt>max_total)max_total=tt;
+    }
+    size_t qab=(size_t)tokens*q_rank*4,rb=(size_t)tokens*pairs*4,qb=(size_t)tokens*heads*dim*4,cb=(size_t)tokens*dim*4,
+           sb=(size_t)heads*4,mb=(size_t)tokens*3*sizeof(int),ib=sel?(size_t)tokens*selstride*sizeof(int):0,
+           hb=(size_t)tokens*wb->O*4,sm=(size_t)max_total*4;
+    if(sm>96*1024||!ok(cudaSetDevice(device),"select prefill chain device"))return 0;
+    /* p1: qa | cos | sin (consumed before wo_b reuses p1); p2: q; p3: the chunk's kv rows; p4: attended; dx: the output */
+    if(!buf((void**)&c->p1,&c->p1cap,qab+2*rb)||!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p3,&c->p3cap,cb)||
+       !buf((void**)&c->p4,&c->p4cap,qb)||!buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
+       (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->dx,&c->xcap,hb))return 0;
+    float*dqa=c->p1,*dcos=(float*)((char*)c->p1+qab),*dsin=(float*)((char*)c->p1+qab+rb);
+    if(!ok(cudaMemcpyAsync(dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"prefill chain qa upload")||
+       !ok(cudaMemcpyAsync(dcos,icos,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain cos upload")||
+       !ok(cudaMemcpyAsync(dsin,isin,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain sin upload")||
+       !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"prefill chain kv upload")||
+       !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"prefill chain sink upload")||
+       !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"prefill chain meta upload")||
+       (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"prefill chain index upload")))return 0;
+    /* the query projection: the same batched dense path dsv4_cuda_matmul_batch takes */
+#ifdef COLI_DSV4_DEEPGEMM
+    if(!dg_dense_batch_dispatch(c,wqb,dqa,c->p2,tokens))return 0;
+#else
+    run_mm_batch(wqb,dqa,c->p2,tokens,c->stream);if(!ok(cudaGetLastError(),"prefill chain wq_b launch"))return 0;
+#endif
+    long long qn=(long long)tokens*heads*dim;
+    bf16_round_ref_kernel<<<(unsigned)((qn+255)/256),256,0,c->stream>>>(c->p2,(int)qn);
+    head_rmsnorm_ref_kernel<<<(unsigned)(tokens*heads),256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
+    attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p2,dcos,dsin,dim,rope_dim,rope_fma,0,heads);
+    if(!ok(cudaGetLastError(),"prefill chain query launch"))return 0;
+    if(sel){
+        if(sattn_v2_on())launch_sattn_v2<1>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,abs_base,chunk_start,window,heads,dim,scale);
+    }else{
+        if(sattn_v2_on())launch_sattn_v2<0>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,abs_base,chunk_start,window,heads,dim,scale);
+    }
+    if(!ok(cudaGetLastError(),"prefill chain attention launch"))return 0;
+    attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1,heads);
+    if(!ok(cudaGetLastError(),"prefill chain inverse rope launch"))return 0;
+    Dsv4CudaActivation ctxa={c->p4,qn,device},outa={c->dx,(long long)tokens*wb->O,device};
+    if(!dsv4_cuda_attention_output_batch(&ctxa,wa,wb,groups,tokens,&outa))return 0;
+    if(!ok(cudaMemcpyAsync(out,c->dx,hb,cudaMemcpyDeviceToHost,c->stream),"prefill chain output download"))return 0;
+    return ok(cudaStreamSynchronize(c->stream),"prefill chain sync");
+}
 extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,const float*chunk,int chunk_start,
         const float*sinks,const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,
         float scale,const float*icos,const float*isin,int rope_dim,int rope_fma,Dsv4CudaTensor*wa,int groups,
