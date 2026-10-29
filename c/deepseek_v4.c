@@ -13854,6 +13854,56 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * single-threaded (the scheduler admits one request and target_batch's chunk
  * loop is sequential), so plain statics are safe, matching the backend's own
  * per-device scratch buffers. */
+/* V4_RESIDENT: which device activation still holds which host array.
+ * Producers tag after their download; consumers take a device-to-device
+ * copy instead of an upload. Identity = (activation, host pointer, count);
+ * cleared at each block's start and when a producer rewrites its mirror. */
+struct V4GpuActTag { const Dsv4CudaActivation *act; const float *host; long long n; };
+static struct V4GpuActTag v4_gpu_act_tags[4];
+static int v4_resident_mode(void) {
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("V4_RESIDENT"); mode = e && *e ? atoi(e) : 1; }
+    return mode;
+}
+static void v4_gpu_act_tag_set(const Dsv4CudaActivation *act, const float *host, long long n) {
+    int slot = -1;
+    for (int i = 0; i < 4; i++) if (v4_gpu_act_tags[i].act == act) { slot = i; break; }
+    if (slot < 0) for (int i = 0; i < 4; i++) if (!v4_gpu_act_tags[i].act) { slot = i; break; }
+    if (slot < 0) slot = 0;
+    v4_gpu_act_tags[slot] = (struct V4GpuActTag){act, host, n};
+}
+static void v4_gpu_act_tags_clear(void) {
+    for (int i = 0; i < 4; i++) v4_gpu_act_tags[i] = (struct V4GpuActTag){0};
+}
+/* before an activation is rewritten: whatever it held is gone */
+static void v4_gpu_act_tag_drop(const Dsv4CudaActivation *act) {
+    for (int i = 0; i < 4; i++) if (v4_gpu_act_tags[i].act == act) v4_gpu_act_tags[i] = (struct V4GpuActTag){0};
+}
+/* 1 when dst now holds host[0..n) by a device copy (the caller's sync
+ * retires it), 0 when the caller must upload */
+static int v4_gpu_resident_take(Dsv4CudaActivation *dst, const float *host, long long n) {
+    int mode = v4_resident_mode();
+    if (!mode || !dst || !host || n < 1) return 0;
+    for (int i = 0; i < 4; i++) {
+        const struct V4GpuActTag *t = &v4_gpu_act_tags[i];
+        if (t->act && t->act != dst && t->host == host && t->n == n) {
+            if (mode == 2) {
+                float *tmp = malloc((size_t)n * sizeof(*tmp));
+                if (tmp && dsv4_cuda_activation_download(tmp, t->act, n) &&
+                    dsv4_cuda_activation_sync(t->act)) {
+                    long long bad = 0;
+                    for (long long k = 0; k < n; k++) if (tmp[k] != host[k]) bad++;
+                    fprintf(stderr, "resident n=%lld %s\n", n, bad ? "MISMATCH" : "equal");
+                }
+                free(tmp);
+            }
+            v4_gpu_act_tag_drop(dst);   /* dst's old content is gone */
+            return dsv4_cuda_activation_copy(dst, t->act, n) ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
 int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
                                  const float *inputs, int batch) {
     static Dsv4CudaActivation *input_mirror, *output_mirror;
@@ -13882,7 +13932,8 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
         output_capacity = output_mirror ? out_elements : 0;
     }
     if (!input_mirror || !output_mirror) return -1;
-    if (!dsv4_cuda_activation_upload(input_mirror, inputs, in_elements) ||
+    if ((!v4_gpu_resident_take(input_mirror, inputs, in_elements) &&
+         !dsv4_cuda_activation_upload(input_mirror, inputs, in_elements)) ||
         !dsv4_cuda_matmul_batch(tensor, input_mirror, batch, output_mirror) ||
         !dsv4_cuda_activation_download(outputs, output_mirror, out_elements) ||
         !dsv4_cuda_activation_sync(output_mirror))
@@ -15409,7 +15460,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             return -1;
         }
     }
-    if (!dsv4_cuda_activation_upload(in_mirror, inputs, elements)) return -1;
+    if (!v4_gpu_resident_take(in_mirror, inputs, elements) &&
+        !dsv4_cuda_activation_upload(in_mirror, inputs, elements)) return -1;
     if (moeb_prof) clock_gettime(CLOCK_MONOTONIC, &moeb_t0);
     int moeb_missing = 0;
     int topk = config->num_experts_per_tok;
@@ -15741,6 +15793,9 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 MOEB_MS(moeb_t1, moeb_t2), MOEB_MS(moeb_t2, moeb_t3));
     }
 #undef MOEB_MS
+    /* the output stays on the card for the FFN post (it is bf16-rounded on
+     * the device already, so the host's round leaves it equal) */
+    v4_gpu_act_tag_set(out_mirror, outputs, elements);
     /* Counted only once nothing can fail: a refused chunk runs on the CPU
      * path (the union, or per token), whose lookups count it. */
     coli_v4_expert_store_note_union(store, weights->plan.layer, ids,
@@ -16226,7 +16281,7 @@ static void v4_gpu_mhc_tags_clear(void) {
     v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
 }
 /* at a block's start: a tag can only hit within the block that set it */
-void coli_v4_gpu_mhc_tags_reset(void) { v4_gpu_mhc_tags_clear(); }
+void coli_v4_gpu_mhc_tags_reset(void) { v4_gpu_mhc_tags_clear(); v4_gpu_act_tags_clear(); }
 
 int coli_v4_gpu_mhc_pre_norm_batch(
     const ColiDeepSeekV4LayerWeights *weights, const char *branch,
@@ -16253,6 +16308,7 @@ int coli_v4_gpu_mhc_pre_norm_batch(
     Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
     Dsv4CudaActivation *input = v4_gpu_mhc_mirror(2, device, xh);
     float *state_host = malloc((size_t)sh * sizeof(*state_host));
+    v4_gpu_act_tag_drop(input);
     int good = residual && state && input && state_host &&
         dsv4_cuda_activation_upload(residual, inputs_hc, rh) &&
         dsv4_cuda_mhc_pre_norm_batch(residual, fn, scale, base, norm,
@@ -16266,6 +16322,7 @@ int coli_v4_gpu_mhc_pre_norm_batch(
                (size_t)batch * hc * hc * sizeof(*combs));
         v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){residual, inputs_hc, rh};
         v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){state, posts, sh};
+        v4_gpu_act_tag_set(input, normalized, xh);
     } else {
         v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){0};
         v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
@@ -16302,6 +16359,7 @@ int coli_v4_gpu_mhc_post_batch(
     int state_resident =
         v4_gpu_mhc_tag_hit(&v4_gpu_mhc_state_tag, state, posts, sh);
     float *state_host = NULL;
+    v4_gpu_act_tag_drop(x);
     if (!state_resident) {
         state_host = malloc((size_t)sh * sizeof(*state_host));
         if (!state_host) return -1;
@@ -16314,7 +16372,8 @@ int coli_v4_gpu_mhc_post_batch(
          dsv4_cuda_activation_upload(residual, residual_hc, rh)) &&
         (state_resident ||
          dsv4_cuda_activation_upload(state, state_host, sh)) &&
-        dsv4_cuda_activation_upload(x, branch, xh) &&
+        (v4_gpu_resident_take(x, branch, xh) ||
+         dsv4_cuda_activation_upload(x, branch, xh)) &&
         dsv4_cuda_mhc_post_batch(x, residual, state, batch, hidden, out) &&
         dsv4_cuda_activation_download(outputs_hc, out, rh) &&
         dsv4_cuda_activation_sync(out);
@@ -16369,6 +16428,7 @@ int coli_v4_gpu_mhc_post_pre_norm_batch(
                (size_t)batch * hc * hc * sizeof(*combs));
     }
     v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
+    v4_gpu_act_tag_drop(x);
     int good =
         (res_resident || dsv4_cuda_activation_upload(residual, residual_hc, rh)) &&
         (state_resident || dsv4_cuda_activation_upload(state, state_host, sh)) &&
@@ -16386,6 +16446,7 @@ int coli_v4_gpu_mhc_post_pre_norm_batch(
         v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){out, states, rh};
         v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){out, states, rh};
         v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){state, ffn_post, sh};
+        v4_gpu_act_tag_set(x, ffn_normalized, xh);
     } else {
         v4_gpu_mhc_tags_clear();
     }

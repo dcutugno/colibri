@@ -794,6 +794,19 @@ bitwise), yet the unprofiled time to first token was 0.4 s worse over two
 A/B pairs (40.9 / 40.8 s fused, 40.4 / 40.5 s two-call). Dropped; the
 device grouping goes with it (it only served the fused path).
 
+Nineteenth measurement (2026-10-29): a chunk's intermediate activations
+taken on the card where the producer's device copy still holds them.
+`V4_RESIDENT` (1): a small tag table (device activation, host array,
+count) that the producers set after their download and the consumers
+read to copy device to device instead of uploading: the normalized
+attention input (the mHC pre's output) for the qa and kv projections,
+the normalized FFN input (the fused hc2's output) for the MoE, the MoE's
+output (bf16-rounded on the device already, so the host's round leaves
+it equal) for the FFN post. The tags are cleared at each block's start
+and dropped whenever a mirror is about to be rewritten. `2` = verify:
+the device copy against the host array before each take (`resident`
+lines). Same bytes: bitwise. Measured (3.3k prompt, 36 tokens, two A/B pairs): time to first token 40.6 / 40.5 -> 39.8 / 39.7 s; the verify over the whole prompt (4472 takes) reports no mismatch; the greedy text unchanged.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -918,6 +931,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
 | `V4_COMP_BATCH` (1) | a prefill chunk's compressor advances (the attention's and the indexer's) in one parallel pass from the batched projections, the serial emit's arithmetic per column (bitwise); `2` = verify against the per-token walk; `0` = the walk |
+| `V4_RESIDENT` (1) | a chunk's intermediate activations copied device to device from the producer's mirror instead of uploaded (the normalized inputs for qa/kv and the MoE, the MoE output for the FFN post); `2` = verify against the host arrays; `0` = uploads |
 | `V4_BLOCK_SCRATCH` (1) | the prefill block's ten per-call arrays from one persistent page-locked scratch (their copies at link speed, no per-chunk mallocs); `0` = a malloc'd scratch |
 | `V4_MOE_BATCH_PROF` (0) | one `moebprof` line per chunk-layer: the batched MoE's switch / route / refill / compute (its own prints inflate the stage) |
 | `V4_HC_PIN` (1) | the prefill page-locks the prompt's range of its state buffers for its duration (the block's 8 MB copies at link speed); `V4_HC_PIN_MIN` (256) the prompt length from which; `0` = pageable copies |
