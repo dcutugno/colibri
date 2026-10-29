@@ -3864,6 +3864,7 @@ struct ColiDeepSeekV4CompressorState {
     char prefix[96];
     float *kv_state;
     float *score_state;
+    int ape_slot;         /* the plan's slot of "<prefix>.ape", -1 until resolved */
 };
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -3881,6 +3882,21 @@ static const void *layer_value(const ColiDeepSeekV4LayerWeights *weights,
     char name[COLI_V4_MAX_TENSOR_NAME];
     snprintf(name, sizeof(name), "layers.%d.%s", weights->plan.layer, suffix);
     return coli_v4_layer_data(weights, name, NULL);
+}
+
+/* The per-token tensor of the advance through its cached slot: the
+ * plan's table is per layer and fixed, the data pointer is read through
+ * it on every call. */
+static const float *compressor_ape(ColiDeepSeekV4CompressorState *state) {
+    const ColiDeepSeekV4LayerWeights *w = state->weights;
+    if (state->ape_slot < 0) {
+        char name[COLI_V4_MAX_TENSOR_NAME];
+        snprintf(name, sizeof(name), "layers.%d.%s.ape", w->plan.layer, state->prefix);
+        for (size_t i = 0; i < w->plan.tensor_count; i++)
+            if (strcmp(w->plan.tensors[i].name, name) == 0) { state->ape_slot = (int)i; break; }
+        if (state->ape_slot < 0) return NULL;
+    }
+    return (const float *)w->data[state->ape_slot];
 }
 
 int coli_v4_compressor_create(ColiDeepSeekV4CompressorState **output,
@@ -3910,6 +3926,7 @@ int coli_v4_compressor_create_with_options(
     ColiDeepSeekV4CompressorState *state = calloc(1, sizeof(*state));
     if (!state) return set_error(error, error_size, "out of memory creating compressor");
     state->weights = weights;
+    state->ape_slot = -1;
     state->config = config;
     state->ratio = weights->plan.compression_ratio;
     state->layer = weights->plan.layer;
@@ -3941,6 +3958,7 @@ int coli_v4_compressor_bind_weights(ColiDeepSeekV4CompressorState *state,
         weights->plan.compression_ratio != state->ratio)
         return set_error(error, error_size, "incompatible compressor weights");
     state->weights = weights;
+    state->ape_slot = -1;
     return 0;
 }
 
@@ -4050,9 +4068,7 @@ int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
     int slot = position % state->ratio;
     int projection = state->projection_dim;
     int state_row = state->ratio == 4 ? state->ratio + slot : slot;
-    char suffix[128];
-    snprintf(suffix, sizeof(suffix), "%s.ape", state->prefix);
-    const float *ape = layer_value(state->weights, suffix);
+    const float *ape = compressor_ape(state);
     if (!ape)
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
@@ -4075,7 +4091,16 @@ static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
     if ((position + 1) % state->ratio != 0) return 0;
     if (!output) return set_error(error, error_size, "compressor output is required");
 
-    #pragma omp parallel for
+    /* V4_COMP_EMIT_PAR: the column loop forks an OpenMP region only from
+     * this many columns up (the indexer's 128 and the attention's 512
+     * columns are a few microseconds of work; the fork costs more). Each
+     * column is its own sequential computation: bitwise either way. */
+    static int emit_par = -1;
+    if (emit_par < 0) {
+        const char *env = getenv("V4_COMP_EMIT_PAR");
+        emit_par = env && *env ? atoi(env) : 100000;
+    }
+    #pragma omp parallel for if (dimension >= emit_par)
     for (int column = 0; column < dimension; column++) {
         float maximum = -INFINITY;
         int pool_rows = state->ratio == 4 ? 2 * state->ratio : state->ratio;
@@ -4539,7 +4564,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
-    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    size_t sz_ranked = ALIGN32((size_t)need * max_count * sizeof(IndexScore));
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -4607,14 +4632,18 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         uint8_t *xs = (uint8_t *)scratch_ptr; scratch_ptr += sz_xs;
         int qok = xq && yq && xs;
         if (qok) {
-            int i = 0;
-            for (int t = 0; t < batch; t++) {
-                if (selected[t] >= 0) continue;
+            int qfail = 0;
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int i = 0; i < need; i++) {
+                int t = stoken[i];
                 if (coli_fp8_activation_qdq_ref(
                         xq + (size_t)i * cols, xs + (size_t)i * (cols / 128),
-                        query_ranks + (size_t)t * cols, cols, 128)) { qok = 0; break; }
-                i++;
+                        query_ranks + (size_t)t * cols, cols, 128)) {
+                    #pragma omp atomic write
+                    qfail = 1;
+                }
             }
+            if (qfail) qok = 0;
         }
         /* V4_IDX_FUSED: projection, prep, head weights and scoring in one
          * device round trip over the resident weights and keys. Any refusal
@@ -4629,7 +4658,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 fhw = (float *)scratch_ptr; scratch_ptr += sz_fhw;
             }
             int rok = 1;
-            for (int i = 0; rok && i < need; i++) {
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int i = 0; i < need; i++) {
                 int t = stoken[i];
                 memcpy(xin + (size_t)i * hidden, inputs + (size_t)t * hidden,
                        (size_t)hidden * sizeof(*xin));
@@ -4638,7 +4668,10 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                         config->qk_rope_head_dim, start_position + t,
                         config->original_max_position_embeddings,
                         config->compress_rope_theta, config->rope_factor,
-                        config->rope_beta_fast, config->rope_beta_slow)) rok = 0;
+                        config->rope_beta_fast, config->rope_beta_slow)) {
+                    #pragma omp atomic write
+                    rok = 0;
+                }
             }
             if (rok && coli_v4_gpu_indexer_select_fused(
                            state->weights, state->layer,
@@ -4822,18 +4855,25 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 bq, wq_, bh, wh, bs, ws);
     }
 #endif
-    for (int i = 0; !result && i < need; i++) {
-        int t = stoken[i];
-        const float *row = scores + (size_t)i * max_count;
-        for (int candidate = 0; candidate < scounts[i]; candidate++)
-            ranked[candidate] = (IndexScore){row[candidate], candidate};
-        qsort(ranked, (size_t)scounts[i], sizeof(*ranked), descending_score);
-        int n = scounts[i];
-        if (n > topk) n = topk;
-        if (n > index_capacity) n = index_capacity;
-        int *out = indices + (size_t)t * index_capacity;
-        for (int k = 0; k < n; k++) out[k] = ranked[k].index;
-        selected[t] = n;
+    /* The per-token sorts are independent (descending_score is a total
+     * order: score, then index), so they run across tokens, each in its
+     * own ranked row: the same output as the serial loop. */
+    if (!result) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < need; i++) {
+            int t = stoken[i];
+            const float *row = scores + (size_t)i * max_count;
+            IndexScore *rk = ranked + (size_t)i * max_count;
+            for (int candidate = 0; candidate < scounts[i]; candidate++)
+                rk[candidate] = (IndexScore){row[candidate], candidate};
+            qsort(rk, (size_t)scounts[i], sizeof(*rk), descending_score);
+            int n = scounts[i];
+            if (n > topk) n = topk;
+            if (n > index_capacity) n = index_capacity;
+            int *out = indices + (size_t)t * index_capacity;
+            for (int k = 0; k < n; k++) out[k] = rk[k].index;
+            selected[t] = n;
+        }
     }
     IDX_PROF_MARK(t_sort);
     if (prof)

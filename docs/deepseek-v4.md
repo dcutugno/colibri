@@ -651,6 +651,24 @@ A chunk the chain declines (no device attention for it) computes its query
 on the host then and takes the usual paths. Same arithmetic in the same
 order as the host (the kernels the decode chain verified bitwise). Measured (3.3k prompt): time to first token 60.9 -> 53.3 s; the profiled attention 48.4 -> 36.5 s (qb 7.4 -> 0.3, rope 1.1 -> 0.0, wo 3.3 -> 0.2, attn 7.3 -> 6.0); the greedy text unchanged. What remains of the prefill's attention: the indexer's selection (13.3 s), the sparse attention kernel (6.0 s), the compressor (3.7 s) and the qa projection (2.5 s).
 
+Tenth measurement (2026-10-29): the prefill indexer's 13.8 s (3.3k prompt,
+`DSV4_ATTN_PROF` + `DSV4_IDX_KPROF`) split as the projection replica 4.9 s,
+the scoring kernel 1.2 s, the host staging of the fused call 1.5 s, the
+per-token qsort 1.6 s and the per-token advance 4.3 s. Four fixes, each
+bitwise: `DSV4_IDX_COAL` (1), the two kernels read coalesced (each thread
+walked its own 4 KB activation row or 512 B key row, so a warp's load split
+into 32 cache wavefronts: a transposed copy of the activations, made on the
+device per call, and of the resident keys, refreshed on append, puts the
+warp's 32 loads in one line; each thread's mul/add sequence is unchanged);
+the per-token sorts run across tokens (the comparator is a total order);
+`V4_COMP_EMIT_PAR` (100000): the compressor's pool-and-emit no longer forks
+an OpenMP region per emitted row (128 or 512 columns of a few microseconds;
+the fork cost more; the value is the column count from which it still
+forks); the compressor's advance looked its `.ape` tensor up by name on
+every token (a strcmp scan over the layer's tensor table): the slot is
+cached in the state. The fused call's staging (fp8 qdq of the query ranks,
+the input gather, the RoPE tables) runs across tokens as well. Measured (3.3k prompt, 36 tokens): time to first token 53.3 -> 47.4 s; the profiled indexer 13.8 -> 6.4 s (projection kernel 4.9 -> 1.2, scoring 1.2 -> 0.3, sort 1.6 -> 0.1, the compressor's comp 3.8 -> 3.1); the greedy text unchanged. What remains of the indexer: the fused call's host staging and syncs (~1.6 s), the per-token advance (~3 s, the compressor's own state copies and emits), the kernels (1.5 s).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -797,6 +815,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DECODE_GPU_PROJ` (1) | decode: the compressor's and the indexer-compressor's wkv/wgate projections on the card (the prefill kernel with a batch of one; needs the `COLI_CUDA_ATTN_BATCH=1` mirrors); `0` = the CPU loops. 3.3k context: attention 127 -> 111 ms/token. On an indexer layer the four projections share one round trip (`dsv4_cuda_matmul_bf16_multi`: indexer-advance 4 -> 2 ms/token) |
 | `V4_IDX_FUSED` (1) | the indexer selection as one device round trip (decode and prefill chunks): the layer's `wq_b` bytes + f32 block scales in the CPU reference layout and its bf16 head-weight rows resident on the card (uploaded with the attention mirrors, 8 MB per indexer layer), the compressed keys appended as the host produces them, and projection -> query prep (bf16 round, RoPE, hadamard, fp4 round trip) -> head weights -> scoring in four launches; the sort stays on the host. Bitwise the CPU path: `DSV4_IDX_VERIFY=1` compares the prepared queries, head weights and scores (651 of 651 selections identical on the reference box, prefill chunks and decode tokens). 3.3k context: attention 111 -> 72 ms/token, decode 19.40 -> 18.20 s / 36 tokens, text unchanged. `0` = the projection replica + scoring kernel with their per-call uploads (8 MB of weights per indexer layer per token) |
 | `DSV4_IDX_ROPE_FMA` (1), `DSV4_IDX_HW_FMA` (1) | which products the fused prep fuses, matching the GCC build of the reference (read off the binary: the RoPE's cosine products — `vfmaddsub` — and the head-weight accumulate are FMAs, nothing else). For a build with another contraction pattern (`DSV4_IDX_VERIFY` would report mismatches): `0` = none fused, ROPE `2` = the sine products instead |
+| `DSV4_IDX_COAL` (1, `.cu`) | the fused indexer's projection replica and scoring kernel over transposed copies of the activations and the resident keys (coalesced loads, the same per-thread arithmetic); `0` = the row-major kernels. 3.3k prefill: projection 4.9 -> 1.2 s, scoring 1.2 -> 0.3 s |
+| `V4_COMP_EMIT_PAR` (100000) | the column count from which the compressor's pool-and-emit forks an OpenMP region; below it the loop runs serially (the indexer's 128 and the attention's 512 columns: ~1.5 s less per 3.3k prefill, bitwise) |
 | `DSV4_IDX_KPROF` (0, `.cu`) | per-call device time of the fused selection's stages (`idxkprof`); 0.16 + 0.01 + 0.10 + 0.09 + 0.02 ms per indexer layer at one token / 820 candidates |
 | `V4_WO_CHAIN` (1) | decode: the attention from the query rank to the hidden vector in one device round trip — `wq_b` matvec, bf16 round, per-head rmsnorm, forward RoPE (the query never crosses), the cached sparse attention, inverse RoPE + bf16 round, the grouped `wo_a` and `wo_b` matvecs through the mirrors' own mv kernels (what the separate calls run: `coli_fp8_matvec_ref` dispatches to the mirror when one exists), one download of the bf16-rounded output. Four syncs per layer become one; arithmetic unchanged, `DSV4_WO_VERIFY=1` compares q, attended, `oa` and output bitwise (215 of 215 layer-tokens identical on the reference box). 3.3k context: attention 70 -> 56 ms/token, decode 17.9 -> 17.4 s / 36 tokens, text unchanged. `0` = the separate calls as before |
 | `DSV4_WO_ROPE_FMA` (1), `DSV4_Q_NORM_FMA` (1) | the chain's fused products: the RoPE's cosine products (as `DSV4_IDX_ROPE_FMA`) and the query rmsnorm's mean-square accumulate, matching the GCC build of the reference |
