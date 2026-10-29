@@ -779,7 +779,12 @@ builds its expert layout slowly); time to first token 40.6 -> 52.2 s. Also tried
 bf16 projection GEMM (`mm_bf16_batch`) with four output rows per block
 sharing the activation loads (bitwise): the projection stage 1.55 ->
 1.61 s, no gain; that stage is its upload, four downloads and sync, not
-the kernel.
+the kernel. And the fused indexer call's inputs built by the
+engine directly in the DLL's pinned staging block (its 3 MB of copies per
+chunk-layer skipped, bitwise): the call's host time 2.84 -> 2.71 s per
+3.3k prefill, within the unprofiled noise; dropped as not worth its
+export. The fused call's host side is its quantization, gather and RoPE
+tables (already across threads), the upload and the sync.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
