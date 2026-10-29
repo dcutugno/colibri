@@ -700,7 +700,15 @@ down after the attention post only to send them up again for the FFN pre.
 calls: the post writes a mirror, the FFN pre + norm read it there, and the
 states stay on the card (tagged) for the FFN post; a CPU fallback of that
 post fetches them first (`coli_v4_gpu_mhc_states_fetch`). The same device
-calls in the same order: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 46.3 -> 44.2 s; hc2 4.7 -> 1.3 s (hc1 2.0 and hc3 1.8 s unchanged: the state's upload at the block's start and its download at the end); decode unchanged; the greedy text unchanged. What remains of the three steps is one 8 MB upload and one 8 MB download of the four-stream state per chunk-layer, pageable.
+calls in the same order: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 46.3 -> 44.2 s; hc2 4.7 -> 1.3 s (hc1 2.0 and hc3 1.8 s unchanged: the state's upload at the block's start and its download at the end); decode unchanged; the greedy text unchanged. What remains of the three steps is one 8 MB upload and one 8 MB download of the four-stream state per chunk-layer, pageable. Tried and dropped: those two
+copies through a page-locked scratch (the engine's parallel memcpy in, then
+the DMA) were slower (hc1 2.2 -> 2.6 s, hc3 1.7 -> 2.1 s): the driver's
+pageable staging overlaps its copy with the DMA, the scratch serializes
+them. Page-locking the session's own state buffers was ruled out: the pin
+registry takes a whole allocation region of a lifetime the DLL cannot see.
+Keeping a chunk's state on the card across layers would need the whole
+prompt's state resident (the prefill is layer-major: every chunk of a
+layer before the next layer; ~430 MB at 3.3k): not done.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
