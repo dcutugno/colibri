@@ -710,6 +710,20 @@ Keeping a chunk's state on the card across layers would need the whole
 prompt's state resident (the prefill is layer-major: every chunk of a
 layer before the next layer; ~430 MB at 3.3k): not done.
 
+Thirteenth measurement (2026-10-29): the two compressors' per-token walk
+(the attention's, 512 columns, and the indexer's, 128: `comp` 3.1 s and
+most of the indexer's advance, ~3 s, over a 3.3k prompt) was the pooling:
+every fourth token an emit of 8 rows x columns of expf, serial, 32 times
+per chunk. `V4_COMP_BATCH` (1): a chunk's advances at once. Every emit's
+eight rows (the previous group's four tokens through the first half of
+their projection row, the group's four through the second half) are known
+before the chunk starts, from the chunk's batched projections and the four
+rows carried in the state, so all the chunk's emits run in one parallel
+pass over (emit, column) with the serial emit's expression order per
+column, and the state rows are then set as the walk leaves them. `2` =
+verify: the walk stays the real path and the batched emits and the final
+state are compared against it (`compbatch` lines). Measured (3.3k prompt, 36 tokens): time to first token 44.2 -> 42.8 s; the indexer stage 6.8 -> 5.4 s, the compressor stage 3.3 -> 3.0 s (the batched passes of both compressors are charged to it now); the verify over the whole prompt (546 chunk-layers) reports no mismatch; decode unchanged; the greedy text unchanged.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -833,6 +847,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
+| `V4_COMP_BATCH` (1) | a prefill chunk's compressor advances (the attention's and the indexer's) in one parallel pass from the batched projections, the serial emit's arithmetic per column (bitwise); `2` = verify against the per-token walk; `0` = the walk |
 | `V4_HC_FUSED` (1) | the prefill block's attention post + FFN pre/norm as one device pass, the states resident for the FFN post (16 MB per chunk-layer not copied); `0` = the two-step path with the states round trip |
 | `DSV4_SATTN_HPB_PF` (16) | heads per block for the multi-token (prefill chunk) launches of the cached sparse attention: 16, 8 or 4 (else the one-token rule); the key rows are shared across the heads of a token, the per-head arithmetic is unchanged (bitwise) |
 | `DSV4_PIN_STAGE` (1, `.cu`) | the prefill chain's inputs as one copy from a page-locked staging block and its output download into it; `0` = seven pageable copies and a pageable download |

@@ -3229,7 +3229,7 @@ static double v4_attn_prof_now(void) {
  * cached arena per slot amortizes them to zero; explicit memset keeps the old
  * calloc semantics where the algorithm may read before writing. */
 static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
-    enum { V4_ATTN_SCRATCH_SLOTS = 24 };
+    enum { V4_ATTN_SCRATCH_SLOTS = 26 };
     static void *arena[V4_ATTN_SCRATCH_SLOTS];
     static size_t capacity[V4_ATTN_SCRATCH_SLOTS];
     if (slot < 0 || slot >= V4_ATTN_SCRATCH_SLOTS || !bytes) return NULL;
@@ -3429,6 +3429,46 @@ int coli_v4_attention_window_batch_ref(
         const char *env = getenv("V4_IDX_BATCH");
         idx_batch = !(env && *env == '0');
     }
+    /* V4_COMP_BATCH (1): the chunk's compressor advances at once (the
+     * attention's and the indexer's), from the batched projections; the
+     * per-item loop below then only commits each emit. 2 = verify against
+     * the per-token walk (which stays the real path). */
+    static int comp_batch = -1;
+    if (comp_batch < 0) {
+        const char *env = getenv("V4_COMP_BATCH");
+        comp_batch = env && *env ? atoi(env) : 1;
+    }
+    float *comp_emits = NULL;
+    int *idx_counts = NULL;
+    int comp_e = 0, comp_nemit = -1;
+    ColiDeepSeekV4CompressorState *comp_check = NULL;
+    if (!result && weights->plan.compression_ratio && comp_kv_proj && comp_batch) {
+        result = prepare_compressed_state(state, weights, config, error, error_size);
+        if (!result && state->compressor) {
+            int cap = batch / 4 + 2;
+            comp_emits = v4_attn_scratch(24, (size_t)cap * head_dim * sizeof(*comp_emits), 0);
+            if (comp_batch == 2) {
+                comp_check = coli_v4_compressor_clone(state->compressor);
+                if (comp_emits && comp_check)
+                    comp_nemit = coli_v4_compressor_advance_batch(
+                        comp_check, comp_emits, cap, comp_kv_proj, comp_gate_proj,
+                        comp_rows, start_position, batch);
+            } else if (comp_emits) {
+                comp_nemit = coli_v4_compressor_advance_batch(
+                    state->compressor, comp_emits, cap, comp_kv_proj, comp_gate_proj,
+                    comp_rows, start_position, batch);
+            }
+            if (comp_nemit < 0) comp_emits = NULL;
+            if (comp_batch == 2) comp_emits = NULL;   /* verify: the walk commits */
+            if (!result && state->indexer && idx_batch && idx_kv_proj && comp_batch == 1) {
+                idx_counts = v4_attn_scratch(25, (size_t)batch * sizeof(*idx_counts), 0);
+                if (!idx_counts || coli_v4_indexer_advance_batch(
+                        state->indexer, idx_kv_proj, idx_gate_proj, idx_rows,
+                        start_position, batch, idx_counts, error, error_size))
+                    idx_counts = NULL;
+            }
+        }
+    }
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         if (weights->plan.compression_ratio) {
@@ -3437,7 +3477,15 @@ int coli_v4_attention_window_batch_ref(
             if (!result && (position + 1) % state->ratio == 0)
                 result = grow_compressed_state(state, error, error_size);
             int produced = 0;
-            if (!result) result = comp_kv_proj
+            if (!result && comp_emits) {
+                if ((position + 1) % state->ratio == 0) {
+                    memcpy(state->compressed + (size_t)state->compressed_count * head_dim,
+                           comp_emits + (size_t)comp_e * head_dim,
+                           (size_t)head_dim * sizeof(*comp_emits));
+                    comp_e++;
+                    produced = 1;
+                }
+            } else if (!result) result = comp_kv_proj
                 ? coli_v4_compressor_advance(
                     state->compressor,
                     state->compressed + (size_t)state->compressed_count * head_dim,
@@ -3449,10 +3497,32 @@ int coli_v4_attention_window_batch_ref(
                     state->compressed + (size_t)state->compressed_count * head_dim,
                     &produced, inputs + (size_t)item * hidden, position,
                     error, error_size);
+            if (!result && produced && comp_check && comp_nemit >= 0) {
+                /* verify: this emit against the batched one */
+                const float *got = v4_attn_scratch(24, 1, 0);
+                got += (size_t)comp_e * head_dim;
+                {
+                    const float *ref = state->compressed + (size_t)state->compressed_count * head_dim;
+                    int bad = 0, first = -1; double worst = 0.0;
+                    for (int c = 0; c < head_dim; c++) if (got[c] != ref[c]) {
+                        double d = fabs((double)got[c] - ref[c]);
+                        if (d > worst) worst = d;
+                        if (first < 0) first = c;
+                        bad++;
+                    }
+                    if (bad)
+                        fprintf(stderr, "compbatch layer=%d start=%d emit=%d MISMATCH cols=%d first=%d got=%.9g ref=%.9g worst=%g\n",
+                                weights->plan.layer, start_position, comp_e, bad, first,
+                                got[first], ref[first], worst);
+                }
+                comp_e++;
+            }
             if (!result && produced) state->compressed_count++;
             compressed_counts[item] = state->compressed_count;
             V4_ATTN_PROF_MARK(prof_comp);
-            if (!result && state->indexer && idx_batch) {
+            if (!result && idx_counts) {
+                selected_counts[item] = idx_counts[item];
+            } else if (!result && state->indexer && idx_batch) {
                 /* Advance only; selection happens once for the whole chunk
                  * below (batched wq_b projection + scoring kernel). Until
                  * then selected_counts holds the visible candidate count. */
@@ -3485,6 +3555,13 @@ int coli_v4_attention_window_batch_ref(
             }
             V4_ATTN_PROF_MARK(prof_idx);
         }
+    }
+    if (comp_check) {
+        if (comp_nemit >= 0)
+            fprintf(stderr, "compbatch layer=%d start=%d emits=%d walk_emits=%d state_%s\n",
+                    weights->plan.layer, start_position, comp_nemit, comp_e,
+                    coli_v4_compressor_state_equal(comp_check, state->compressor) ? "equal" : "MISMATCH");
+        coli_v4_compressor_destroy(comp_check);
     }
     if (!result && weights->plan.compression_ratio && state->indexer &&
         idx_batch) {
@@ -3875,6 +3952,9 @@ struct ColiDeepSeekV4CompressorState {
     float *kv_state;
     float *score_state;
     int ape_slot;         /* the plan's slot of "<prefix>.ape", -1 until resolved */
+    int norm_slot;        /* the plan's slot of "<prefix>.norm.weight", -1 until resolved */
+    float *norm_dec;      /* the norm weights decoded (head_dim floats), from norm_src */
+    const void *norm_src;
 };
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -3909,6 +3989,88 @@ static const float *compressor_ape(ColiDeepSeekV4CompressorState *state) {
     return (const float *)w->data[state->ape_slot];
 }
 
+/* The compressor's norm weights decoded once (re-decoded when the layer's
+ * data pointer changes), through the cached slot like the ape. */
+static const float *compressor_norm(ColiDeepSeekV4CompressorState *state) {
+    const ColiDeepSeekV4LayerWeights *w = state->weights;
+    int dimension = state->head_dim;
+    if (state->norm_slot < 0) {
+        char name[COLI_V4_MAX_TENSOR_NAME];
+        snprintf(name, sizeof(name), "layers.%d.%s.norm.weight", w->plan.layer, state->prefix);
+        for (size_t i = 0; i < w->plan.tensor_count; i++)
+            if (strcmp(w->plan.tensors[i].name, name) == 0) { state->norm_slot = (int)i; break; }
+        if (state->norm_slot < 0) return NULL;
+    }
+    const uint16_t *raw = (const uint16_t *)w->data[state->norm_slot];
+    if (!raw) return NULL;
+    if (!state->norm_dec) {
+        state->norm_dec = malloc((size_t)dimension * sizeof(*state->norm_dec));
+        if (!state->norm_dec) return NULL;
+        state->norm_src = NULL;
+    }
+    if (state->norm_src != raw) {
+        for (int i = 0; i < dimension; i++) state->norm_dec[i] = coli_bf16_decode(raw[i]);
+        state->norm_src = raw;
+    }
+    return state->norm_dec;
+}
+
+/* An emit's tail after the pooling: bf16 round, the norm, bf16 round, RoPE
+ * at the group's first position, the activation quantization (fp4 after a
+ * hadamard, or fp8), bf16 round. Shared by the per-token walk and the
+ * batched advance. */
+static int compressor_finish(const ColiDeepSeekV4CompressorState *state,
+                             float *output, int position, const float *norm,
+                             char *error, size_t error_size) {
+    int dimension = state->head_dim;
+    coli_bf16_round_array(output, (size_t)dimension);
+    coli_v4_rmsnorm(output, output, norm, dimension, state->config->rms_norm_eps);
+    coli_bf16_round_array(output, (size_t)dimension);
+
+    int rope_position = position + 1 - state->ratio;
+    int pairs = state->rope_dim / 2;
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, state->rope_dim, rope_position,
+            state->config->original_max_position_embeddings,
+            state->config->compress_rope_theta, state->config->rope_factor,
+            state->config->rope_beta_fast, state->config->rope_beta_slow)) {
+        free(sines); free(cosines);
+        return set_error(error, error_size, "cannot create compressor RoPE table");
+    }
+    float *rope = output + dimension - state->rope_dim;
+    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
+    coli_bf16_round_array(rope, (size_t)state->rope_dim);
+    free(sines); free(cosines);
+
+    size_t quantized = state->rotate_fp4
+        ? (size_t)dimension : (size_t)(dimension - state->rope_dim);
+    size_t block = state->rotate_fp4 ? 32u : 64u;
+    float *qdq = malloc(quantized * sizeof(*qdq));
+    uint8_t *scales = malloc((quantized + block - 1) / block);
+    if (!qdq || !scales) {
+        free(scales); free(qdq);
+        return set_error(error, error_size, "compressor activation quantization failed");
+    }
+    int quant_error = 0;
+    if (state->rotate_fp4)
+        quant_error = coli_hadamard_bf16_ref(output, (size_t)dimension) ||
+                      coli_fp4_activation_qdq_ref(qdq, scales, output,
+                                                  quantized, block);
+    else
+        quant_error = coli_fp8_activation_qdq_ref(qdq, scales, output,
+                                                  quantized, block);
+    if (quant_error) {
+        free(scales); free(qdq);
+        return set_error(error, error_size, "compressor activation quantization failed");
+    }
+    memcpy(output, qdq, quantized * sizeof(*output));
+    coli_bf16_round_array(output, quantized);
+    free(scales); free(qdq);
+    return 0;
+}
+
 int coli_v4_compressor_create(ColiDeepSeekV4CompressorState **output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -3937,6 +4099,7 @@ int coli_v4_compressor_create_with_options(
     if (!state) return set_error(error, error_size, "out of memory creating compressor");
     state->weights = weights;
     state->ape_slot = -1;
+    state->norm_slot = -1;
     state->config = config;
     state->ratio = weights->plan.compression_ratio;
     state->layer = weights->plan.layer;
@@ -3969,6 +4132,8 @@ int coli_v4_compressor_bind_weights(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "incompatible compressor weights");
     state->weights = weights;
     state->ape_slot = -1;
+    state->norm_slot = -1;
+    state->norm_src = NULL;
     return 0;
 }
 
@@ -3981,6 +4146,7 @@ void coli_v4_compressor_reset(ColiDeepSeekV4CompressorState *state) {
 
 void coli_v4_compressor_destroy(ColiDeepSeekV4CompressorState *state) {
     if (!state) return;
+    free(state->norm_dec);
     free(state->score_state);
     free(state->kv_state);
     free(state);
@@ -4091,6 +4257,132 @@ int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
                                     error, error_size);
 }
 
+/* V4_COMP_BATCH: a chunk's advances at once (ratio 4 only). Returns the
+ * number of emits written to emitted (each head_dim floats, in order), the
+ * state rows updated as the per-token walk would leave them; -1 (state
+ * untouched) when the shape is not handled. Per column the expression
+ * order is the serial emit's. */
+int coli_v4_compressor_advance_batch(ColiDeepSeekV4CompressorState *state,
+                                     float *emitted, int emit_capacity,
+                                     const float *kv_proj,
+                                     const float *gate_proj, int proj_stride,
+                                     int start_position, int batch) {
+    if (!state || !emitted || !kv_proj || !gate_proj || start_position < 0 ||
+        batch < 1 || state->ratio != 4 || proj_stride != state->projection_dim)
+        return -1;
+    const float *ape = compressor_ape(state);
+    if (!ape) return -1;
+    const int dim = state->head_dim, proj = state->projection_dim;
+    int nemit = 0, last_emit = -1;
+    for (int item = 0; item < batch; item++)
+        if ((start_position + item + 1) % 4 == 0) { nemit++; last_emit = item; }
+    if (nemit > emit_capacity) return -1;
+    int *emit_item = malloc((size_t)(nemit ? nemit : 1) * sizeof(*emit_item));
+    if (!emit_item) return -1;
+    for (int item = 0, e = 0; item < batch; item++)
+        if ((start_position + item + 1) % 4 == 0) emit_item[e++] = item;
+    const float *kv_state = state->kv_state, *score_state = state->score_state;
+    #pragma omp parallel for schedule(static)
+    for (long long w = 0; w < (long long)nemit * dim; w++) {
+        int ei = (int)(w / dim), column = (int)(w % dim);
+        int pos = start_position + emit_item[ei];
+        float sc[8], kv[8];
+        float maximum = -INFINITY;
+        for (int row = 0; row < 8; row++) {
+            int p = pos - 7 + row, i = p - start_position;
+            int col = row >= 4 ? column + dim : column;
+            if (i >= 0) {
+                int slot = p % 4;
+                sc[row] = gate_proj[(size_t)i * proj + col] + ape[(size_t)slot * proj + col];
+                kv[row] = kv_proj[(size_t)i * proj + col];
+            } else {
+                sc[row] = score_state[(size_t)row * proj + col];
+                kv[row] = kv_state[(size_t)row * proj + col];
+            }
+            if (sc[row] > maximum) maximum = sc[row];
+        }
+        float total = 0.0f, weighted = 0.0f;
+        for (int row = 0; row < 8; row++) {
+            float weight = expf(sc[row] - maximum);
+            total += weight;
+            weighted += kv[row] * weight;
+        }
+        emitted[(size_t)ei * dim + column] = weighted / total;
+    }
+    /* each emit's tail, independent across emits */
+    {
+        const float *norm = compressor_norm(state);
+        if (!norm) { free(emit_item); return -1; }
+        int failed = 0;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int ei = 0; ei < nemit; ei++) {
+            char err[128] = {0};
+            if (compressor_finish(state, emitted + (size_t)ei * dim,
+                                  start_position + emit_item[ei], norm, err, sizeof(err))) {
+                #pragma omp atomic write
+                failed = 1;
+            }
+        }
+        if (failed) { free(emit_item); return -1; }
+    }
+    free(emit_item);
+    /* the state as the walk leaves it */
+    float *kvs = state->kv_state, *scs = state->score_state;
+    int first_trailing = 0;
+    if (last_emit >= 0) {
+        for (int slot = 0; slot < 4; slot++) {
+            int i = last_emit - 3 + slot;
+            if (i < 0) continue;   /* carried from before the chunk: already in row 4+slot */
+            int p = start_position + i;
+            float *kv_row = kvs + (size_t)(4 + slot) * proj;
+            float *sc_row = scs + (size_t)(4 + slot) * proj;
+            for (int c = 0; c < proj; c++) {
+                kv_row[c] = kv_proj[(size_t)i * proj + c];
+                sc_row[c] = gate_proj[(size_t)i * proj + c] + ape[(size_t)(p % 4) * proj + c];
+            }
+        }
+        memcpy(kvs, kvs + (size_t)4 * proj, (size_t)4 * proj * sizeof(*kvs));
+        memcpy(scs, scs + (size_t)4 * proj, (size_t)4 * proj * sizeof(*scs));
+        first_trailing = last_emit + 1;
+    }
+    for (int i = first_trailing; i < batch; i++) {
+        int p = start_position + i, slot = p % 4;
+        float *kv_row = kvs + (size_t)(4 + slot) * proj;
+        float *sc_row = scs + (size_t)(4 + slot) * proj;
+        for (int c = 0; c < proj; c++) {
+            kv_row[c] = kv_proj[(size_t)i * proj + c];
+            sc_row[c] = gate_proj[(size_t)i * proj + c] + ape[(size_t)slot * proj + c];
+        }
+    }
+    return nemit;
+}
+
+/* a copy of the compressor's state (the verify of the batched advance) */
+ColiDeepSeekV4CompressorState *coli_v4_compressor_clone(
+    const ColiDeepSeekV4CompressorState *state) {
+    if (!state) return NULL;
+    ColiDeepSeekV4CompressorState *copy = malloc(sizeof(*copy));
+    if (!copy) return NULL;
+    *copy = *state;
+    copy->norm_dec = NULL; copy->norm_src = NULL;
+    size_t n = (size_t)state->state_rows * state->projection_dim;
+    copy->kv_state = malloc(n * sizeof(*copy->kv_state));
+    copy->score_state = malloc(n * sizeof(*copy->score_state));
+    if (!copy->kv_state || !copy->score_state) {
+        free(copy->kv_state); free(copy->score_state); free(copy); return NULL;
+    }
+    memcpy(copy->kv_state, state->kv_state, n * sizeof(*copy->kv_state));
+    memcpy(copy->score_state, state->score_state, n * sizeof(*copy->score_state));
+    return copy;
+}
+int coli_v4_compressor_state_equal(const ColiDeepSeekV4CompressorState *a,
+                                   const ColiDeepSeekV4CompressorState *b) {
+    if (!a || !b || a->state_rows != b->state_rows || a->projection_dim != b->projection_dim) return 0;
+    size_t n = (size_t)a->state_rows * a->projection_dim;
+    return !memcmp(a->kv_state, b->kv_state, n * sizeof(float)) &&
+           !memcmp(a->score_state, b->score_state, n * sizeof(float));
+}
+
 static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
                                     float *output, int *produced,
                                     int position, char *error,
@@ -4144,60 +4436,12 @@ static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
                state->score_state + (size_t)state->ratio * projection,
                (size_t)state->ratio * projection * sizeof(*state->score_state));
     }
-    coli_bf16_round_array(output, (size_t)dimension);
-    snprintf(suffix, sizeof(suffix), "%s.norm.weight", state->prefix);
-    const uint16_t *raw_norm = layer_value(state->weights, suffix);
-    float *norm = malloc((size_t)dimension * sizeof(*norm));
-    if (!raw_norm || !norm) {
-        free(norm);
-        return set_error(error, error_size, "missing compressor norm");
+    {
+        const float *norm = compressor_norm(state);
+        if (!norm) return set_error(error, error_size, "missing compressor norm");
+        if (compressor_finish(state, output, position, norm, error, error_size)) return -1;
     }
-    for (int i = 0; i < dimension; i++) norm[i] = coli_bf16_decode(raw_norm[i]);
-    coli_v4_rmsnorm(output, output, norm, dimension, state->config->rms_norm_eps);
-    coli_bf16_round_array(output, (size_t)dimension);
-    free(norm);
-
-    int rope_position = position + 1 - state->ratio;
-    int pairs = state->rope_dim / 2;
-    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
-    float *sines = malloc((size_t)pairs * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_position(
-            cosines, sines, state->rope_dim, rope_position,
-            state->config->original_max_position_embeddings,
-            state->config->compress_rope_theta, state->config->rope_factor,
-            state->config->rope_beta_fast, state->config->rope_beta_slow)) {
-        free(sines); free(cosines);
-        return set_error(error, error_size, "cannot create compressor RoPE table");
-    }
-    float *rope = output + dimension - state->rope_dim;
-    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
-    coli_bf16_round_array(rope, (size_t)state->rope_dim);
-    free(sines); free(cosines);
-
-    size_t quantized = state->rotate_fp4
-        ? (size_t)dimension : (size_t)(dimension - state->rope_dim);
-    size_t block = state->rotate_fp4 ? 32u : 64u;
-    float *qdq = malloc(quantized * sizeof(*qdq));
-    uint8_t *scales = malloc((quantized + block - 1) / block);
-    if (!qdq || !scales) {
-        free(scales); free(qdq);
-        return set_error(error, error_size, "compressor activation quantization failed");
-    }
-    int quant_error = 0;
-    if (state->rotate_fp4)
-        quant_error = coli_hadamard_bf16_ref(output, (size_t)dimension) ||
-                      coli_fp4_activation_qdq_ref(qdq, scales, output,
-                                                  quantized, block);
-    else
-        quant_error = coli_fp8_activation_qdq_ref(qdq, scales, output,
-                                                  quantized, block);
-    if (quant_error) {
-        free(scales); free(qdq);
-        return set_error(error, error_size, "compressor activation quantization failed");
-    }
-    memcpy(output, qdq, quantized * sizeof(*output));
-    coli_bf16_round_array(output, quantized);
-    free(scales); free(qdq);
+    (void)suffix;
     *produced = 1;
     return 0;
 }
@@ -4454,6 +4698,42 @@ int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
         return set_error(error, error_size, "invalid indexer advance arguments");
     return indexer_advance(state, input, position, kv_proj, gate_proj,
                            error, error_size);
+}
+
+/* V4_COMP_BATCH: the chunk's advances at once: the keys appended in order,
+ * counts[item] the count visible to each token (what the per-token advance
+ * returns). -1 with the state untouched when not handled. */
+int coli_v4_indexer_advance_batch(ColiDeepSeekV4Indexer *state,
+                                  const float *kv_proj, const float *gate_proj,
+                                  int proj_stride, int start_position,
+                                  int batch, int *counts, char *error,
+                                  size_t error_size) {
+    if (!state || !kv_proj || !gate_proj || start_position < 0 || batch < 1 || !counts)
+        return set_error(error, error_size, "invalid indexer batch advance arguments");
+    int dimension = state->config->index_head_dim;
+    int nemit = 0;
+    for (int item = 0; item < batch; item++)
+        if ((start_position + item + 1) % 4 == 0) nemit++;
+    if (state->count + nemit > state->capacity) {
+        int next_capacity = state->capacity;
+        while (next_capacity < state->count + nemit) next_capacity *= 2;
+        float *grown = realloc(state->compressed,
+            (size_t)next_capacity * dimension * sizeof(*grown));
+        if (!grown) return set_error(error, error_size, "cannot grow indexer cache");
+        memset(grown + (size_t)state->capacity * dimension, 0,
+               (size_t)(next_capacity - state->capacity) * dimension * sizeof(*grown));
+        state->compressed = grown;
+        state->capacity = next_capacity;
+    }
+    int n = coli_v4_compressor_advance_batch(
+        state->compressor, state->compressed + (size_t)state->count * dimension,
+        nemit, kv_proj, gate_proj, proj_stride, start_position, batch);
+    if (n < 0) return -1;
+    for (int item = 0; item < batch; item++) {
+        if ((start_position + item + 1) % 4 == 0) state->count++;
+        counts[item] = state->count;
+    }
+    return 0;
 }
 
 /* Prepare one token's scoring queries in place: bf16 round, RoPE, per-head
