@@ -56,7 +56,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -91,6 +91,23 @@ static int nok(ncclResult_t e,const char*s){if(e==ncclSuccess)return 1;fprintf(s
  * that never touched the missing buffer. Read it here. */
 static int alloc_ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;(void)cudaGetLastError();return ok(e,s);}
 static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree(*p);*p=nullptr;*cap=0;if(!alloc_ok(cudaMalloc(p,n),"buffer allocation"))return 0;*cap=n;return 1;}
+/* DSV4_PIN_STAGE (1): a per-device page-locked staging block for a call
+ * that ends with a stream sync (the prefill chain: its seven inputs as one
+ * staged copy, its output download). A cudaMemcpyAsync from pageable memory
+ * blocks the host per call on WDDM; a pinned copy queues. The caller's
+ * sync retires the copies, so the block needs no event. NULL = pageable. */
+static int pin_stage_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_PIN_STAGE");on=!(e&&*e=='0');}return on;}
+static void *stage_get(Dev*c,size_t n){
+    if(!pin_stage_on())return nullptr;
+    if(c->stgcap<n){
+        size_t cap=c->stgcap?c->stgcap:((size_t)1<<20);while(cap<n)cap*=2;
+        if(c->stg)cudaFreeHost(c->stg);
+        c->stg=nullptr;c->stgcap=0;
+        if(!alloc_ok(cudaHostAlloc(&c->stg,cap,cudaHostAllocPortable),"pinned staging"))return nullptr;
+        c->stgcap=cap;
+    }
+    return c->stg;
+}
 
 
 __constant__ float e8_table[256];
@@ -965,9 +982,10 @@ template<int IDX,int HPB> __global__ void __launch_bounds__(512) sparse_attn_cac
     int t=blockIdx.y,h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
     int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
     const int*ts=IDX?sel+(long long)t*selstride:nullptr;
-    const float*qh[HPB];
+    const float*qb=q+((long long)t*heads+h0)*dim;
+    int qo[HPB];
     #pragma unroll
-    for(int k=0;k<HPB;k++)qh[k]=q+((long long)t*heads+h0+(k<nh?k:0))*dim;
+    for(int k=0;k<HPB;k++)qo[k]=(k<nh?k:0)*dim;
     extern __shared__ float score[];   /* [HPB][total] */
     __shared__ float red[HPB][32];
     __shared__ float den[HPB];
@@ -988,7 +1006,7 @@ template<int IDX,int HPB> __global__ void __launch_bounds__(512) sparse_attn_cac
             #pragma unroll
             for(int r=0;r<4;r++)vd[r]=r<nr?v[r][d]:0.f;
             #pragma unroll
-            for(int k=0;k<HPB;k++){float qd=qh[k][d];
+            for(int k=0;k<HPB;k++){float qd=qb[qo[k]+d];
                 #pragma unroll
                 for(int r=0;r<4;r++)if(r<nr)z[k][r]+=qd*vd[r];}}
         #pragma unroll
@@ -1056,10 +1074,18 @@ static int sattn_v2_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4
  * (max_total * 4). Four heads when their score rows fit the 48 KB default,
  * else one. */
 static int sattn_hpb(void){static int n=-1;if(n<0){const char*e=getenv("DSV4_SATTN_HPB");n=e&&*e?atoi(e):4;if(n!=4)n=1;}return n;}
+/* DSV4_SATTN_HPB_PF (16): heads per block for the multi-token launches
+ * (prefill chunks), where the token count fills the card and the key rows
+ * are shared across the heads; 16, 8 or 4 (else the one-token rule) */
+static int sattn_hpb_pf(void){static int n=-1;if(n<0){const char*e=getenv("DSV4_SATTN_HPB_PF");n=e&&*e?atoi(e):16;if(n!=16&&n!=8)n=4;}return n;}
 template<int IDX> static void launch_sattn_v2(int heads,int tokens,size_t sm1,cudaStream_t st,float*out,const float*q,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int selstride,int abs_base,
         int chunk_start,int window,int dim,float scale){
-    if(sattn_hpb()==4&&sm1>=1024&&sm1*4<=48*1024)   /* four heads from 256 rows up: fewer blocks under-fill the card on short layers */
+    if(tokens>1&&sattn_hpb_pf()==16&&sm1*16<=48*1024)
+        sparse_attn_cached_v2<IDX,16><<<dim3((heads+15)/16,tokens),512,sm1*16,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
+    else if(tokens>1&&sattn_hpb_pf()>=8&&sm1*8<=48*1024)
+        sparse_attn_cached_v2<IDX,8><<<dim3((heads+7)/8,tokens),512,sm1*8,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
+    else if(sattn_hpb()==4&&sm1>=1024&&sm1*4<=48*1024)   /* four heads from 256 rows up: fewer blocks under-fill the card on short layers */
         sparse_attn_cached_v2<IDX,4><<<dim3((heads+3)/4,tokens),512,sm1*4,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
     else
         sparse_attn_cached_v2<IDX,1><<<dim3(heads,tokens),512,sm1,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
@@ -1840,6 +1866,10 @@ extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,
         const float*icos,const float*isin,int rope_dim,int rope_fma,const float*chunk,int chunk_start,const float*sinks,
         const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,float scale,int tokens,
         Dsv4CudaTensor*wa,int groups,Dsv4CudaTensor*wb,float*out){
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_PF_KPROF");kprof=e&&*e&&*e!='0';}
+    std::chrono::steady_clock::time_point t_in;
+    if(kprof)t_in=std::chrono::steady_clock::now();
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!qa||!wqb||!icos||!isin||!chunk||!sinks||!meta||!out||
        !wa||!wb||q_rank<1||tokens<1||heads<1||dim<1||rope_dim<2||rope_dim>dim||(rope_dim&1)||!(scale>0.f)||
@@ -1863,38 +1893,74 @@ extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,
        !buf((void**)&c->p4,&c->p4cap,qb)||!buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
        (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->dx,&c->xcap,hb))return 0;
     float*dqa=c->p1,*dcos=(float*)((char*)c->p1+qab),*dsin=(float*)((char*)c->p1+qab+rb);
-    if(!ok(cudaMemcpyAsync(dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"prefill chain qa upload")||
-       !ok(cudaMemcpyAsync(dcos,icos,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain cos upload")||
-       !ok(cudaMemcpyAsync(dsin,isin,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain sin upload")||
-       !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"prefill chain kv upload")||
-       !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"prefill chain sink upload")||
-       !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"prefill chain meta upload")||
-       (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"prefill chain index upload")))return 0;
+    cudaEvent_t ev[8];
+    if(kprof){for(int i=0;i<8;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
+    /* DSV4_PIN_STAGE: the seven inputs as one block in the pinned staging,
+     * one copy into p1 (all of it consumed before wo_b reuses p1); else
+     * the seven pageable copies */
+    size_t upb=qab+2*rb+cb+sb+mb+ib;
+    char*stg=(char*)stage_get(c,upb>hb?upb:hb);
+    const float*dchunk=c->p3,*dsink=c->aux1;const int*dmeta=(const int*)c->aux2,*dsel=ib?(const int*)c->aux3:nullptr;
+    if(stg&&buf((void**)&c->p1,&c->p1cap,upb)){
+        char*h=stg;
+        memcpy(h,qa,qab);h+=qab;memcpy(h,icos,rb);h+=rb;memcpy(h,isin,rb);h+=rb;memcpy(h,chunk,cb);h+=cb;
+        memcpy(h,sinks,sb);h+=sb;memcpy(h,meta,mb);h+=mb;if(ib)memcpy(h,sel,ib);
+        if(!ok(cudaMemcpyAsync(c->p1,stg,upb,cudaMemcpyHostToDevice,c->stream),"prefill chain staged upload"))return 0;
+        char*d=(char*)c->p1;
+        dqa=(float*)d;dcos=(float*)(d+qab);dsin=(float*)(d+qab+rb);dchunk=(const float*)(d+qab+2*rb);
+        dsink=(const float*)(d+qab+2*rb+cb);dmeta=(const int*)(d+qab+2*rb+cb+sb);dsel=ib?(const int*)(d+qab+2*rb+cb+sb+mb):nullptr;
+    }else{
+        stg=nullptr;
+        if(!ok(cudaMemcpyAsync(dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"prefill chain qa upload")||
+           !ok(cudaMemcpyAsync(dcos,icos,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain cos upload")||
+           !ok(cudaMemcpyAsync(dsin,isin,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain sin upload")||
+           !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"prefill chain kv upload")||
+           !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"prefill chain sink upload")||
+           !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"prefill chain meta upload")||
+           (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"prefill chain index upload")))return 0;
+    }
+    if(kprof)cudaEventRecord(ev[1],c->stream);
     /* the query projection: the same batched dense path dsv4_cuda_matmul_batch takes */
 #ifdef COLI_DSV4_DEEPGEMM
     if(!dg_dense_batch_dispatch(c,wqb,dqa,c->p2,tokens))return 0;
 #else
     run_mm_batch(wqb,dqa,c->p2,tokens,c->stream);if(!ok(cudaGetLastError(),"prefill chain wq_b launch"))return 0;
 #endif
+    if(kprof)cudaEventRecord(ev[2],c->stream);
     long long qn=(long long)tokens*heads*dim;
     bf16_round_ref_kernel<<<(unsigned)((qn+255)/256),256,0,c->stream>>>(c->p2,(int)qn);
     head_rmsnorm_ref_kernel<<<(unsigned)(tokens*heads),256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
     attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p2,dcos,dsin,dim,rope_dim,rope_fma,0,heads);
     if(!ok(cudaGetLastError(),"prefill chain query launch"))return 0;
+    if(kprof)cudaEventRecord(ev[3],c->stream);
     if(sel){
-        if(sattn_v2_on())launch_sattn_v2<1>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,abs_base,chunk_start,window,dim,scale);
-        else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,abs_base,chunk_start,window,heads,dim,scale);
+        if(sattn_v2_on())launch_sattn_v2<1>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,selstride,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,selstride,abs_base,chunk_start,window,heads,dim,scale);
     }else{
-        if(sattn_v2_on())launch_sattn_v2<0>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,abs_base,chunk_start,window,dim,scale);
-        else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,abs_base,chunk_start,window,heads,dim,scale);
+        if(sattn_v2_on())launch_sattn_v2<0>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,0,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,abs_base,chunk_start,window,heads,dim,scale);
     }
     if(!ok(cudaGetLastError(),"prefill chain attention launch"))return 0;
+    if(kprof)cudaEventRecord(ev[4],c->stream);
     attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1,heads);
     if(!ok(cudaGetLastError(),"prefill chain inverse rope launch"))return 0;
+    if(kprof)cudaEventRecord(ev[5],c->stream);
     Dsv4CudaActivation ctxa={c->p4,qn,device},outa={c->dx,(long long)tokens*wb->O,device};
     if(!dsv4_cuda_attention_output_batch(&ctxa,wa,wb,groups,tokens,&outa))return 0;
-    if(!ok(cudaMemcpyAsync(out,c->dx,hb,cudaMemcpyDeviceToHost,c->stream),"prefill chain output download"))return 0;
-    return ok(cudaStreamSynchronize(c->stream),"prefill chain sync");
+    if(kprof)cudaEventRecord(ev[6],c->stream);
+    if(!ok(cudaMemcpyAsync(stg?(void*)stg:(void*)out,c->dx,hb,cudaMemcpyDeviceToHost,c->stream),"prefill chain output download"))return 0;
+    if(kprof)cudaEventRecord(ev[7],c->stream);
+    int done=ok(cudaStreamSynchronize(c->stream),"prefill chain sync");
+    if(stg&&done)memcpy(out,stg,hb);
+    if(kprof){
+        float ms[7];
+        for(int i=0;i<7;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
+        double host=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_in).count();
+        fprintf(stderr,"pfkprof layer=%d tokens=%d total=%d up=%.3f qb=%.3f qk=%.3f attn=%.3f rope=%.3f wo=%.3f down=%.3f host=%.3f ms\n",
+                layer,tokens,max_total,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],host);
+        for(int i=0;i<8;i++)cudaEventDestroy(ev[i]);
+    }
+    return done;
 }
 extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,const float*chunk,int chunk_start,
         const float*sinks,const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,

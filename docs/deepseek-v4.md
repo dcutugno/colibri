@@ -669,6 +669,28 @@ every token (a strcmp scan over the layer's tensor table): the slot is
 cached in the state. The fused call's staging (fp8 qdq of the query ranks,
 the input gather, the RoPE tables) runs across tokens as well. Measured (3.3k prompt, 36 tokens): time to first token 53.3 -> 47.4 s; the profiled indexer 13.8 -> 6.4 s (projection kernel 4.9 -> 1.2, scoring 1.2 -> 0.3, sort 1.6 -> 0.1, the compressor's comp 3.8 -> 3.1); the greedy text unchanged. What remains of the indexer: the fused call's host staging and syncs (~1.6 s), the per-token advance (~3 s, the compressor's own state copies and emits), the kernels (1.5 s).
 
+Eleventh measurement (2026-10-29): the prefill attention stage's 5.8 s
+(3.3k prompt) against the chain's device time: `DSV4_PF_KPROF=1` (per call
+`pfkprof`: uploads, wq_b, the query kernels, the sparse attention, the
+inverse RoPE, wo, the download, and the call's host wall) summed to 2.5 s
+of device work, the chain's host wall the same; `attnprof` now splits the
+stage's host side (`sync=` the KV cache sync, `chain=` the call, `adv=` the
+ring append). The KV sync was 1.4 s: the chain's success fell into the
+fallback's else branch, which poisons the device KV cache, so every next
+chunk-layer reseeded the ring row by row (127 pageable copies) and
+re-uploaded the whole compressed prefix; the cache is poisoned only when
+no device attention ran. `DSV4_SATTN_HPB_PF` (16): heads per block for the
+multi-token launches of the cached sparse attention (the one-token shape's
+four heads per block re-read every key row once per four heads; a chunk
+has the tokens to fill the card; the per-head arithmetic is unchanged):
+the kernel 6.26 -> 5.73 s of stage time. `DSV4_PIN_STAGE` (1): the chain's
+seven inputs as one staged copy from a page-locked block and its output
+download into it (a pageable cudaMemcpyAsync blocks the host per call on
+WDDM): up 273 -> 134 ms, down 576 -> 199 ms. A pinned copy for the kv
+appends was tried and dropped: reusing the block safely needs an event
+per copy, and each record is a WDDM submit dearer than the pageable copy
+(and the event-free variant corrupted the text: the hazard is real). Measured (3.3k prompt, 36 tokens): time to first token 47.4 -> 46.3 s; the KV sync 1.4 -> 0.1 s, the chain's uploads 273 -> 149 ms and its download 576 -> 197 ms; decode unchanged (12.95 s / 36 tokens); the greedy text unchanged. What remains of the stage is the chain's device work (2.5 s: the sparse attention 0.9, wo 0.56, wq_b 0.15, the copies 0.35) and the two dense layers without a chain (0.8 s).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -792,6 +814,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
+| `DSV4_SATTN_HPB_PF` (16) | heads per block for the multi-token (prefill chunk) launches of the cached sparse attention: 16, 8 or 4 (else the one-token rule); the key rows are shared across the heads of a token, the per-head arithmetic is unchanged (bitwise) |
+| `DSV4_PIN_STAGE` (1, `.cu`) | the prefill chain's inputs as one copy from a page-locked staging block and its output download into it; `0` = seven pageable copies and a pageable download |
+| `DSV4_PF_KPROF` (0, `.cu`) | per-call device time of the prefill chain's stages and its host wall (`pfkprof`) |
 | `DSV4_SATTN_HPB` (4) | heads per block of the shaped sparse attention from 256 rows up (`1` = one head per block, the rows read once per head) |
 | `DSV4_SATTN_V2` (1) | the cached sparse attention kernel shaped for latency (same arithmetic, same order, bitwise); `0` = the old kernel |
 | `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the byte-per-lane kernel, bitwise the reference (slower by ~0.27 ms per layer) |

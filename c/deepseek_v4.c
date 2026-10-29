@@ -3325,6 +3325,7 @@ int coli_v4_attention_window_batch_ref(
         return set_error(error, error_size, "out of memory in batched attention");
 
     double prof_t = v4_attn_prof_enabled() ? v4_attn_prof_now() : 0.0;
+    double prof_sync = 0, prof_chain = 0, prof_adv = 0;
     double prof_qa = 0, prof_comp = 0, prof_idx = 0, prof_qb = 0,
            prof_kv = 0, prof_rope = 0, prof_attn = 0, prof_wo = 0;
 #define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
@@ -3604,9 +3605,12 @@ int coli_v4_attention_window_batch_ref(
              * separate buffer and enter the ring only AFTER attention (with
              * slots indexed position%window, appending first would overwrite
              * the oldest rows early chunk tokens still attend to). */
-            if (meta && coli_v4_gpu_kv_cache_sync(
+            double prof_t0 = prof_t ? v4_attn_prof_now() : 0;
+            int synced = meta && coli_v4_gpu_kv_cache_sync(
                     weights, state->kv, state->window_size, head_dim,
-                    start_position, state->compressed, comp_total)) {
+                    start_position, state->compressed, comp_total);
+            if (prof_t) { double n2 = v4_attn_prof_now(); prof_sync += n2 - prof_t0; prof_t0 = n2; }
+            if (synced) {
                 /* V4_PREFILL_CHAIN: the deferred query, the attention and
                  * wo on the card in one chain; the kv rows enter the ring
                  * below as usual, nothing of the chunk's attention comes
@@ -3620,9 +3624,11 @@ int coli_v4_attention_window_batch_ref(
                     coli_bf16_round_array(outputs, (size_t)batch * hidden);
                     chain_done = 1;
                     gpu_attn_done = 1;
+                    if (prof_t) { double n2 = v4_attn_prof_now(); prof_chain += n2 - prof_t0; prof_t0 = n2; }
                     coli_v4_gpu_kv_cache_advance(weights, kv, start_position,
                                                  batch, state->window_size,
                                                  head_dim, comp_total);
+                    if (prof_t) { double n2 = v4_attn_prof_now(); prof_adv += n2 - prof_t0; prof_t0 = n2; }
                 }
                 if (!chain_done && q_defer) {
                     result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim, rope_dim,
@@ -3643,7 +3649,9 @@ int coli_v4_attention_window_batch_ref(
                     coli_v4_gpu_kv_cache_advance(weights, kv, start_position,
                                                  batch, state->window_size,
                                                  head_dim, comp_total);
-                } else {
+                } else if (!chain_done) {
+                    /* no device attention for the chunk: the cache is stale
+                     * from here (the chain's success committed it above) */
                     coli_v4_gpu_kv_cache_poison(weights);
                 }
             }
@@ -3825,10 +3833,12 @@ int coli_v4_attention_window_batch_ref(
     V4_ATTN_PROF_MARK(prof_wo);
     if (prof_t)
         fprintf(stderr, "attnprof layer=%d start=%d n=%d qa=%.0f comp=%.0f "
-                "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms\n",
+                "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms "
+                "(sync=%.1f chain=%.1f adv=%.1f)\n",
                 weights->plan.layer, start_position, batch, prof_qa * 1e3,
                 prof_comp * 1e3, prof_idx * 1e3, prof_qb * 1e3, prof_kv * 1e3,
-                prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
+                prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3,
+                prof_sync * 1e3, prof_chain * 1e3, prof_adv * 1e3);
 #undef V4_ATTN_PROF_MARK
 
     free(inputs_act_scales); free(inputs_act);
