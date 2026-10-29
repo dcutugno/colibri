@@ -3323,6 +3323,10 @@ static bool host_pinned(const void*p,size_t len){
  * while the drive still writes into it left stale bytes behind — WDDM moves
  * the pages). 1 when pinned (or already), 0 when not. */
 extern "C" int dsv4_cuda_host_pin(const void*p,size_t len){return host_pinned(p,len)?1:0;}
+/* V4_PIN_SCRATCH: page-locked host memory for the engine's own staging (a
+ * parallel memcpy into it, then a copy at link speed); NULL when refused */
+extern "C" void *dsv4_cuda_host_alloc(size_t n){void*p=nullptr;if(!n||!alloc_ok(cudaHostAlloc(&p,n,cudaHostAllocPortable),"pinned scratch"))return nullptr;return p;}
+extern "C" void dsv4_cuda_host_free(void*p){if(p)cudaFreeHost(p);}
 /* V4_HC_PIN: page-lock a range the engine owns for as long as it says (no
  * registry: the engine unregisters before freeing or reusing it). 1 =
  * registered now, 2 = was already (leave it), 0 = refused. */

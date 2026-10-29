@@ -202,6 +202,8 @@ typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **g, Dsv4CudaTensor **
 typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, const uint8_t *scales, long long S, const long long *soff, const uint8_t *weights, long long Wb, const long long *woff, int sync);
 typedef int             (*fn_mirror_copy)(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len);
 typedef int             (*fn_host_pin)(const void *p, size_t len);
+typedef void *          (*fn_host_alloc)(size_t n);
+typedef void            (*fn_host_free)(void *p);
 typedef int             (*fn_host_register)(void *p, size_t len);
 typedef void            (*fn_host_unregister)(void *p);
 typedef int             (*fn_attn_prefill_chain)(int device,int layer,const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,int norm_fma,const float *icos,const float *isin,int rope_dim,int rope_fma,const float *chunk,int chunk_start,const float *sinks,const int *meta,const int *sel,int selstride,int abs_base,int comp_limit,int heads,int dim,float scale,int tokens,Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out);
@@ -360,6 +362,7 @@ static struct {
     fn_mirror_copy mirror_copy; fn_mirror_point mirror_point;       /* optional: read -> upload pieces */
     fn_mirror_check mirror_check;                                   /* optional: diagnostic */
     fn_host_pin host_pin;                                           /* optional: pieces pin the slab first */
+    fn_host_alloc host_alloc; fn_host_free host_free;               /* optional: the engine's pinned staging */
     fn_host_register host_register; fn_host_unregister host_unregister;   /* optional: the prefill's state buffers */
     fn_attn_prefill_chain attn_prefill_chain;                       /* optional: the prefill attention chain */
     fn_kv_ring_append kv_ring_append;
@@ -604,6 +607,8 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.mirror_point = (fn_mirror_point)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_point");
     g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
     g_dsv4.host_pin = (fn_host_pin)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_pin");
+    g_dsv4.host_alloc = (fn_host_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_alloc");
+    g_dsv4.host_free = (fn_host_free)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_free");
     g_dsv4.host_register = (fn_host_register)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_register");
     g_dsv4.host_unregister = (fn_host_unregister)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_unregister");
     g_dsv4.attn_prefill_chain = (fn_attn_prefill_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_prefill_chain");
@@ -1039,6 +1044,13 @@ int dsv4_cuda_mirror_copy(Dsv4CudaTensor *g, int run, long long off, const uint8
 int dsv4_cuda_host_pin(const void *p, size_t len){
     if(!g_dsv4.available||!g_dsv4.host_pin) return 0;
     return g_dsv4.host_pin(p, len);
+}
+void *dsv4_cuda_host_alloc(size_t n){
+    if(!g_dsv4.available||!g_dsv4.host_alloc||!g_dsv4.host_free) return NULL;
+    return g_dsv4.host_alloc(n);
+}
+void dsv4_cuda_host_free(void *p){
+    if(p&&g_dsv4.available&&g_dsv4.host_free) g_dsv4.host_free(p);
 }
 int dsv4_cuda_host_register(void *p, size_t len){
     if(!g_dsv4.available||!g_dsv4.host_register||!g_dsv4.host_unregister) return 0;

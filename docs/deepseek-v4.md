@@ -758,6 +758,20 @@ in flight at either point) and releases them on every exit; the copies are
 then DMA at link speed. Prompts under `V4_HC_PIN_MIN` (256) tokens skip
 it. Same bytes: bitwise. Measured (3.3k prompt, 36 tokens): hc1 1.9 -> 1.3 s, hc3 1.8 -> 1.5 s (profiled; the register and release of 2 x 215 MB per prefill included); time to first token 41.9 -> 41.7 s unprofiled; the greedy text unchanged.
 
+Sixteenth measurement (2026-10-29): the MoE stage (5.6 s per 3.3k prefill)
+by `V4_MOE_BATCH_PROF=1` (`moebprof`): route 1.2 s (a device kernel and a
+host round trip per chunk-layer for the ids), refill 0.6 s (the first
+chunk of each layer; the second bank's prefetch covers the rest), compute
+3.2 s (the routed and shared kernels, the 2 MB download, the sync). Around
+it, the block itself took ten mallocs per chunk-layer (~24 MB: the states,
+the normalized and branch arrays, the FFN four), so every upload or
+download of them hit fresh pageable pages. `V4_BLOCK_SCRATCH` (1): the ten
+arrays from one persistent page-locked scratch (`dsv4_cuda_host_alloc`,
+grow-only; a plain malloc when the DLL has none): no fresh-page faults,
+and their copies are DMA at link speed. The mHC residency tags are reset
+at each block's start, since with stable pointers a tag from the previous
+chunk must never hit. Same bytes: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 41.7 -> 40.6 s; the MoE stage 5.6 -> 5.0 s and the attention stage 28.8 -> 27.9 s (profiled); the greedy text unchanged.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -882,6 +896,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
 | `V4_COMP_BATCH` (1) | a prefill chunk's compressor advances (the attention's and the indexer's) in one parallel pass from the batched projections, the serial emit's arithmetic per column (bitwise); `2` = verify against the per-token walk; `0` = the walk |
+| `V4_BLOCK_SCRATCH` (1) | the prefill block's ten per-call arrays from one persistent page-locked scratch (their copies at link speed, no per-chunk mallocs); `0` = a malloc'd scratch |
+| `V4_MOE_BATCH_PROF` (0) | one `moebprof` line per chunk-layer: the batched MoE's switch / route / refill / compute (its own prints inflate the stage) |
 | `V4_HC_PIN` (1) | the prefill page-locks the prompt's range of its state buffers for its duration (the block's 8 MB copies at link speed); `V4_HC_PIN_MIN` (256) the prompt length from which; `0` = pageable copies |
 | `V4_HC_FUSED` (1) | the prefill block's attention post + FFN pre/norm as one device pass, the states resident for the FFN post (16 MB per chunk-layer not copied); `0` = the two-step path with the states round trip |
 | `DSV4_SATTN_HPB_PF` (16) | heads per block for the multi-token (prefill chunk) launches of the cached sparse attention: 16, 8 or 4 (else the one-token rule); the key rows are shared across the heads of a token, the per-head arithmetic is unchanged (bitwise) |

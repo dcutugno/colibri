@@ -65,6 +65,8 @@ EXPORTS
     dsv4_cuda_mirror_refill
     dsv4_cuda_mirror_copy
     dsv4_cuda_host_pin
+    dsv4_cuda_host_alloc
+    dsv4_cuda_host_free
     dsv4_cuda_host_register
     dsv4_cuda_host_unregister
     dsv4_cuda_attn_prefill_chain

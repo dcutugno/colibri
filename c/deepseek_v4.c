@@ -8009,6 +8009,11 @@ int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
 }
 #endif
 
+#ifdef COLI_V4_GPU_TIER
+extern void *dsv4_cuda_host_alloc(size_t n);   /* backend_cuda_dsv4.h: V4_BLOCK_SCRATCH */
+extern void dsv4_cuda_host_free(void *p);
+void coli_v4_gpu_mhc_tags_reset(void);
+#endif
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -8019,24 +8024,48 @@ int coli_v4_block_window_batch_ref(
         !inputs_hc || !tokens || batch < 1 || batch > 128) return -1;
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
-    float *states = malloc((size_t)batch * hd * sizeof(*states));
-    float *normalized = malloc((size_t)batch * d * sizeof(*normalized));
-    float *branches = malloc((size_t)batch * d * sizeof(*branches));
-    float *posts = malloc((size_t)batch * hc * sizeof(*posts));
-    float *combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
-    float *reduced = malloc((size_t)d * sizeof(*reduced));
+    /* V4_BLOCK_SCRATCH: the ten per-call arrays from one persistent
+     * page-locked scratch (grow-only; single generation thread) */
+    static char *scratch; static size_t scratch_cap; static int scratch_pinned;
+    size_t n_states = (size_t)batch * hd, n_d = (size_t)batch * d,
+           n_hc = (size_t)batch * hc, n_hc2 = (size_t)batch * hc * hc;
+    size_t need = (n_states + 4 * n_d + 2 * n_hc + 2 * n_hc2 + (size_t)d) * sizeof(float) + 10 * 64;
+    if (scratch_cap < need) {
+        size_t want = need < ((size_t)32 << 20) ? ((size_t)32 << 20) : need;
+        char *grown = NULL; int pinned = 0;
+#ifdef COLI_V4_GPU_TIER
+        static int pin_on = -1;
+        if (pin_on < 0) { const char *e = getenv("V4_BLOCK_SCRATCH"); pin_on = !(e && *e == '0'); }
+        if (pin_on) { grown = dsv4_cuda_host_alloc(want); pinned = grown != NULL; }
+#endif
+        if (!grown) grown = malloc(want);
+        if (!grown) return -1;
+        if (scratch) {
+#ifdef COLI_V4_GPU_TIER
+            if (scratch_pinned) dsv4_cuda_host_free(scratch); else
+#endif
+            free(scratch);
+        }
+        scratch = grown; scratch_cap = want; scratch_pinned = pinned;
+    }
+    char *carve = scratch;
+#define V4_BLOCK_CARVE(count) ((float *)(carve += 0, carve = (char *)(((uintptr_t)carve + 63) & ~(uintptr_t)63), carve += (count) * sizeof(float), carve - (count) * sizeof(float)))
+    float *states = V4_BLOCK_CARVE(n_states);
+    float *normalized = V4_BLOCK_CARVE(n_d);
+    float *branches = V4_BLOCK_CARVE(n_d);
+    float *posts = V4_BLOCK_CARVE(n_hc);
+    float *combs = V4_BLOCK_CARVE(n_hc2);
+    float *reduced = V4_BLOCK_CARVE((size_t)d);
     /* FFN buffers are batch-sized so the MoE can run expert-major over the
      * whole chunk (v4_moe_batch_union) instead of position by position. */
-    float *ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
-    float *ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
-    float *ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
-    float *ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
-    if (!states || !normalized || !branches || !posts || !combs || !reduced ||
-        !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
-        free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
-        free(reduced); free(combs); free(posts); free(branches);
-        free(normalized); free(states); return -1;
-    }
+    float *ffn_normalized = V4_BLOCK_CARVE(n_d);
+    float *ffn_branch = V4_BLOCK_CARVE(n_d);
+    float *ffn_post = V4_BLOCK_CARVE(n_hc);
+    float *ffn_comb = V4_BLOCK_CARVE(n_hc2);
+#undef V4_BLOCK_CARVE
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_mhc_tags_reset();
+#endif
     int result = 0;
     double prof_t = v4_block_prof_enabled() ? v4_block_prof_now() : 0.0;
     double prof_hc1 = 0, prof_attn = 0, prof_hc2 = 0, prof_moe = 0,
@@ -8159,9 +8188,6 @@ int coli_v4_block_window_batch_ref(
                 prof_attn * 1e3, prof_hc2 * 1e3, prof_moe * 1e3,
                 prof_hc3 * 1e3);
 #undef V4_BLOCK_PROF_MARK
-    free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
-    free(reduced); free(combs); free(posts); free(branches);
-    free(normalized); free(states);
     if (!result) return 0;
     if (error && error_size && error[0]) return -1;
     if (moe_reason()[0])
@@ -16199,6 +16225,8 @@ static void v4_gpu_mhc_tags_clear(void) {
     v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
     v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
 }
+/* at a block's start: a tag can only hit within the block that set it */
+void coli_v4_gpu_mhc_tags_reset(void) { v4_gpu_mhc_tags_clear(); }
 
 int coli_v4_gpu_mhc_pre_norm_batch(
     const ColiDeepSeekV4LayerWeights *weights, const char *branch,
