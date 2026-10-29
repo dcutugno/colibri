@@ -770,7 +770,12 @@ arrays from one persistent page-locked scratch (`dsv4_cuda_host_alloc`,
 grow-only; a plain malloc when the DLL has none): no fresh-page faults,
 and their copies are DMA at link speed. The mHC residency tags are reset
 at each block's start, since with stable pointers a tag from the previous
-chunk must never hit. Same bytes: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 41.7 -> 40.6 s; the MoE stage 5.6 -> 5.0 s and the attention stage 28.8 -> 27.9 s (profiled); the greedy text unchanged.
+chunk must never hit. Same bytes: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 41.7 -> 40.6 s; the MoE stage 5.6 -> 5.0 s and the attention stage 28.8 -> 27.9 s (profiled); the greedy text unchanged. Tried and dropped: the batched MoE's
+route and compute in one device pass (`dsv4_cuda_route_moe_batch`, the
+ids fetched on the stream) when the bank holds every expert: 14 ms per
+chunk-layer against 4 ms for the router call, the host round trip for
+the ids and the second call (the device-ids variant of the grouped MoE
+builds its expert layout slowly); time to first token 40.6 -> 52.2 s.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
