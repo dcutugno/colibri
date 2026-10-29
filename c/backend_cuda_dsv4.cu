@@ -950,6 +950,78 @@ __device__ __forceinline__ const float*cached_row(const float*win,const float*ch
                           :win+(long long)(ap%window)*dim;
 }
 
+/* DSV4_SATTN_V2 (1): the cached sparse attention rewritten for latency —
+ * the same arithmetic in the same order (each lane's per-row dot, the
+ * warp shuffle, the denominator's serial sum, the row-ordered weighted
+ * sum), only the loads overlapped: four rows per warp step for the
+ * scores, the selection indices and eight rows prefetched into registers
+ * for the weighted sum, the exponentials by every thread with the max as
+ * a block reduction. IDX: rows past the window come from the indexer's
+ * selection. Measured before: 0.39 ms per 640-row layer, one thread's
+ * serial softmax and a dependent index load before each row load. */
+template<int IDX> __global__ void __launch_bounds__(512) sparse_attn_cached_v2(float*out,const float*q,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,
+        int selstride,int abs_base,int chunk_start,int window,int heads,int dim,float scale){
+    int t=blockIdx.y,h=blockIdx.x;
+    int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
+    const int*ts=IDX?sel+(long long)t*selstride:nullptr;
+    const float*qh=q+((long long)t*heads+h)*dim;
+    extern __shared__ float score[];
+    __shared__ float red[32];
+    __shared__ float den;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,nw=blockDim.x>>5;
+    for(int item=warp*4;item<total;item+=nw*4){
+        int nr=total-item;if(nr>4)nr=4;
+        const float*v[4];
+        #pragma unroll
+        for(int k=0;k<4;k++){int it=item+(k<nr?k:0);
+            v[k]=it<wn?cached_row(win,chunk,abs_base+wo+it,chunk_start,window,dim)
+                      :comp+(long long)(IDX?ts[it-wn]:(it-wn))*dim;}
+        float z[4]={0.f,0.f,0.f,0.f};
+        for(int d=lane;d<dim;d+=32){float qd=qh[d];
+            #pragma unroll
+            for(int k=0;k<4;k++)if(k<nr)z[k]+=qd*v[k][d];}
+        #pragma unroll
+        for(int k=0;k<4;k++){float zz=z[k];
+            for(int n=16;n;n>>=1)zz+=__shfl_down_sync(0xffffffff,zz,n);
+            if(!lane&&k<nr)score[item+k]=zz*scale;}
+    }
+    __syncthreads();
+    float lm=-INFINITY;
+    for(int i=threadIdx.x;i<total;i+=blockDim.x)lm=fmaxf(lm,score[i]);
+    for(int n=16;n;n>>=1)lm=fmaxf(lm,__shfl_xor_sync(0xffffffff,lm,n));
+    if(!lane)red[warp]=lm;
+    __syncthreads();
+    float m=red[0];for(int w=1;w<nw;w++)m=fmaxf(m,red[w]);
+    for(int i=threadIdx.x;i<total;i+=blockDim.x)score[i]=expf(score[i]-m);
+    __syncthreads();
+    if(!threadIdx.x){float d0=expf(sink[h]-m);for(int i=0;i<total;i++)d0+=score[i];den=d0;}
+    __syncthreads();
+    for(int i=threadIdx.x;i<total;i+=blockDim.x)score[i]=__bfloat162float(__float2bfloat16(score[i]));
+    __syncthreads();
+    float dn=den;
+    for(int d=threadIdx.x;d<dim;d+=blockDim.x){
+        float sum=0.f;int i=0;
+        for(;i+16<=wn;i+=16){float v[16];
+            #pragma unroll
+            for(int k=0;k<16;k++)v[k]=cached_row(win,chunk,abs_base+wo+i+k,chunk_start,window,dim)[d];
+            #pragma unroll
+            for(int k=0;k<16;k++)sum+=score[i+k]*v[k];}
+        for(;i<wn;i++)sum+=score[i]*cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+        i=0;
+        for(;i+16<=cn;i+=16){int ix[16];float v[16];
+            #pragma unroll
+            for(int k=0;k<16;k++)ix[k]=IDX?ts[i+k]:i+k;
+            #pragma unroll
+            for(int k=0;k<16;k++)v[k]=comp[(long long)ix[k]*dim+d];
+            #pragma unroll
+            for(int k=0;k<16;k++)sum+=score[wn+i+k]*v[k];}
+        for(;i<cn;i++){int ix=IDX?ts[i]:i;sum+=score[wn+i]*comp[(long long)ix*dim+d];}
+        out[((long long)t*heads+h)*dim+d]=__bfloat162float(__float2bfloat16(sum/dn));
+    }
+}
+static int sattn_v2_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_SATTN_V2");on=!e||!*e||*e!='0';}return on;}
+
 __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,int abs_base,
         int chunk_start,int window,int heads,int dim,float scale){
@@ -1005,7 +1077,10 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const flo
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached attention chunk upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached attention meta upload"))return 0;
-    sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
+    if(sattn_v2_on())sparse_attn_cached_v2<0><<<dim3(heads,tokens),512,sm,c->stream>>>(
+        c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
+        abs_base,chunk_start,window,heads,dim,scale);
+    else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
         abs_base,chunk_start,window,heads,dim,scale);
     return ok(cudaGetLastError(),"cached sparse attention launch")&&
@@ -1048,6 +1123,7 @@ __global__ void sparse_attn_batch_cached_idx_kernel(float*out,const float*q,cons
     }
 }
 
+
 extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const float*q,
         const float*chunk,int chunk_start,const float*sinks,const int*meta,const int*sel,
         int selstride,int abs_base,int comp_limit,int heads,int dim,int tokens,
@@ -1079,7 +1155,10 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached idx attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached idx attention meta upload")||
        !ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"cached idx attention index upload"))return 0;
-    sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
+    if(sattn_v2_on())sparse_attn_cached_v2<1><<<dim3(heads,tokens),512,sm,c->stream>>>(
+        c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+        selstride,abs_base,chunk_start,window,heads,dim,scale);
+    else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
         selstride,abs_base,chunk_start,window,heads,dim,scale);
     return ok(cudaGetLastError(),"cached idx sparse attention launch")&&
@@ -1612,6 +1691,10 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
        (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->p1,&c->p1cap,2*rb+qab)||
        !buf((void**)&c->dy,&c->ycap,ob)||!buf((void**)&c->dx,&c->xcap,hb))return 0;
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_WO_KPROF");kprof=e&&*e&&*e!='0';}
+    cudaEvent_t ev[7],ex[3];
+    if(kprof){for(int i=0;i<7;i++)cudaEventCreate(&ev[i]);for(int i=0;i<3;i++)cudaEventCreate(&ex[i]);cudaEventRecord(ex[0],c->stream);}
     if(qa){
         /* q from qa on the card: the wq_b mv kernel (what coli_fp8_matvec_ref
          * dispatches to over the mirror), bf16 round, per-head rmsnorm,
@@ -1631,6 +1714,7 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
         if(!ok(cudaGetLastError(),"decode chain q rope launch"))return 0;
         if(q_out&&!ok(cudaMemcpyAsync(q_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"decode chain q download"))return 0;
     }
+    if(kprof)cudaEventRecord(ex[1],c->stream);
     if(!qa&&!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"decode chain query upload"))return 0;
     if(
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"decode chain kv upload")||
@@ -1639,19 +1723,25 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"decode chain index upload"))||
        (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
               !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))))return 0;
-    if(sel)
+    if(kprof)cudaEventRecord(ex[2],c->stream);
+    if(sel&&sattn_v2_on())
+        sparse_attn_cached_v2<1><<<dim3(heads,1),512,sm,c->stream>>>(
+            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+            cn,abs_base,chunk_start,window,heads,dim,scale);
+    else if(sel)
         sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
             cn,abs_base,chunk_start,window,heads,dim,scale);
+    else if(sattn_v2_on())
+        sparse_attn_cached_v2<0><<<dim3(heads,1),512,sm,c->stream>>>(
+            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
+            abs_base,chunk_start,window,heads,dim,scale);
     else
         sparse_attn_batch_cached_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
             abs_base,chunk_start,window,heads,dim,scale);
     if(!ok(cudaGetLastError(),"decode chain attention launch"))return 0;
-    static int kprof=-1;
-    if(kprof<0){const char*e=getenv("DSV4_WO_KPROF");kprof=e&&*e&&*e!='0';}
-    cudaEvent_t ev[7];
-    if(kprof){for(int i=0;i<7;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
+    if(kprof)cudaEventRecord(ev[0],c->stream);
     attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
     if(kprof)cudaEventRecord(ev[1],c->stream);
@@ -1674,10 +1764,11 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
     if(kprof)cudaEventRecord(ev[5],c->stream);
     int done=ok(cudaStreamSynchronize(c->stream),"decode chain sync");
     if(kprof){
-        float ms[5];
+        float ms[5],mq=0,mu=0,ma=0;
         for(int i=0;i<5;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
-        fprintf(stderr,"wokprof layer=%d rope=%.3f wo_a=%.3f round=%.3f wo_b=%.3f down=%.3f ms\n",layer,ms[0],ms[1],ms[2],ms[3],ms[4]);
-        for(int i=0;i<7;i++)cudaEventDestroy(ev[i]);
+        cudaEventElapsedTime(&mq,ex[0],ex[1]);cudaEventElapsedTime(&mu,ex[1],ex[2]);cudaEventElapsedTime(&ma,ex[2],ev[0]);
+        fprintf(stderr,"wokprof layer=%d q=%.3f up=%.3f attn=%.3f rope=%.3f wo_a=%.3f round=%.3f wo_b=%.3f down=%.3f ms rows=%d\n",layer,mq,mu,ma,ms[0],ms[1],ms[2],ms[3],ms[4],total);
+        for(int i=0;i<7;i++)cudaEventDestroy(ev[i]);for(int i=0;i<3;i++)cudaEventDestroy(ex[i]);
     }
     return done;
 }
