@@ -722,7 +722,17 @@ rows carried in the state, so all the chunk's emits run in one parallel
 pass over (emit, column) with the serial emit's expression order per
 column, and the state rows are then set as the walk leaves them. `2` =
 verify: the walk stays the real path and the batched emits and the final
-state are compared against it (`compbatch` lines). Measured (3.3k prompt, 36 tokens): time to first token 44.2 -> 42.8 s; the indexer stage 6.8 -> 5.4 s, the compressor stage 3.3 -> 3.0 s (the batched passes of both compressors are charged to it now); the verify over the whole prompt (546 chunk-layers) reports no mismatch; decode unchanged; the greedy text unchanged.
+state are compared against it (`compbatch` lines). Measured (3.3k prompt, 36 tokens): time to first token 44.2 -> 42.8 s; the indexer stage 6.8 -> 5.4 s, the compressor stage 3.3 -> 3.0 s (the batched passes of both compressors are charged to it now); the verify over the whole prompt (546 chunk-layers) reports no mismatch; decode unchanged; the greedy text unchanged. The stage split further
+(`attnprof` proj= / cbatch= / comp=): the batched passes of both
+compressors 0.26 s, the per-item commits 0.1 s, and 2.2 s in the chunk's
+four projection calls (the attention compressor's wkv and wgate, the
+indexer's), each uploading the same 2 MB of inputs and syncing. They are
+now one multi call (the decode's four-way call, batched: one upload, four
+GEMMs of the same kernel, four downloads, one sync); a refusal leaves each
+pair to its own call. The qa stage's fp8 activation qdq of the chunk's
+inputs (128 x 4096, serial on the CPU) fed only the CPU and Vulkan
+fallbacks of wq_a and wkv (the device path takes the raw inputs): it is
+computed lazily now, across threads, the first time a fallback needs it. Measured (3.3k prompt, 36 tokens): the projection calls 2.2 -> 1.6 s, the qa stage 2.6 -> 1.5 s (profiled); time to first token 42.8 -> 42.2 s unprofiled (the profiled run 52.8 -> 51.3 s); the greedy text unchanged.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
