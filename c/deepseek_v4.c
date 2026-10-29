@@ -3325,7 +3325,7 @@ int coli_v4_attention_window_batch_ref(
         return set_error(error, error_size, "out of memory in batched attention");
 
     double prof_t = v4_attn_prof_enabled() ? v4_attn_prof_now() : 0.0;
-    double prof_sync = 0, prof_chain = 0, prof_adv = 0, prof_proj = 0, prof_cbatch = 0;
+    double prof_sync = 0, prof_chain = 0, prof_adv = 0, prof_proj = 0, prof_cbatch = 0, prof_idxloop = 0;
     double prof_qa = 0, prof_comp = 0, prof_idx = 0, prof_qb = 0,
            prof_kv = 0, prof_rope = 0, prof_attn = 0, prof_wo = 0;
 #define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
@@ -3585,7 +3585,7 @@ int coli_v4_attention_window_batch_ref(
             } else if (!result) {
                 selected_counts[item] = state->compressed_count;
             }
-            V4_ATTN_PROF_MARK(prof_idx);
+            V4_ATTN_PROF_MARK(prof_idxloop);
         }
     }
     if (comp_check) {
@@ -3954,12 +3954,12 @@ int coli_v4_attention_window_batch_ref(
     if (prof_t)
         fprintf(stderr, "attnprof layer=%d start=%d n=%d qa=%.0f comp=%.0f "
                 "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms "
-                "(sync=%.1f chain=%.1f adv=%.1f proj=%.1f cbatch=%.1f)\n",
+                "(sync=%.1f chain=%.1f adv=%.1f proj=%.1f cbatch=%.1f idxloop=%.2f)\n",
                 weights->plan.layer, start_position, batch, prof_qa * 1e3,
                 prof_comp * 1e3, prof_idx * 1e3, prof_qb * 1e3, prof_kv * 1e3,
                 prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3,
                 prof_sync * 1e3, prof_chain * 1e3, prof_adv * 1e3,
-                prof_proj * 1e3, prof_cbatch * 1e3);
+                prof_proj * 1e3, prof_cbatch * 1e3, prof_idxloop * 1e3);
 #undef V4_ATTN_PROF_MARK
 
     free(inputs_act_scales); free(inputs_act);
@@ -4843,6 +4843,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (!state || !indices || index_capacity < 1 || !query_ranks || !inputs ||
         start_position < 0 || batch < 1 || !counts || !selected)
         return set_error(error, error_size, "invalid indexer batch arguments");
+    struct timespec ts_entry;
+    clock_gettime(CLOCK_MONOTONIC, &ts_entry);
     const ColiDeepSeekV4Config *config = state->config;
     int dimension = config->index_head_dim, heads = config->index_n_heads;
     int topk = config->index_topk;
@@ -4878,7 +4880,11 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     struct timespec ts_prev, ts_now;
     double t_proj = 0, t_prep = 0, t_score = 0, t_sort = 0;
 #define IDX_PROF_MARK(acc) do { if (prof) {         clock_gettime(CLOCK_MONOTONIC, &ts_now);         acc += (ts_now.tv_sec - ts_prev.tv_sec) +                (ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9;         ts_prev = ts_now; } } while (0)
-    if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
+    double t_pre = 0;
+    if (prof) {
+        clock_gettime(CLOCK_MONOTONIC, &ts_prev);
+        t_pre = (ts_prev.tv_sec - ts_entry.tv_sec) + (ts_prev.tv_nsec - ts_entry.tv_nsec) * 1e-9;
+    }
     ColiTensorView wq;
     if (fp8_view(&wq, state->weights, "attn.indexer.wq_b")) {
         __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
@@ -5212,8 +5218,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     IDX_PROF_MARK(t_sort);
     if (prof)
         fprintf(stderr, "idxprof layer=%d start=%d scored=%d cand=%d "
-                "proj=%.0f prep=%.0f score=%.0f sort=%.0f ms%s\n",
-                state->layer, start_position, need, max_count, t_proj * 1e3,
+                "pre=%.2f proj=%.0f prep=%.0f score=%.0f sort=%.0f ms%s\n",
+                state->layer, start_position, need, max_count, t_pre * 1e3, t_proj * 1e3,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 fused ? " (fused)" : gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK

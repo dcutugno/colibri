@@ -1421,6 +1421,36 @@ __global__ void fp8_ref_matmul_rows8_xt_kernel(float*y,const uint8_t*w,const flo
     }
     y[(long long)t*rows+o]=sum;
 }
+/* DSV4_IDX_TILE (1): the packed replica a tile (8 rows) per block: one
+ * 8-byte load per column gives the tile's weight bytes, the activation
+ * load is shared by the 8 rows' sums. Each (row, token) sum in its order. */
+__global__ void fp8_ref_matmul_rows8_tile_kernel(float*y,const uint8_t*w,const float*bscale,
+        const float*x_t,int rows,int cols,int tokens){
+    int t=threadIdx.x;long long tile=blockIdx.x;
+    if(t>=tokens||tile*8>=rows)return;
+    const float*xs=x_t+t;
+    int nblk=cols/128;
+    const float*scl=bscale+(long long)((tile*8)/128)*nblk;
+    const unsigned long long*wt=(const unsigned long long*)(w+tile*cols*8);
+    float sum[8];
+    #pragma unroll
+    for(int r=0;r<8;r++)sum[r]=0.f;
+    for(int base=0;base<cols;base+=128){
+        float sc=scl[base/128];
+        for(int i=base;i<base+128;i++){
+            unsigned long long w8=wt[i];
+            float xv=xs[(long long)i*tokens];
+            #pragma unroll
+            for(int r=0;r<8;r++){
+                float v=e4m3_dev((uint8_t)(w8>>(8*r)));
+                sum[r]=__fadd_rn(sum[r],__fmul_rn(__fmul_rn(xv,v),sc));
+            }
+        }
+    }
+    #pragma unroll
+    for(int r=0;r<8;r++)y[(long long)t*rows+tile*8+r]=sum[r];
+}
+static int idx_tile_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_IDX_TILE");on=!(e&&*e=='0');}return on;}
 /* the replica over x [tokens][cols] on the stream: transposed into x_t when
  * DSV4_IDX_COAL (and the scratch) allows, the row-major kernels otherwise */
 static int fp8_ref_matmul_launch(Dev*c,float*y,const uint8_t*w,const float*bscale,const float*x,float*x_t,
@@ -1428,7 +1458,9 @@ static int fp8_ref_matmul_launch(Dev*c,float*y,const uint8_t*w,const float*bscal
     int threads=tokens<32?32:((tokens+31)/32)*32;
     if(x_t){
         transpose_f32(x_t,x,tokens,cols,tokens,c->stream);
-        if(packed_rows8)
+        if(packed_rows8&&idx_tile_on()&&rows%8==0)
+            fp8_ref_matmul_rows8_tile_kernel<<<rows/8,threads,0,c->stream>>>(y,w,bscale,x_t,rows,cols,tokens);
+        else if(packed_rows8)
             fp8_ref_matmul_rows8_xt_kernel<<<rows,threads,0,c->stream>>>(y,w,bscale,x_t,rows,cols,tokens);
         else
             fp8_ref_matmul_xt_kernel<<<rows,threads,0,c->stream>>>(y,w,bscale,x_t,rows,cols,tokens);

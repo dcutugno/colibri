@@ -734,6 +734,19 @@ inputs (128 x 4096, serial on the CPU) fed only the CPU and Vulkan
 fallbacks of wq_a and wkv (the device path takes the raw inputs): it is
 computed lazily now, across threads, the first time a fallback needs it. Measured (3.3k prompt, 36 tokens): the projection calls 2.2 -> 1.6 s, the qa stage 2.6 -> 1.5 s (profiled); time to first token 42.8 -> 42.2 s unprofiled (the profiled run 52.8 -> 51.3 s); the greedy text unchanged.
 
+Fourteenth measurement (2026-10-29): the indexer stage's 6.2 s against the
+select call's own clocks (3.3 s): the difference is the profile's stderr
+lines, which the bench's redirect sends through a pipe to PowerShell at
+milliseconds per line; profiled runs are ~10 s slower than unprofiled ones
+for that reason, and a stage's figure counts the lines printed inside it.
+Judge by the unprofiled time to first token. Inside the fused call the
+projection replica was 1.2 s: a block per output row re-read the whole
+transposed activation block (512 KB) for its row. `DSV4_IDX_TILE` (1): a
+packed tile (8 rows) per block, one 8-byte load per column for the tile's
+weight bytes, the activation load shared by the 8 rows' sums (the
+transposed block read 1024 times instead of 8192); each (row, token) sum
+in its order: bitwise. Measured (3.3k prompt, 36 tokens): the projection kernel 1.21 -> 0.95 s; time to first token 42.25 -> 41.9 s; the greedy text unchanged. The fused call's remainder: its host side ~1.5 s (the quantization and gather across threads, the 3 MB copy into the pinned staging, the upload, the sync), the scoring kernel 0.32 s.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -885,6 +898,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DECODE_GPU_PROJ` (1) | decode: the compressor's and the indexer-compressor's wkv/wgate projections on the card (the prefill kernel with a batch of one; needs the `COLI_CUDA_ATTN_BATCH=1` mirrors); `0` = the CPU loops. 3.3k context: attention 127 -> 111 ms/token. On an indexer layer the four projections share one round trip (`dsv4_cuda_matmul_bf16_multi`: indexer-advance 4 -> 2 ms/token) |
 | `V4_IDX_FUSED` (1) | the indexer selection as one device round trip (decode and prefill chunks): the layer's `wq_b` bytes + f32 block scales in the CPU reference layout and its bf16 head-weight rows resident on the card (uploaded with the attention mirrors, 8 MB per indexer layer), the compressed keys appended as the host produces them, and projection -> query prep (bf16 round, RoPE, hadamard, fp4 round trip) -> head weights -> scoring in four launches; the sort stays on the host. Bitwise the CPU path: `DSV4_IDX_VERIFY=1` compares the prepared queries, head weights and scores (651 of 651 selections identical on the reference box, prefill chunks and decode tokens). 3.3k context: attention 111 -> 72 ms/token, decode 19.40 -> 18.20 s / 36 tokens, text unchanged. `0` = the projection replica + scoring kernel with their per-call uploads (8 MB of weights per indexer layer per token) |
 | `DSV4_IDX_ROPE_FMA` (1), `DSV4_IDX_HW_FMA` (1) | which products the fused prep fuses, matching the GCC build of the reference (read off the binary: the RoPE's cosine products — `vfmaddsub` — and the head-weight accumulate are FMAs, nothing else). For a build with another contraction pattern (`DSV4_IDX_VERIFY` would report mismatches): `0` = none fused, ROPE `2` = the sine products instead |
+| `DSV4_IDX_TILE` (1, `.cu`) | the fused indexer's packed projection replica a tile of 8 rows per block (the activation loads shared by the tile's sums; bitwise); `0` = a row per block |
 | `DSV4_IDX_COAL` (1, `.cu`) | the fused indexer's projection replica and scoring kernel over transposed copies of the activations and the resident keys (coalesced loads, the same per-thread arithmetic); `0` = the row-major kernels. 3.3k prefill: projection 4.9 -> 1.2 s, scoring 1.2 -> 0.3 s |
 | `V4_COMP_EMIT_PAR` (100000) | the column count from which the compressor's pool-and-emit forks an OpenMP region; below it the loop runs serially (the indexer's 128 and the attention's 512 columns: ~1.5 s less per 3.3k prefill, bitwise) |
 | `DSV4_IDX_KPROF` (0, `.cu`) | per-call device time of the fused selection's stages (`idxkprof`); 0.16 + 0.01 + 0.10 + 0.09 + 0.02 ms per indexer layer at one token / 820 candidates |
