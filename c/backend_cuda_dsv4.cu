@@ -46,6 +46,7 @@
 #define COLI_DSV4_TC 1
 #endif
 struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; void *block,*block2; long long blockpad; /* block mirror: the owner's weight-run and scale-run allocations (dsv4_cuda_mirror_alloc) */ };
+static bool run_fp8_attn(const Dsv4CudaTensor*t,const float*x,float*y,int groups,cudaStream_t st);   /* below, by mv_fp8_dec */
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
 struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin;int *compressed_len;int device,window,dim,max_tokens,max_compressed,rope_pairs; };
@@ -1619,8 +1620,9 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
         if(!ok(cudaMemcpyAsync((void*)dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"decode chain qa upload")||
            !ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
            !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))return 0;
+        if(!run_fp8_attn(wqb,dqa,c->p2,1,c->stream)){
         if(wqb->fmt==9)run_mv<9>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);
-        else run_mv<8>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);
+        else run_mv<8>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);}
         if(!ok(cudaGetLastError(),"decode chain wq_b launch"))return 0;
         bf16_round_ref_kernel<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p2,heads*dim);
         head_rmsnorm_ref_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
@@ -1653,15 +1655,17 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
     attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
     if(kprof)cudaEventRecord(ev[1],c->stream);
+    if(!run_fp8_attn(wa,c->p4,c->dy,groups,c->stream)){
     if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->p4,c->dy,wa->O,wa->I,groups,c->stream);
-    else run_mv<8>((uint8_t*)wa->w,wa->scale,c->p4,c->dy,wa->O,wa->I,groups,c->stream);
+    else run_mv<8>((uint8_t*)wa->w,wa->scale,c->p4,c->dy,wa->O,wa->I,groups,c->stream);}
     if(!ok(cudaGetLastError(),"decode chain wo_a launch"))return 0;
     if(kprof)cudaEventRecord(ev[2],c->stream);
     bf16_round_ref_kernel<<<(wa->O+255)/256,256,0,c->stream>>>(c->dy,wa->O);
     if(oa_out&&!ok(cudaMemcpyAsync(oa_out,c->dy,ob,cudaMemcpyDeviceToHost,c->stream),"decode chain oa download"))return 0;
     if(kprof)cudaEventRecord(ev[3],c->stream);
+    if(!run_fp8_attn(wb,c->dy,c->dx,1,c->stream)){
     if(wb->fmt==9)run_mv<9>((uint8_t*)wb->w,wb->scale,c->dy,c->dx,wb->O,wb->I,1,c->stream);
-    else run_mv<8>((uint8_t*)wb->w,wb->scale,c->dy,c->dx,wb->O,wb->I,1,c->stream);
+    else run_mv<8>((uint8_t*)wb->w,wb->scale,c->dy,c->dx,wb->O,wb->I,1,c->stream);}
     if(!ok(cudaGetLastError(),"decode chain wo_b launch"))return 0;
     bf16_round_ref_kernel<<<(wb->O+255)/256,256,0,c->stream>>>(c->dx,wb->O);
     if(kprof)cudaEventRecord(ev[4],c->stream);
@@ -2535,8 +2539,12 @@ template<int RW> __global__ void __launch_bounds__(256) mv_fp4_dec(const MvDesc*
         for(int off=16;off;off>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,off);
         if(!lane)d.y[o]=sum;}
 }
-template<int RW> __global__ void __launch_bounds__(256) mv_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I){
+/* RND: fmt 9, the dequantized weight bf16-rounded per element before the
+ * product (as mv<9>); blockIdx.y: the group (the matrix as `groups`
+ * independent blocks of O rows, each over its own I-slice of x). */
+template<int RW,int RND> __global__ void __launch_bounds__(256) mv_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I){
     extern __shared__ float xs[];
+    int grp=blockIdx.y;w+=(size_t)grp*O*I;sc+=(size_t)(grp*O/128)*((I+127)/128);x+=(size_t)grp*I;y+=(size_t)grp*O;
     for(int e=threadIdx.x;e<I;e+=blockDim.x)xs[e+(e>>4)]=x[e];
     __syncthreads();
     int warp=threadIdx.x>>5,lane=threadIdx.x&31,chunks=I>>4,sb=(I+127)/128;
@@ -2549,8 +2557,9 @@ template<int RW> __global__ void __launch_bounds__(256) mv_fp8_dec(const uint8_t
             #pragma unroll
             for(int k=0;k<4;k++){uint32_t b=ws[k];
                 #pragma unroll
-                for(int n=0;n<4;n++)part+=xp[k*4+n]*e4m3_bits((b>>(8*n))&255u);}
-            sum+=part*s;}
+                for(int n=0;n<4;n++){float wv=e4m3_bits((b>>(8*n))&255u);
+                    if constexpr(RND)part+=xp[k*4+n]*__bfloat162float(__float2bfloat16(wv*s));else part+=xp[k*4+n]*wv;}}
+            if constexpr(RND)sum+=part;else sum+=part*s;}
         #pragma unroll
         for(int off=16;off;off>>=1)sum+=__shfl_xor_sync(0xffffffffu,sum,off);
         if(!lane)y[o]=sum;}
@@ -2562,7 +2571,18 @@ static int mv_dec_on(void){if(g_mv_dec<0){const char*e=getenv("DSV4_MOE_MV");g_m
 static void run_fp4_dec(const MvDesc*desc,int count,int O,int I,cudaStream_t st){
     mv_fp4_dec<4><<<dim3((O+31)/32,count),256,(size_t)(I+(I>>5))*sizeof(float),st>>>(desc,count,O,I);}
 static void run_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,cudaStream_t st){
-    mv_fp8_dec<4><<<(O+31)/32,256,(size_t)(I+(I>>4))*sizeof(float),st>>>(w,sc,x,y,O,I);}
+    mv_fp8_dec<4,0><<<(O+31)/32,256,(size_t)(I+(I>>4))*sizeof(float),st>>>(w,sc,x,y,O,I);}
+/* DSV4_ATTN_MV (1): the decode attention chain's fp8 matvecs on the shaped
+ * kernel; a matrix it cannot take (I not a multiple of 16, the x slice past
+ * the shared-memory budget, O not a multiple of 128 per group) keeps mv. */
+static int attn_mv_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_ATTN_MV");on=!e||!*e||*e!='0';}return on;}
+static bool run_fp8_attn(const Dsv4CudaTensor*t,const float*x,float*y,int groups,cudaStream_t st){
+    int Og=t->O/groups,I=t->I;size_t sm=(size_t)(I+(I>>4))*sizeof(float);
+    if(!attn_mv_on()||groups<1||t->O%groups||I%16||Og%128||sm>48*1024)return false;
+    dim3 grid((Og+31)/32,groups);
+    if(t->fmt==9)mv_fp8_dec<4,1><<<grid,256,sm,st>>>((const uint8_t*)t->w,t->scale,x,y,Og,I);
+    else mv_fp8_dec<4,0><<<grid,256,sm,st>>>((const uint8_t*)t->w,t->scale,x,y,Og,I);
+    return true;}
 static int group_stage(Dev*c,size_t xb){
     if(c->grp_pinned<0)return 0;
     if(c->grp_pinned>0)return xb<=c->grp_hcap;

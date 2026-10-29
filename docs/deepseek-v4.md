@@ -600,6 +600,17 @@ line: `v4_gpu pieces: reserved= mirrored= abandoned= copies= enqueue=`.
    mirror back and compares it with the slab.
    Measured (3.3k context, `--ram 16`): 36 tokens, one card MoE 287 -> 232 ms/token (`loads` 175 -> 175, `compute` 83 -> 30: the fence wait is gone and the reads did not slow down; 2 pieces 237, 8 pieces slower), two cards 270 -> 215. Steady state (last 100 of 300 tokens): one card 329 -> 285 ms/token (`compute` 84 -> 34), two cards 306 -> 260 (second card 651 mirrors, 43 ms of its group under the loads). The lane's enqueue costs 0.09 ms per expert. The 36- and 300-token one-card texts are unchanged; the two-card 300-token text differs because the experts now split between the cards in a different order (the same class of difference the split already had).
 
+Sixth measurement (2026-10-29): `DSV4_ATTN_MV` (1): the decode attention
+chain's three fp8 matvecs (wq_b, the grouped wo_a, wo_b: 32 MB each) on
+the bandwidth-shaped `mv_fp8_dec` (a warp per row, 16-byte loads, the
+activation in padded shared memory; it gained a group dimension and the
+fmt-9 per-element rounding) instead of the byte-per-lane `mv` kernel
+(`DSV4_WO_KPROF`: wo_a and wo_b 0.137 → 0.05 ms each, 245 → 650 GB/s on
+the 5080). Not bitwise the old kernel (a different order of summation:
+`DSV4_WO_VERIFY=1` shows a handful of 1-ulp elements per layer), so the
+greedy text can differ at near ties; `DSV4_ATTN_MV=0` restores the exact
+text at the old speed. Measured (3.3k context, `--ram 16`): attention 55 -> 43 ms/token (`sattn` 33 -> 20); steady state (last 100 of 300 tokens) one card 285 -> 265 ms/token, two cards 260 -> 248.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -722,6 +733,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
+| `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the byte-per-lane kernel, bitwise the reference (slower by ~0.27 ms per layer) |
 | `V4_UPLOAD_PIECES` (4) | decode: a lane's expert read lands in this many pieces, all in flight at once, each copied to a mirror reserved before the read as it lands (the link works under the read); the slab is page-locked before the read. `0`/`1` = one read, the uploader thread copies after it. Needs `V4_MIRROR_BLOCK`, `V4_UPLOAD_FENCE` and the DLL's `dsv4_cuda_mirror_copy`/`_point`/`_host_pin`. `V4_PIECES_VERIFY=1` compares each piece-built mirror with its slab, `=8` compares each slab with a buffered re-read (diagnostics) |
 | `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
 | `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
