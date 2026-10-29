@@ -959,68 +959,111 @@ __device__ __forceinline__ const float*cached_row(const float*win,const float*ch
  * a block reduction. IDX: rows past the window come from the indexer's
  * selection. Measured before: 0.39 ms per 640-row layer, one thread's
  * serial softmax and a dependent index load before each row load. */
-template<int IDX> __global__ void __launch_bounds__(512) sparse_attn_cached_v2(float*out,const float*q,const float*win,
+template<int IDX,int HPB> __global__ void __launch_bounds__(512) sparse_attn_cached_v2(float*out,const float*q,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,
         int selstride,int abs_base,int chunk_start,int window,int heads,int dim,float scale){
-    int t=blockIdx.y,h=blockIdx.x;
+    int t=blockIdx.y,h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
     int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
     const int*ts=IDX?sel+(long long)t*selstride:nullptr;
-    const float*qh=q+((long long)t*heads+h)*dim;
-    extern __shared__ float score[];
-    __shared__ float red[32];
-    __shared__ float den;
+    const float*qh[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++)qh[k]=q+((long long)t*heads+h0+(k<nh?k:0))*dim;
+    extern __shared__ float score[];   /* [HPB][total] */
+    __shared__ float red[HPB][32];
+    __shared__ float den[HPB];
     int warp=threadIdx.x>>5,lane=threadIdx.x&31,nw=blockDim.x>>5;
     for(int item=warp*4;item<total;item+=nw*4){
         int nr=total-item;if(nr>4)nr=4;
         const float*v[4];
         #pragma unroll
-        for(int k=0;k<4;k++){int it=item+(k<nr?k:0);
-            v[k]=it<wn?cached_row(win,chunk,abs_base+wo+it,chunk_start,window,dim)
+        for(int r=0;r<4;r++){int it=item+(r<nr?r:0);
+            v[r]=it<wn?cached_row(win,chunk,abs_base+wo+it,chunk_start,window,dim)
                       :comp+(long long)(IDX?ts[it-wn]:(it-wn))*dim;}
-        float z[4]={0.f,0.f,0.f,0.f};
-        for(int d=lane;d<dim;d+=32){float qd=qh[d];
-            #pragma unroll
-            for(int k=0;k<4;k++)if(k<nr)z[k]+=qd*v[k][d];}
+        float z[HPB][4];
         #pragma unroll
-        for(int k=0;k<4;k++){float zz=z[k];
-            for(int n=16;n;n>>=1)zz+=__shfl_down_sync(0xffffffff,zz,n);
-            if(!lane&&k<nr)score[item+k]=zz*scale;}
+        for(int k=0;k<HPB;k++){
+            #pragma unroll
+            for(int r=0;r<4;r++)z[k][r]=0.f;}
+        for(int d=lane;d<dim;d+=32){float vd[4];
+            #pragma unroll
+            for(int r=0;r<4;r++)vd[r]=r<nr?v[r][d]:0.f;
+            #pragma unroll
+            for(int k=0;k<HPB;k++){float qd=qh[k][d];
+                #pragma unroll
+                for(int r=0;r<4;r++)if(r<nr)z[k][r]+=qd*vd[r];}}
+        #pragma unroll
+        for(int k=0;k<HPB;k++){
+            #pragma unroll
+            for(int r=0;r<4;r++){float zz=z[k][r];
+                for(int n=16;n;n>>=1)zz+=__shfl_down_sync(0xffffffff,zz,n);
+                if(!lane&&r<nr&&k<nh)score[k*total+item+r]=zz*scale;}}
     }
     __syncthreads();
-    float lm=-INFINITY;
-    for(int i=threadIdx.x;i<total;i+=blockDim.x)lm=fmaxf(lm,score[i]);
-    for(int n=16;n;n>>=1)lm=fmaxf(lm,__shfl_xor_sync(0xffffffff,lm,n));
-    if(!lane)red[warp]=lm;
+    float m[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++){float lm=-INFINITY;
+        if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)lm=fmaxf(lm,score[k*total+i]);
+        for(int n=16;n;n>>=1)lm=fmaxf(lm,__shfl_xor_sync(0xffffffff,lm,n));
+        if(!lane)red[k][warp]=lm;}
     __syncthreads();
-    float m=red[0];for(int w=1;w<nw;w++)m=fmaxf(m,red[w]);
-    for(int i=threadIdx.x;i<total;i+=blockDim.x)score[i]=expf(score[i]-m);
+    #pragma unroll
+    for(int k=0;k<HPB;k++){float mm=red[k][0];for(int w=1;w<nw;w++)mm=fmaxf(mm,red[k][w]);m[k]=mm;}
+    #pragma unroll
+    for(int k=0;k<HPB;k++)if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)score[k*total+i]=expf(score[k*total+i]-m[k]);
     __syncthreads();
-    if(!threadIdx.x){float d0=expf(sink[h]-m);for(int i=0;i<total;i++)d0+=score[i];den=d0;}
+    if(threadIdx.x<HPB){int k=threadIdx.x;if(k<nh){float d0=expf(sink[h0+k]-m[k]);const float*sc=score+k*total;for(int i=0;i<total;i++)d0+=sc[i];den[k]=d0;}}
     __syncthreads();
-    for(int i=threadIdx.x;i<total;i+=blockDim.x)score[i]=__bfloat162float(__float2bfloat16(score[i]));
+    #pragma unroll
+    for(int k=0;k<HPB;k++)if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)score[k*total+i]=__bfloat162float(__float2bfloat16(score[k*total+i]));
     __syncthreads();
-    float dn=den;
+    float dn[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++)dn[k]=den[k];
     for(int d=threadIdx.x;d<dim;d+=blockDim.x){
-        float sum=0.f;int i=0;
+        float sum[HPB];
+        #pragma unroll
+        for(int k=0;k<HPB;k++)sum[k]=0.f;
+        int i=0;
         for(;i+16<=wn;i+=16){float v[16];
             #pragma unroll
-            for(int k=0;k<16;k++)v[k]=cached_row(win,chunk,abs_base+wo+i+k,chunk_start,window,dim)[d];
+            for(int j=0;j<16;j++)v[j]=cached_row(win,chunk,abs_base+wo+i+j,chunk_start,window,dim)[d];
             #pragma unroll
-            for(int k=0;k<16;k++)sum+=score[i+k]*v[k];}
-        for(;i<wn;i++)sum+=score[i]*cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+            for(int k=0;k<HPB;k++){
+                #pragma unroll
+                for(int j=0;j<16;j++)sum[k]+=score[k*total+i+j]*v[j];}}
+        for(;i<wn;i++){float vv=cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++)sum[k]+=score[k*total+i]*vv;}
         i=0;
         for(;i+16<=cn;i+=16){int ix[16];float v[16];
             #pragma unroll
-            for(int k=0;k<16;k++)ix[k]=IDX?ts[i+k]:i+k;
+            for(int j=0;j<16;j++)ix[j]=IDX?ts[i+j]:i+j;
             #pragma unroll
-            for(int k=0;k<16;k++)v[k]=comp[(long long)ix[k]*dim+d];
+            for(int j=0;j<16;j++)v[j]=comp[(long long)ix[j]*dim+d];
             #pragma unroll
-            for(int k=0;k<16;k++)sum+=score[wn+i+k]*v[k];}
-        for(;i<cn;i++){int ix=IDX?ts[i]:i;sum+=score[wn+i]*comp[(long long)ix*dim+d];}
-        out[((long long)t*heads+h)*dim+d]=__bfloat162float(__float2bfloat16(sum/dn));
+            for(int k=0;k<HPB;k++){
+                #pragma unroll
+                for(int j=0;j<16;j++)sum[k]+=score[k*total+wn+i+j]*v[j];}}
+        for(;i<cn;i++){int ix=IDX?ts[i]:i;float vv=comp[(long long)ix*dim+d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++)sum[k]+=score[k*total+wn+i]*vv;}
+        #pragma unroll
+        for(int k=0;k<HPB;k++)if(k<nh)out[((long long)t*heads+h0+k)*dim+d]=__bfloat162float(__float2bfloat16(sum[k]/dn[k]));
     }
 }
 static int sattn_v2_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_SATTN_V2");on=!e||!*e||*e!='0';}return on;}
+/* DSV4_SATTN_HPB (4): heads per block; sm1 = the one-head score row bytes
+ * (max_total * 4). Four heads when their score rows fit the 48 KB default,
+ * else one. */
+static int sattn_hpb(void){static int n=-1;if(n<0){const char*e=getenv("DSV4_SATTN_HPB");n=e&&*e?atoi(e):4;if(n!=4)n=1;}return n;}
+template<int IDX> static void launch_sattn_v2(int heads,int tokens,size_t sm1,cudaStream_t st,float*out,const float*q,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int selstride,int abs_base,
+        int chunk_start,int window,int dim,float scale){
+    if(sattn_hpb()==4&&sm1>=1024&&sm1*4<=48*1024)   /* four heads from 256 rows up: fewer blocks under-fill the card on short layers */
+        sparse_attn_cached_v2<IDX,4><<<dim3((heads+3)/4,tokens),512,sm1*4,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
+    else
+        sparse_attn_cached_v2<IDX,1><<<dim3(heads,tokens),512,sm1,st>>>(out,q,win,chunk,comp,sink,meta,sel,selstride,abs_base,chunk_start,window,heads,dim,scale);
+}
 
 __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,int abs_base,
@@ -1077,9 +1120,9 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const flo
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached attention chunk upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached attention meta upload"))return 0;
-    if(sattn_v2_on())sparse_attn_cached_v2<0><<<dim3(heads,tokens),512,sm,c->stream>>>(
+    if(sattn_v2_on())launch_sattn_v2<0>(heads,tokens,sm,c->stream,
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
-        abs_base,chunk_start,window,heads,dim,scale);
+        abs_base,chunk_start,window,dim,scale);
     else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
         abs_base,chunk_start,window,heads,dim,scale);
@@ -1155,9 +1198,9 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached idx attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached idx attention meta upload")||
        !ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"cached idx attention index upload"))return 0;
-    if(sattn_v2_on())sparse_attn_cached_v2<1><<<dim3(heads,tokens),512,sm,c->stream>>>(
+    if(sattn_v2_on())launch_sattn_v2<1>(heads,tokens,sm,c->stream,
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
-        selstride,abs_base,chunk_start,window,heads,dim,scale);
+        selstride,abs_base,chunk_start,window,dim,scale);
     else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
         selstride,abs_base,chunk_start,window,heads,dim,scale);
@@ -1725,17 +1768,17 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
               !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))))return 0;
     if(kprof)cudaEventRecord(ex[2],c->stream);
     if(sel&&sattn_v2_on())
-        sparse_attn_cached_v2<1><<<dim3(heads,1),512,sm,c->stream>>>(
+        launch_sattn_v2<1>(heads,1,sm,c->stream,
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
-            cn,abs_base,chunk_start,window,heads,dim,scale);
+            cn,abs_base,chunk_start,window,dim,scale);
     else if(sel)
         sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
             cn,abs_base,chunk_start,window,heads,dim,scale);
     else if(sattn_v2_on())
-        sparse_attn_cached_v2<0><<<dim3(heads,1),512,sm,c->stream>>>(
+        launch_sattn_v2<0>(heads,1,sm,c->stream,
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
-            abs_base,chunk_start,window,heads,dim,scale);
+            abs_base,chunk_start,window,dim,scale);
     else
         sparse_attn_batch_cached_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,

@@ -625,6 +625,17 @@ uploads and this kernel) showed 0.39 ms per 640-row indexer layer and
 0.10 per 153-row layer for ~40 MFLOP. Bitwise the old kernel (the greedy
 text is unchanged). Measured (3.3k context, `--ram 16`): attention 43 -> 37 ms/token; steady state (last 100 of 300 tokens) one card 265 -> 260 ms/token, two cards 248 -> 244.
 
+   Eighth measurement (2026-10-29): `DSV4_SATTN_HPB` (4): from 256 rows up
+   a block serves four heads, loading each row once for their four dot
+   products and four weighted sums (the rows are the one latent KV per
+   position, shared by every head; each head's arithmetic keeps its
+   order, so still bitwise). The 640-row layers were at the card's DRAM
+   limit — 64 one-head blocks re-reading the same rows twice, 168 MB in
+   0.20 ms: now 0.125 ms. Shorter layers keep one head per block (fewer
+   blocks under-fill the card), as does any shape whose four score rows
+   would pass 48 KB of shared memory. The batched prefill shares the
+   kernel: time to first token 62.4 -> 60.9 s at 3.3k context; decode attention 37 -> 36 ms/token, steady state one card 260 -> 259 ms/token, two cards 244 (unchanged).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -747,6 +758,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
+| `DSV4_SATTN_HPB` (4) | heads per block of the shaped sparse attention from 256 rows up (`1` = one head per block, the rows read once per head) |
 | `DSV4_SATTN_V2` (1) | the cached sparse attention kernel shaped for latency (same arithmetic, same order, bitwise); `0` = the old kernel |
 | `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the byte-per-lane kernel, bitwise the reference (slower by ~0.27 ms per layer) |
 | `V4_UPLOAD_PIECES` (4) | decode: a lane's expert read lands in this many pieces, all in flight at once, each copied to a mirror reserved before the read as it lands (the link works under the read); the slab is page-locked before the read. `0`/`1` = one read, the uploader thread copies after it. Needs `V4_MIRROR_BLOCK`, `V4_UPLOAD_FENCE` and the DLL's `dsv4_cuda_mirror_copy`/`_point`/`_host_pin`. `V4_PIECES_VERIFY=1` compares each piece-built mirror with its slab, `=8` compares each slab with a buffered re-read (diagnostics) |
