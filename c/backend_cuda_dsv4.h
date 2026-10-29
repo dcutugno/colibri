@@ -115,6 +115,8 @@ int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g,Dsv4CudaTensor *u,Dsv4CudaTensor *
 /* chunked read -> upload pipeline: a piece of a block mirror's run (0 scales, 1 weights) at off, enqueued on the aux stream; mirror_point re-points the tensors once the record is in */
 int dsv4_cuda_mirror_copy(Dsv4CudaTensor *g,int run,long long off,const uint8_t *src,long long len);
 int dsv4_cuda_host_pin(const void *p,size_t len);   /* page-lock a slab before its first piece read */
+int dsv4_cuda_host_register(void *p,size_t len);     /* page-lock an engine range until unregistered: 1 done, 2 already, 0 refused */
+void dsv4_cuda_host_unregister(void *p);
 /* the batched prefill attention as one device chain (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo); 0 = refused */
 int dsv4_cuda_attn_prefill_chain(int device,int layer,const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,int norm_fma,const float *icos,const float *isin,int rope_dim,int rope_fma,const float *chunk,int chunk_start,const float *sinks,const int *meta,const int *sel,int selstride,int abs_base,int comp_limit,int heads,int dim,float scale,int tokens,Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out);
 int dsv4_cuda_mirror_point(Dsv4CudaTensor *g,Dsv4CudaTensor *u,Dsv4CudaTensor *d,long long S,const long long *soff,long long Wb,const long long *woff);

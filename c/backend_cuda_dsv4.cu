@@ -3323,6 +3323,17 @@ static bool host_pinned(const void*p,size_t len){
  * while the drive still writes into it left stale bytes behind — WDDM moves
  * the pages). 1 when pinned (or already), 0 when not. */
 extern "C" int dsv4_cuda_host_pin(const void*p,size_t len){return host_pinned(p,len)?1:0;}
+/* V4_HC_PIN: page-lock a range the engine owns for as long as it says (no
+ * registry: the engine unregisters before freeing or reusing it). 1 =
+ * registered now, 2 = was already (leave it), 0 = refused. */
+extern "C" int dsv4_cuda_host_register(void*p,size_t len){
+    if(!p||!len)return 0;
+    cudaError_t e=cudaHostRegister(p,len,cudaHostRegisterPortable);
+    if(e==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();return 2;}
+    if(e!=cudaSuccess){cudaGetLastError();return 0;}
+    return 1;
+}
+extern "C" void dsv4_cuda_host_unregister(void*p){if(p&&cudaHostUnregister(p)!=cudaSuccess)cudaGetLastError();}
 extern "C" int dsv4_cuda_stream_drain(int device){
     Dev*c=ctx(device);if(!c)return 0;
     if(!ok(cudaSetDevice(device),"select drain device"))return 0;

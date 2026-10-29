@@ -747,6 +747,17 @@ weight bytes, the activation load shared by the 8 rows' sums (the
 transposed block read 1024 times instead of 8192); each (row, token) sum
 in its order: bitwise. Measured (3.3k prompt, 36 tokens): the projection kernel 1.21 -> 0.95 s; time to first token 42.25 -> 41.9 s; the greedy text unchanged. The fused call's remainder: its host side ~1.5 s (the quantization and gather across threads, the 3 MB copy into the pinned staging, the upload, the sync), the scoring kernel 0.32 s.
 
+Fifteenth measurement (2026-10-29): the block's two 8 MB state copies per
+chunk-layer (hc1 up, hc3 down, 3.8 s per 3.3k prefill, pageable) once
+more. The earlier objections were about lifetime (the pin registry takes
+a whole allocation region the DLL cannot see freed) and a staging copy
+(slower than the driver's pipelined one). `V4_HC_PIN` (1): the prefill
+itself page-locks the prompt's range of its two state buffers for the
+duration of one prefill (`dsv4_cuda_host_register`, no registry, nothing
+in flight at either point) and releases them on every exit; the copies are
+then DMA at link speed. Prompts under `V4_HC_PIN_MIN` (256) tokens skip
+it. Same bytes: bitwise. Measured (3.3k prompt, 36 tokens): hc1 1.9 -> 1.3 s, hc3 1.8 -> 1.5 s (profiled; the register and release of 2 x 215 MB per prefill included); time to first token 41.9 -> 41.7 s unprofiled; the greedy text unchanged.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -871,6 +882,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
 | `V4_COMP_BATCH` (1) | a prefill chunk's compressor advances (the attention's and the indexer's) in one parallel pass from the batched projections, the serial emit's arithmetic per column (bitwise); `2` = verify against the per-token walk; `0` = the walk |
+| `V4_HC_PIN` (1) | the prefill page-locks the prompt's range of its state buffers for its duration (the block's 8 MB copies at link speed); `V4_HC_PIN_MIN` (256) the prompt length from which; `0` = pageable copies |
 | `V4_HC_FUSED` (1) | the prefill block's attention post + FFN pre/norm as one device pass, the states resident for the FFN post (16 MB per chunk-layer not copied); `0` = the two-step path with the states round trip |
 | `DSV4_SATTN_HPB_PF` (16) | heads per block for the multi-token (prefill chunk) launches of the cached sparse attention: 16, 8 or 4 (else the one-token rule); the key rows are shared across the heads of a token, the per-head arithmetic is unchanged (bitwise) |
 | `DSV4_PIN_STAGE` (1, `.cu`) | the prefill chain's inputs as one copy from a page-locked staging block and its output download into it; `0` = seven pageable copies and a pageable download |

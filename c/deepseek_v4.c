@@ -18004,6 +18004,13 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         int start, int batch, int use_prefill_pool,
                         ColiV4SessionAbortFn should_abort, void *abort_ctx,
                         char *error, size_t error_size);
+#ifdef COLI_V4_GPU_TIER
+extern int dsv4_cuda_host_register(void *p, size_t len);   /* backend_cuda_dsv4.h: V4_HC_PIN */
+extern void dsv4_cuda_host_unregister(void *p);
+#else
+static int dsv4_cuda_host_register(void *p, size_t len) { (void)p; (void)len; return 0; }
+static void dsv4_cuda_host_unregister(void *p) { (void)p; }
+#endif
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
@@ -18061,12 +18068,31 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
+    /* V4_HC_PIN: the prompt's range of both state buffers page-locked for
+     * this prefill (the block's 8 MB state copies per chunk-layer become
+     * DMA at link speed); released on every exit below */
+    void *pin_a = NULL, *pin_b = NULL;
+#ifdef COLI_V4_GPU_TIER
+    {
+        static int pin_on = -1, pin_min = 256;
+        if (pin_on < 0) {
+            const char *e = getenv("V4_HC_PIN"); pin_on = !(e && *e == '0');
+            const char *m = getenv("V4_HC_PIN_MIN"); if (m && *m) pin_min = atoi(m);
+        }
+        if (pin_on && batch >= pin_min && first_layer < config->num_hidden_layers) {
+            size_t bytes = (size_t)batch * hd * sizeof(float);
+            if (dsv4_cuda_host_register(state, bytes) == 1) pin_a = state;
+            if (dsv4_cuda_host_register(next, bytes) == 1) pin_b = next;
+        }
+    }
+#endif
     for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) {
             if (pool_experts)
                 coli_v4_expert_store_prefill_pool(experts, -1);
+            dsv4_cuda_host_unregister(pin_a); dsv4_cuda_host_unregister(pin_b);
             return -1;
         }
         /* A true prefill is layer-major: every prompt position crosses this
@@ -18118,6 +18144,7 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         if (result) {
             if (pool_experts)
                 coli_v4_expert_store_prefill_pool(experts, -1);
+            dsv4_cuda_host_unregister(pin_a); dsv4_cuda_host_unregister(pin_b);
             return -1;
         }
         float *swap = state; state = next; next = swap;
@@ -18126,6 +18153,7 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                          (int64_t)start + item);
     }
     if (pool_experts) coli_v4_expert_store_prefill_pool(experts, -1);
+    dsv4_cuda_host_unregister(pin_a); dsv4_cuda_host_unregister(pin_b);
     *state_ptr = state;
     *next_ptr = next;
     return 0;
