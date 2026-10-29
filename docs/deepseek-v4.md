@@ -775,7 +775,11 @@ route and compute in one device pass (`dsv4_cuda_route_moe_batch`, the
 ids fetched on the stream) when the bank holds every expert: 14 ms per
 chunk-layer against 4 ms for the router call, the host round trip for
 the ids and the second call (the device-ids variant of the grouped MoE
-builds its expert layout slowly); time to first token 40.6 -> 52.2 s.
+builds its expert layout slowly); time to first token 40.6 -> 52.2 s. Also tried and dropped: the chunk's
+bf16 projection GEMM (`mm_bf16_batch`) with four output rows per block
+sharing the activation loads (bitwise): the projection stage 1.55 ->
+1.61 s, no gain; that stage is its upload, four downloads and sync, not
+the kernel.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
