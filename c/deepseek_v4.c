@@ -7741,9 +7741,17 @@ int coli_v4_block_window_batch_ref(
         start_position, batch, error, error_size);
     V4_BLOCK_PROF_MARK(prof_attn);
     if (!result) phase = "attention post / FFN hyper-connection";
-    int gpu_hc2 = 0;
+    int gpu_hc2 = 0, states_resident = 0;
 #ifdef COLI_V4_GPU_TIER
+    /* V4_HC_FUSED: the post and the FFN pre + norm in one pass, the states
+     * kept on the card for the FFN post below */
     if (!result && batch > 1 &&
+        coli_v4_gpu_mhc_post_pre_norm_batch(weights, branches, inputs_hc,
+                                            posts, combs, ffn_post, ffn_comb,
+                                            ffn_normalized, states, hc, d,
+                                            batch) == 0)
+        gpu_hc2 = states_resident = 1;
+    else if (!result && batch > 1 &&
         coli_v4_gpu_mhc_post_batch(weights, states, branches, inputs_hc,
                                    posts, combs, hc, d, batch) == 0 &&
         coli_v4_gpu_mhc_pre_norm_batch(weights, "ffn", "ffn_norm",
@@ -7796,6 +7804,11 @@ int coli_v4_block_window_batch_ref(
         coli_v4_gpu_mhc_post_batch(weights, outputs_hc, ffn_branch, states,
                                    ffn_post, ffn_comb, hc, d, batch) == 0)
         gpu_hc3 = 1;
+#endif
+#ifdef COLI_V4_GPU_TIER
+    if (!gpu_hc3 && !result && states_resident &&
+        coli_v4_gpu_mhc_states_fetch(states, (long long)batch * hd))
+        result = -1;   /* the states stayed on the card and cannot come down */
 #endif
     if (!gpu_hc3)
     for (int item = 0; !result && item < batch; item++) {
@@ -15842,7 +15855,8 @@ static struct V4GpuMhcTag {
     const Dsv4CudaActivation *act;
     const float *host;
     long long elements;
-} v4_gpu_mhc_res_tag, v4_gpu_mhc_state_tag;
+} v4_gpu_mhc_res_tag, v4_gpu_mhc_state_tag,
+  v4_gpu_mhc_pending_tag;   /* V4_HC_FUSED: states on the device only, host copy not made */
 
 static int v4_gpu_mhc_tag_hit(const struct V4GpuMhcTag *tag,
                               const Dsv4CudaActivation *act,
@@ -15853,6 +15867,7 @@ static int v4_gpu_mhc_tag_hit(const struct V4GpuMhcTag *tag,
 static void v4_gpu_mhc_tags_clear(void) {
     v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){0};
     v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
+    v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
 }
 
 int coli_v4_gpu_mhc_pre_norm_batch(
@@ -15920,6 +15935,10 @@ int coli_v4_gpu_mhc_post_batch(
     Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
     Dsv4CudaActivation *x = v4_gpu_mhc_mirror(2, device, xh);
     Dsv4CudaActivation *out = v4_gpu_mhc_mirror(3, device, rh);
+    /* V4_HC_FUSED left the residual in slot 3: read it there, write slot 0 */
+    if (out && v4_gpu_mhc_tag_hit(&v4_gpu_mhc_res_tag, out, residual_hc, rh)) {
+        Dsv4CudaActivation *t = residual; residual = out; out = t;
+    }
     int res_resident =
         v4_gpu_mhc_tag_hit(&v4_gpu_mhc_res_tag, residual, residual_hc, rh);
     int state_resident =
@@ -15942,6 +15961,88 @@ int coli_v4_gpu_mhc_post_batch(
         dsv4_cuda_activation_download(outputs_hc, out, rh) &&
         dsv4_cuda_activation_sync(out);
     free(state_host);
+    return good ? 0 : -1;
+}
+
+/* V4_HC_FUSED (1): the attention post and the FFN pre + norm as one device
+ * pass. The post writes slot 3; the FFN pre reads it there as its residual
+ * and leaves the FFN posts/combs in slot 1 and the normalized FFN input in
+ * slot 2; only those come down. The states stay on the card (slot 3, tagged
+ * as `states` for the FFN post); coli_v4_gpu_mhc_states_fetch brings them
+ * down for a CPU fallback. Same device calls as the two-step path. */
+static int v4_hc_fused_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_HC_FUSED"); on = !(e && *e == '0'); }
+    return on;
+}
+int coli_v4_gpu_mhc_post_pre_norm_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const float *branch,
+    const float *residual_hc, const float *posts, const float *combs,
+    float *ffn_post, float *ffn_comb, float *ffn_normalized,
+    const float *states, int hc, int hidden, int batch) {
+    if (!v4_hc_fused_on() || !coli_v4_gpu_attn_batch_wanted() || !weights ||
+        !branch || !residual_hc || !posts || !combs || !ffn_post || !ffn_comb ||
+        !ffn_normalized || !states || hc != 4 || hidden != 4096 || batch < 1)
+        return -1;
+    Dsv4CudaTensor *fn = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "hc_ffn_fn");
+    Dsv4CudaTensor *scale = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "hc_ffn_scale");
+    Dsv4CudaTensor *base = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "hc_ffn_base");
+    Dsv4CudaTensor *norm = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn_norm");
+    if (!fn || !scale || !base || !norm) return -1;
+    int device = dsv4_cuda_tensor_device(fn);
+    if (device < 0) return -1;
+    long long rh = (long long)batch * hc * hidden;
+    long long sh = (long long)batch * (hc + hc * hc);
+    long long xh = (long long)batch * hidden;
+    Dsv4CudaActivation *residual = v4_gpu_mhc_mirror(0, device, rh);
+    Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
+    Dsv4CudaActivation *x = v4_gpu_mhc_mirror(2, device, xh);
+    Dsv4CudaActivation *out = v4_gpu_mhc_mirror(3, device, rh);
+    if (!residual || !state || !x || !out) return -1;
+    int res_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_res_tag, residual, residual_hc, rh);
+    int state_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_state_tag, state, posts, sh);
+    float *state_host = malloc((size_t)sh * sizeof(*state_host));
+    if (!state_host) return -1;
+    if (!state_resident) {
+        memcpy(state_host, posts, (size_t)batch * hc * sizeof(*posts));
+        memcpy(state_host + (size_t)batch * hc, combs,
+               (size_t)batch * hc * hc * sizeof(*combs));
+    }
+    v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
+    int good =
+        (res_resident || dsv4_cuda_activation_upload(residual, residual_hc, rh)) &&
+        (state_resident || dsv4_cuda_activation_upload(state, state_host, sh)) &&
+        dsv4_cuda_activation_upload(x, branch, xh) &&
+        dsv4_cuda_mhc_post_batch(x, residual, state, batch, hidden, out) &&
+        dsv4_cuda_mhc_pre_norm_batch(out, fn, scale, base, norm, batch, hidden,
+                                     state, x) &&
+        dsv4_cuda_activation_download(state_host, state, sh) &&
+        dsv4_cuda_activation_download(ffn_normalized, x, xh) &&
+        dsv4_cuda_activation_sync(x);
+    if (good) {
+        memcpy(ffn_post, state_host, (size_t)batch * hc * sizeof(*ffn_post));
+        memcpy(ffn_comb, state_host + (size_t)batch * hc,
+               (size_t)batch * hc * hc * sizeof(*ffn_comb));
+        v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){out, states, rh};
+        v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){out, states, rh};
+        v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){state, ffn_post, sh};
+    } else {
+        v4_gpu_mhc_tags_clear();
+    }
+    free(state_host);
+    return good ? 0 : -1;
+}
+
+/* the states the fused step kept on the card, into their host array (for
+ * a CPU fallback of the FFN post); 0 when they came down */
+int coli_v4_gpu_mhc_states_fetch(float *states, long long elements) {
+    const struct V4GpuMhcTag *t = &v4_gpu_mhc_pending_tag;
+    if (!t->act || t->host != states || t->elements != elements) return -1;
+    int good = dsv4_cuda_activation_download(states, t->act, elements) &&
+               dsv4_cuda_activation_sync(t->act);
+    v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
     return good ? 0 : -1;
 }
 #endif /* COLI_V4_GPU_TIER && _WIN32 */

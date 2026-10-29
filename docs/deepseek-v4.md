@@ -691,6 +691,17 @@ appends was tried and dropped: reusing the block safely needs an event
 per copy, and each record is a WDDM submit dearer than the pageable copy
 (and the event-free variant corrupted the text: the hazard is real). Measured (3.3k prompt, 36 tokens): time to first token 47.4 -> 46.3 s; the KV sync 1.4 -> 0.1 s, the chain's uploads 273 -> 149 ms and its download 576 -> 197 ms; decode unchanged (12.95 s / 36 tokens); the greedy text unchanged. What remains of the stage is the chain's device work (2.5 s: the sparse attention 0.9, wo 0.56, wq_b 0.15, the copies 0.35) and the two dense layers without a chain (0.8 s).
 
+Twelfth measurement (2026-10-29): the prefill block's three hyper-connection
+steps (`blockprof` hc1 2.0 s, hc2 4.7 s, hc3 1.8 s over a 3.3k prompt) were
+copies, not arithmetic: each step moved the whole four-stream state (8 MB
+per chunk-layer) across the link, and the middle step brought the states
+down after the attention post only to send them up again for the FFN pre.
+`V4_HC_FUSED` (1): the middle step as one device pass through the existing
+calls: the post writes a mirror, the FFN pre + norm read it there, and the
+states stay on the card (tagged) for the FFN post; a CPU fallback of that
+post fetches them first (`coli_v4_gpu_mhc_states_fetch`). The same device
+calls in the same order: bitwise. Measured (3.3k prompt, 36 tokens): time to first token 46.3 -> 44.2 s; hc2 4.7 -> 1.3 s (hc1 2.0 and hc3 1.8 s unchanged: the state's upload at the block's start and its download at the end); decode unchanged; the greedy text unchanged. What remains of the three steps is one 8 MB upload and one 8 MB download of the four-stream state per chunk-layer, pageable.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -814,6 +825,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
 | `V4_PREFILL_CHAIN` (1) | the batched prefill attention tail (wq_b, norm, RoPE, sparse attention, inverse RoPE, wo) as one device chain; `0` = the query and the attended cross the link and the CPU does the norm and RoPE |
+| `V4_HC_FUSED` (1) | the prefill block's attention post + FFN pre/norm as one device pass, the states resident for the FFN post (16 MB per chunk-layer not copied); `0` = the two-step path with the states round trip |
 | `DSV4_SATTN_HPB_PF` (16) | heads per block for the multi-token (prefill chunk) launches of the cached sparse attention: 16, 8 or 4 (else the one-token rule); the key rows are shared across the heads of a token, the per-head arithmetic is unchanged (bitwise) |
 | `DSV4_PIN_STAGE` (1, `.cu`) | the prefill chain's inputs as one copy from a page-locked staging block and its output download into it; `0` = seven pageable copies and a pageable download |
 | `DSV4_PF_KPROF` (0, `.cu`) | per-call device time of the prefill chain's stages and its host wall (`pfkprof`) |

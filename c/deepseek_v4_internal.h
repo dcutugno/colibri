@@ -1111,6 +1111,15 @@ int coli_v4_gpu_mhc_post_batch(
     const ColiDeepSeekV4LayerWeights *weights, float *outputs_hc,
     const float *branch, const float *residual_hc, const float *posts,
     const float *combs, int hc, int hidden, int batch);
+/* V4_HC_FUSED: the attention post + the FFN pre/norm as one device pass; the
+ * states stay on the card (tagged as `states`) for the FFN post, and
+ * coli_v4_gpu_mhc_states_fetch brings them down for a CPU fallback. */
+int coli_v4_gpu_mhc_post_pre_norm_batch(
+    const ColiDeepSeekV4LayerWeights *weights, const float *branch,
+    const float *residual_hc, const float *posts, const float *combs,
+    float *ffn_post, float *ffn_comb, float *ffn_normalized,
+    const float *states, int hc, int hidden, int batch);
+int coli_v4_gpu_mhc_states_fetch(float *states, long long elements);
 /* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
  * Uses the resident layer's uploaded f32 gate/bias mirrors through
  * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or
