@@ -112,6 +112,11 @@ int dsv4_cuda_group_fence(int device);
 /* one-block expert mirror: three fp4 tensors inside one allocation (the scale run, then the weight run); a refill copies the host record's two runs (soff/woff: each tensor's offset within its run) and re-points the tensors */
 int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **g,Dsv4CudaTensor **u,Dsv4CudaTensor **d,int Og,int Ig,int Od,int Id,int device);
 int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g,Dsv4CudaTensor *u,Dsv4CudaTensor *d,const uint8_t *scales,long long S,const long long *soff,const uint8_t *weights,long long Wb,const long long *woff,int sync);
+/* chunked read -> upload pipeline: a piece of a block mirror's run (0 scales, 1 weights) at off, enqueued on the aux stream; mirror_point re-points the tensors once the record is in */
+int dsv4_cuda_mirror_copy(Dsv4CudaTensor *g,int run,long long off,const uint8_t *src,long long len);
+int dsv4_cuda_host_pin(const void *p,size_t len);   /* page-lock a slab before its first piece read */
+int dsv4_cuda_mirror_point(Dsv4CudaTensor *g,Dsv4CudaTensor *u,Dsv4CudaTensor *d,long long S,const long long *soff,long long Wb,const long long *woff);
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *g,int run,long long off,const uint8_t *src,long long len);   /* diagnostic (V4_PIECES_VERIFY) */
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,

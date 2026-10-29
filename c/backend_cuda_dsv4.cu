@@ -13,6 +13,7 @@
 #include <climits>
 #include <algorithm>
 #include <vector>
+#include <mutex>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -2000,6 +2001,7 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
  * shard) never matters. The gate tensor owns the block; up and down point
  * into it and own nothing, so the engine's free order (gate, up, down)
  * stays. block = the weight run, block2 = the scale run, blockpad = S. */
+static void aux_flush(Dev*c);   /* below, by group_fence */
 extern "C" int dsv4_cuda_mirror_alloc(Dsv4CudaTensor**g,Dsv4CudaTensor**u,Dsv4CudaTensor**d,int Og,int Ig,int Od,int Id,int dev){
     if(!g||!u||!d||Og<=0||Ig<=0||Od<=0||Id<=0||Ig%32||Id%32)return 0;Dev*c=ctx(dev);if(!c||!ok(cudaSetDevice(dev),"select mirror device"))return 0;
     long long sg=(long long)Og*Ig/32,sd=(long long)Od*Id/32,wg=(long long)Og*Ig/2,wd=(long long)Od*Id/2,S=2*sg+sd,Wb=2*wg+wd;
@@ -2024,8 +2026,40 @@ extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4Cud
     if(!ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,cs),"mirror scales upload")||
        !ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,cs),"mirror weights upload"))return 0;
     if(sync&&!ok(cudaStreamSynchronize(cs),"mirror block drain"))return 0;
+    if(!sync&&cs==c->aux)aux_flush(c);   /* enqueue-only: submit now, the fence must see it */
     for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
     return 1;}
+/* The chunked read -> upload pipeline (V4_UPLOAD_PIECES): a piece of a
+ * block mirror's run (0 = the scale run, 1 = the weight run) at off,
+ * enqueued on the card's aux stream and never waited for here — the
+ * expert group fences the stream (group_fence) as it does for the
+ * uploader's copies. mirror_point re-points the three tensors once every
+ * piece is in (host side only, no device work). */
+extern "C" int dsv4_cuda_mirror_copy(Dsv4CudaTensor*g,int run,long long off,const uint8_t*src,long long len){
+    if(!g||!g->block||!g->block2||!src||off<0||len<=0||(run!=0&&run!=1))return 0;
+    long long cap=run?g->bytes:g->blockpad;if(off+len>cap)return 0;
+    Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror piece device"))return 0;
+    host_pinned(src,(size_t)len);
+    void*dst=(uint8_t*)(run?g->block:g->block2)+off;
+    return ok(cudaMemcpyAsync(dst,src,(size_t)len,cudaMemcpyHostToDevice,c->aux),"mirror piece upload")?1:0;}
+extern "C" int dsv4_cuda_mirror_point(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4CudaTensor*d,long long S,const long long*soff,long long Wb,const long long*woff){
+    if(!g||!g->block||!g->block2||!u||!d||!soff||!woff||S<=0||Wb<=0||S>g->blockpad||Wb>g->bytes)return 0;
+    Dsv4CudaTensor*t[3]={g,u,d};
+    for(int k=0;k<3;k++){long long sb=(long long)t[k]->O*t[k]->I/32,wb=(long long)t[k]->O*t[k]->I/2;
+        if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
+    {Dev*c=ctx(g->device);if(c&&ok(cudaSetDevice(g->device),"select mirror point device"))aux_flush(c);}   /* the pieces this thread enqueued: submitted before the entry becomes a hit */
+    for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
+    return 1;}
+/* diagnostic: compare a run of a block mirror with host bytes (aux stream drained first); returns the first mismatching offset, -1 when equal, -2 on error */
+extern "C" long long dsv4_cuda_mirror_check(Dsv4CudaTensor*g,int run,long long off,const uint8_t*src,long long len){
+    if(!g||!g->block||!g->block2||!src||off<0||len<=0||(run!=0&&run!=1))return -2;
+    long long cap=run?g->bytes:g->blockpad;if(off+len>cap)return -2;
+    Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror check device"))return -2;
+    if(!ok(cudaStreamSynchronize(c->aux),"mirror check drain"))return -2;
+    std::vector<uint8_t> h((size_t)len);
+    if(!ok(cudaMemcpy(h.data(),(uint8_t*)(run?g->block:g->block2)+off,(size_t)len,cudaMemcpyDeviceToHost),"mirror check download"))return -2;
+    for(long long i=0;i<len;i++)if(h[(size_t)i]!=src[i])return i;
+    return -1;}
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
@@ -2446,6 +2480,14 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
  * group orders its kernels after those copies on the device, instead of the
  * host joining the DMA and only then launching. Cheap when nothing is
  * pending. Exported too, so the engine can probe for it. */
+/* Precaution for the event fence: WDDM may submit a thread's queued work
+ * lazily, so an enqueue-only producer (the uploader threads, the decode
+ * lanes' pieces) flushes its submission with cudaStreamQuery after its
+ * last copy, before the main thread can record the fence event on the
+ * same stream. (Not measured to be necessary; the wrong text seen while
+ * the pieces were built came from page-locking a slab under the drive's
+ * DMA, see dsv4_cuda_host_pin.) */
+static void aux_flush(Dev*c){cudaError_t e=cudaStreamQuery(c->aux);if(e!=cudaSuccess&&e!=cudaErrorNotReady)ok(e,"aux flush");else cudaGetLastError();}
 static int group_fence(Dev*c){
     if(!c->upfence&&!ok(cudaEventCreateWithFlags(&c->upfence,cudaEventDisableTiming),"upload fence event"))return 0;
     return ok(cudaEventRecord(c->upfence,c->aux),"upload fence record")&&ok(cudaStreamWaitEvent(c->stream,c->upfence,0),"upload fence wait");
@@ -2792,9 +2834,11 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
+static std::mutex g_pin_mutex;   /* the uploader threads and the decode lanes (mirror pieces) all come here */
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
+    std::lock_guard<std::mutex> pin_lock(g_pin_mutex);
     uintptr_t a=(uintptr_t)p;
     for(auto&r:g_pin_regions)if(a>=r.base&&a+len<=r.base+r.size)return true;
     for(auto&r:g_pin_failed)if(a>=r.base&&a+len<=r.base+r.size)return false;
@@ -2836,6 +2880,11 @@ static bool host_pinned(const void*p,size_t len){
 /* Drain the device's expert stream: the hybrid decode split enqueues its
  * fill-set uploads asynchronously, computes the CPU subset while the DMA is
  * in flight, and closes the pipeline here before the GPU group runs. */
+/* Page-lock a host region now, with nothing in flight on it: the read ->
+ * upload pieces pin each slab before its first read (registering a region
+ * while the drive still writes into it left stale bytes behind — WDDM moves
+ * the pages). 1 when pinned (or already), 0 when not. */
+extern "C" int dsv4_cuda_host_pin(const void*p,size_t len){return host_pinned(p,len)?1:0;}
 extern "C" int dsv4_cuda_stream_drain(int device){
     Dev*c=ctx(device);if(!c)return 0;
     if(!ok(cudaSetDevice(device),"select drain device"))return 0;

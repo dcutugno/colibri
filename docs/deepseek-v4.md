@@ -570,11 +570,35 @@ finish reading together and their ~33 MB then cross the gen4 x8 link in
 300 tokens, 3.3k context, `--ram 16`): one card 327 → 329 ms/token (unchanged within noise; `attach` 53 → 3, `compute` 38 → 84: the wait moved to the fence), two cards
 306 → 306 (second card 651 mirrors).
 
-   The lever that remains for one card is to start each expert's copy
-   before its read ends: read the record in a few striped pieces and
-   enqueue each piece as it lands (the block mirror makes the destination
-   one contiguous run), so the link works under the reads and the tail
-   shrinks to the last piece.
+Fifth measurement (2026-10-29): `V4_UPLOAD_PIECES` (4, on): a decode lane
+reserves its expert's mirror BEFORE the read (the LRU block mirror of the
+card the split picks, or a grown one; the entry is `pending`, neither a hit
+nor a victim, until the last piece is in) and reads the 12 MiB weight window
+in four pieces, all in flight at once (whole pieces alternate between the
+two replicas; halving each piece across them made the reads slower), each
+reported as it lands; the lane enqueues the piece's copy into the mirror's
+block on the card's aux stream at once, so the link works under the read
+instead of after it. The scale run (the buffered read) is one more piece.
+The main thread then finds the expert mirrored (`coli_v4_gpu_expert_peek`)
+and never queues an upload for it; the expert group fences the aux stream
+as it does for the uploader's copies. Anything short of a complete report
+(a fallback read, a copy that failed) abandons the entry — it stays empty
+and is recycled first — and the expert takes the old path. Only inside the
+decode step's lane window: the prefill's lanes never reserve mirrors. Exit
+line: `v4_gpu pieces: reserved= mirrored= abandoned= copies= enqueue=`.
+
+   Gotcha found on the way: the first copy from a slab page-locks its whole
+   region (`cudaHostRegister`), and when that happened while the window's
+   other pieces were still landing from the drive, those pieces came up
+   with stale bytes (WDDM moves the pages as it locks them; the drive's DMA
+   had the old frames). One read in a hundred of the first tokens — each
+   slab's first use — carried wrong weights, enough to flip near-tie tokens
+   in half the runs, while every mirror matched its slab (the slab itself
+   was wrong). The lane now pins the slab before its first piece read
+   (`dsv4_cuda_host_pin`); `V4_PIECES_VERIFY=8` re-reads every record with
+   the buffered path and compares the slab, `=1` reads each piece-built
+   mirror back and compares it with the slab.
+   Measured (3.3k context, `--ram 16`): 36 tokens, one card MoE 287 -> 232 ms/token (`loads` 175 -> 175, `compute` 83 -> 30: the fence wait is gone and the reads did not slow down; 2 pieces 237, 8 pieces slower), two cards 270 -> 215. Steady state (last 100 of 300 tokens): one card 329 -> 285 ms/token (`compute` 84 -> 34), two cards 306 -> 260 (second card 651 mirrors, 43 ms of its group under the loads). The lane's enqueue costs 0.09 ms per expert. The 36- and 300-token one-card texts are unchanged; the two-card 300-token text differs because the experts now split between the cards in a different order (the same class of difference the split already had).
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
@@ -698,6 +722,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_EXPERT_TRACE` (0) | decode: one `xtrace` line per layer with the routed experts and their VRAM-mirror / RAM-cache state at routing time, for offline cache simulation (slows the token: it probes every expert) |
 | `V4_DEV2_SPLIT` (50) | with a second card, the share (percent) of recycled uploads placed on it once both mirror caches are full; `0` = the second card fills once and stays a static store |
 | `V4_MIRROR_BLOCK` (1) | decode expert mirrors as one device allocation each (the record's scale run, then its weight run), refilled with two copies and re-pointed to the record's tensor order; `0` = three tensors, six copies. Needs the DLL's `dsv4_cuda_mirror_alloc`/`_refill` |
+| `V4_UPLOAD_PIECES` (4) | decode: a lane's expert read lands in this many pieces, all in flight at once, each copied to a mirror reserved before the read as it lands (the link works under the read); the slab is page-locked before the read. `0`/`1` = one read, the uploader thread copies after it. Needs `V4_MIRROR_BLOCK`, `V4_UPLOAD_FENCE` and the DLL's `dsv4_cuda_mirror_copy`/`_point`/`_host_pin`. `V4_PIECES_VERIFY=1` compares each piece-built mirror with its slab, `=8` compares each slab with a buffered re-read (diagnostics) |
 | `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
 | `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
 | `DSV4_MOE_MV` (1, `.cu`) | decode expert group / fused MoE: bandwidth-shaped fp4 and fp8 matvecs (one warp per row, 16-byte loads; kernels 1.14 → 0.29 ms per layer on the 5080); `0` = the byte-per-lane `mv_fp4_grouped` / `mv<8>` kernels (a different summation order) |

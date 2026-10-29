@@ -1142,6 +1142,29 @@ int coli_v4_expert_store_cached(ColiExpertStore *store, ColiExpertKey key);
 int coli_v4_upload_threads_enabled(void);
 /* V4_UPLOAD_FENCE: queued uploads are enqueue-only, the expert group fences on the device */
 int coli_v4_upload_fence_on(ColiExpertStore *store);
+/* V4_UPLOAD_PIECES: a decode lane's expert read lands in pieces and each is
+ * copied at once to a mirror reserved before the read (GPU unit). The store
+ * describes the record — its scale run (S bytes) and weight run (Wb), each
+ * tensor's offset within its run, the dims as the views carry them — and
+ * reports every landed range in record bytes: [0, S) the scales, [S, S+Wb)
+ * the weights. begin: NULL when the expert takes the old path. end: the
+ * entry becomes a hit when every byte was reported, else it is left empty. */
+typedef struct {
+    int dims[4];                  /* Og, Ig, Od, Id */
+    long long S, Wb;
+    long long soff[3], woff[3];   /* gate, up, down */
+} V4PieceLayout;
+typedef struct {
+    void (*land)(void *ctx, unsigned long long rec_off, size_t len,
+                 const unsigned char *ptr);
+    void *ctx;
+} V4ReadHook;
+void coli_v4_gpu_pieces_window(int on);   /* 1 while the decode MoE step's lanes read */
+void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
+                               const V4PieceLayout *lay, const void *slab, size_t slab_bytes);
+void coli_v4_gpu_pieces_land(void *ctx, unsigned long long rec_off, size_t len,
+                             const unsigned char *ptr);
+void coli_v4_gpu_pieces_end(void *ctx, int ok);
 /* DSV4_DECODE_PROF: the decode attention's stages, per token across layers. */
 extern double g_v4_ap_qa, g_v4_ap_comp, g_v4_ap_qb, g_v4_ap_kv, g_v4_ap_sattn, g_v4_ap_wo;
 extern double g_v4_ap_comp_c, g_v4_ap_comp_a;

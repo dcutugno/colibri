@@ -6044,6 +6044,9 @@ static void v4_lanes_finish(ColiExpertStore *store, ExpertLoadJob *jobs,
             if (!jobs[slot].result)
                 coli_expert_release(store, &jobs[slot].view);
         }
+#ifdef COLI_V4_GPU_TIER
+    if (store && store->gpu) coli_v4_gpu_pieces_window(0);
+#endif
 }
 #endif
 
@@ -6229,6 +6232,9 @@ static int moe_token_pipeline(float *output,
                           weights->plan.layer, selected);
 #ifdef COLI_V4_GPU_TIER
     int mirror_first = !result && store->gpu && mirror_first_enabled();
+    /* the decode lanes may reserve mirrors and copy pieces as they read
+     * (V4_UPLOAD_PIECES); closed by v4_lanes_finish */
+    if (store->gpu) coli_v4_gpu_pieces_window(1);
     /* V4_DEV2_EARLY: every routed expert's residence is known now; those on
      * the second card need no read, so its group starts here on its thread
      * and is joined once this layer's reads and uploads are done (measured
@@ -6441,6 +6447,9 @@ static int moe_token_pipeline(float *output,
         double dpt_j = v4_wait_clock();
         g_v4_dp_attach += dpt_j - dpt_c;
         dpt_c = dpt_j;
+        uploads_fenced = coli_v4_upload_fence_on(store);
+    } else if (store->gpu) {
+        /* the lanes' piece copies are enqueue-only too */
         uploads_fenced = coli_v4_upload_fence_on(store);
     }
     /* The fused path needs every expert on the primary card; decided here,
@@ -10264,6 +10273,36 @@ static int v4_slab_shift_enabled(void) {
     if (on < 0) { const char *e = getenv("V4_SLAB_SHIFT"); on = !(e && *e == '0'); }
     return on;
 }
+/* V4_UPLOAD_PIECES (4): a decode lane reads its expert's weight window in
+ * this many pieces, all in flight at once, and reports each as it lands
+ * (coli_v4_gpu_pieces_land) so its copy to the card starts under the rest
+ * of the read instead of after it. 0 or 1 = one read, no pipelining. */
+static int v4_upload_pieces(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("V4_UPLOAD_PIECES");
+        n = e && *e ? atoi(e) : 4;
+        if (n < 0) n = 0;
+        if (n > 16) n = 16;
+    }
+    return n;
+}
+/* The hook as a window read sees it: the record's bytes sit at
+ * [pad, pad + length) of the window and start at rec_base of the record. */
+typedef struct {
+    const V4ReadHook *hook;
+    unsigned char *slab;
+    size_t pad, length;
+    uint64_t rec_base;
+} V4WindowHook;
+static void v4_window_landed(const V4WindowHook *w, size_t a, size_t b) {
+    if (!w || !w->hook) return;
+    size_t lo = a > w->pad ? a : w->pad;
+    size_t end = w->pad + w->length;
+    size_t hi = end < b ? end : b;
+    if (lo < hi)
+        w->hook->land(w->hook->ctx, w->rec_base + (lo - w->pad), hi - lo, w->slab + lo);
+}
 
 #ifdef _WIN32
 /* Two reads in flight at once on two overlapped handles (the replica twins
@@ -10306,30 +10345,130 @@ done:
 }
 #endif
 
+#ifdef _WIN32
+/* The window in pieces, every piece's reads in flight at once (each piece
+ * split between the two replicas when fd_b is one, as v4_pread_pair), then
+ * waited for in order so a piece is reported only once every byte before
+ * it is in. -1 on any failure (the reads left are cancelled and waited). */
+static int v4_pread_pieces(int fd_a, int fd_b, unsigned char *slab, size_t length,
+                           uint64_t base, int pieces, const V4WindowHook *w) {
+    enum { MAXR = 32 };
+    intptr_t ha_ = _get_osfhandle(fd_a);
+    intptr_t hb_ = fd_b >= 0 ? _get_osfhandle(fd_b) : -1;
+    if (ha_ == -1 || ha_ == -2) return -1;
+    HANDLE ha = (HANDLE)ha_;
+    HANDLE hb = (fd_b >= 0 && hb_ != -1 && hb_ != -2) ? (HANDLE)hb_ : NULL;
+    if (pieces < 1) pieces = 1;
+    if (pieces > MAXR / 2) pieces = MAXR / 2;
+    size_t piece = ((length + (size_t)pieces - 1) / (size_t)pieces + 4095) & ~(size_t)4095;
+    if (!piece) return -1;
+    HANDLE ev[MAXR], hh[MAXR];
+    OVERLAPPED ov[MAXR];
+    size_t rlen[MAXR], rpos[MAXR];
+    int rpiece[MAXR];
+    int n = 0, result = -1, done = 0;
+    size_t pos = 0;
+    for (int p = 0; p < pieces && pos < length; p++) {
+        size_t len = length - pos < piece ? length - pos : piece;
+        /* two replicas: whole pieces alternate between them (two sequential
+         * runs per drive); one replica, or two pieces: as the pair read */
+        size_t half = hb && pieces < 3 ? (len / 2) & ~(size_t)4095 : 0;
+        size_t part[2] = { half ? half : len, half ? len - half : 0 };
+        HANDLE ph[2] = { hb && !half && (p & 1) ? hb : ha, hb };
+        for (int k = 0; k < 2 && part[k]; k++) {
+            if (part[k] > 0x7FFFFFFFu) goto cancel;
+            ev[n] = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (!ev[n]) goto cancel;
+            memset(&ov[n], 0, sizeof(ov[n]));
+            uint64_t off = base + pos;
+            ov[n].Offset = (DWORD)(off & 0xFFFFFFFFu);
+            ov[n].OffsetHigh = (DWORD)(off >> 32);
+            ov[n].hEvent = ev[n];
+            hh[n] = ph[k]; rlen[n] = part[k]; rpos[n] = pos; rpiece[n] = p;
+            DWORD got = 0;
+            BOOL issued = ReadFile(hh[n], slab + pos, (DWORD)part[k], &got, &ov[n]);
+            n++;
+            if (!issued && GetLastError() != ERROR_IO_PENDING) goto cancel;
+            pos += part[k];
+        }
+    }
+    for (int i = 0; i < n;) {
+        int p = rpiece[i];
+        size_t a = rpos[i], b = a;
+        for (; i < n && rpiece[i] == p; i++) {
+            DWORD got = 0;
+            if (!GetOverlappedResult(hh[i], &ov[i], &got, TRUE) || got != (DWORD)rlen[i])
+                goto cancel;
+            b = rpos[i] + rlen[i];
+        }
+        done = i;
+        v4_window_landed(w, a, b);
+    }
+    result = 0;
+cancel:
+    if (result)
+        for (int i = done; i < n; i++) {
+            DWORD got = 0;
+            CancelIoEx(hh[i], &ov[i]);
+            GetOverlappedResult(hh[i], &ov[i], &got, TRUE);
+        }
+    for (int i = 0; i < n; i++) CloseHandle(ev[i]);
+    return result;
+}
+#endif
+
 /* The aligned window read: both halves from the two replicas at once when a
  * mirror exists (Windows overlapped twins; elsewhere one drive, the halves
- * would only serialize), else the routed replica alone. */
+ * would only serialize), else the routed replica alone. With a hook and
+ * V4_UPLOAD_PIECES the window lands in pieces, each reported as it is in;
+ * *reported says whether it was (a fallback reports nothing). */
 static int v4_pread_direct_window(const V4ExpertStoreState *state, int shard,
                                   int rep, int dfd, unsigned char *slab,
-                                  size_t direct_length, uint64_t base) {
+                                  size_t direct_length, uint64_t base,
+                                  const V4WindowHook *w, int *reported) {
+    *reported = 0;
 #ifdef _WIN32
+    int other = -1;
     if (v4_read_stripe_enabled() && direct_length >= (size_t)2 << 20) {
-        int other = -1;
         if (rep == 0 && coli_st_mirror_nrep() >= 1)
             other = state->index->mdfds[0][shard];
         else if (rep > 0)
             other = state->index->dfds[shard];
-        if (other >= 0) {
-            size_t half = (direct_length / 2) & ~(size_t)4095;
-            if (half && !v4_pread_pair(dfd, slab, half, base,
-                                       other, slab + half, direct_length - half,
-                                       base + half)) {
-                __atomic_fetch_add(&g_v4_dp_pair_ok, 1, __ATOMIC_RELAXED);
-                return 0;
-            }
-            __atomic_fetch_add(&g_v4_dp_pair_fail, 1, __ATOMIC_RELAXED);
-            g_v4_dp_pair_err = GetLastError();
+    }
+    if (w && w->hook && v4_upload_pieces() > 1) {
+        if (!v4_pread_pieces(dfd, other, slab, direct_length, base,
+                             v4_upload_pieces(), w)) {
+            if (other >= 0) __atomic_fetch_add(&g_v4_dp_pair_ok, 1, __ATOMIC_RELAXED);
+            *reported = 1;
+            return 0;
         }
+        __atomic_fetch_add(&g_v4_dp_pair_fail, 1, __ATOMIC_RELAXED);
+        g_v4_dp_pair_err = GetLastError();
+        /* whole window again below, unreported: the mirror is abandoned */
+    }
+    if (other >= 0) {
+        size_t half = (direct_length / 2) & ~(size_t)4095;
+        if (half && !v4_pread_pair(dfd, slab, half, base,
+                                   other, slab + half, direct_length - half,
+                                   base + half)) {
+            __atomic_fetch_add(&g_v4_dp_pair_ok, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+        __atomic_fetch_add(&g_v4_dp_pair_fail, 1, __ATOMIC_RELAXED);
+        g_v4_dp_pair_err = GetLastError();
+    }
+#else
+    if (w && w->hook && v4_upload_pieces() > 1) {
+        int pieces = v4_upload_pieces();
+        size_t piece = ((direct_length + (size_t)pieces - 1) / (size_t)pieces + 4095) & ~(size_t)4095;
+        for (size_t pos = 0; pos < direct_length;) {
+            size_t len = direct_length - pos < piece ? direct_length - pos : piece;
+            if (v4_pread_full_try(dfd, slab + pos, len, base + pos)) return -1;
+            v4_window_landed(w, pos, pos + len);
+            pos += len;
+        }
+        *reported = 1;
+        return 0;
     }
 #endif
     return v4_pread_full_try(dfd, slab, direct_length, base);
@@ -10338,7 +10477,8 @@ static int v4_pread_direct_window(const V4ExpertStoreState *state, int shard,
 static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
                                  int rep, unsigned char *slab, uint64_t offset,
                                  size_t length, size_t destination_offset,
-                                 size_t *shift_out) {
+                                 size_t *shift_out, const V4ReadHook *hook,
+                                 uint64_t rec_base) {
     if (!state || !state->index || shard < 0 || shard >= state->index->nfd) return -1;
     /* DUAL-SSD: prefer the routed replica's O_DIRECT twin. */
     int dfd = rep ? state->index->mdfds[rep - 1][shard] : state->index->dfds[shard];
@@ -10358,11 +10498,18 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     if ((uint64_t)direct_length > available)
         direct_length = (size_t)(available & ~(alignment - 1));
     uint64_t t0 = v4_ns_now();
+    /* reported only where the record stays where the window put it */
+    int keep = shift_out && !destination_offset && v4_slab_shift_enabled();
+    V4WindowHook wh = { keep ? hook : NULL, slab, pad, length, rec_base };
+    int reported = 0;
     if (direct_length && v4_pread_direct_window(state, shard, rep, dfd, slab,
-                                                direct_length, base)) return -1;
-    if (direct_length < wanted && v4_pread_full_try(
-            fd, slab + direct_length,
-            wanted - direct_length, base + direct_length)) return -1;
+                                                direct_length, base, &wh,
+                                                &reported)) return -1;
+    if (direct_length < wanted) {
+        if (v4_pread_full_try(fd, slab + direct_length,
+                              wanted - direct_length, base + direct_length)) return -1;
+        if (reported) v4_window_landed(&wh, direct_length, wanted);
+    }
     uint64_t t1 = v4_ns_now();
     if (shift_out && !destination_offset && v4_slab_shift_enabled()) {
         *shift_out = pad;   /* the record stays where the window put it */
@@ -10393,7 +10540,7 @@ static int v4_read_direct_copy(const V4ExpertStoreState *state, int shard,
     __atomic_fetch_add(&g_v4_dp_pm_n, 1, __ATOMIC_RELAXED);
     if (posix_memalign((void **)&bounce, 4096, length + 8192u)) return -1;
     int result = v4_read_direct_window(state, shard, rep, bounce, offset,
-                                       length, 0, NULL);
+                                       length, 0, NULL, NULL, 0);
     if (!result) memcpy(destination, bounce, length);
     compat_aligned_free(bounce);
     return result;
@@ -10408,7 +10555,7 @@ static int v4_try_direct_segment(V4ExpertStoreState *state, int shard, int rep,
     size_t length = (size_t)bytes;
     if (dest == 0)
         return v4_read_direct_window(state, shard, rep, slot->slab, offset,
-                                     length, 0, NULL);
+                                     length, 0, NULL, NULL, 0);
     return v4_read_direct_copy(state, shard, rep, slot->slab + dest, offset,
                                length);
 }
@@ -10511,7 +10658,8 @@ static int v4_gguf_interleave(const V4ExpertRecord *record, unsigned char *slab)
 
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
-                                 V4ExpertSlot *slot, int rep) {
+                                 V4ExpertSlot *slot, int rep,
+                                 const V4ReadHook *hook) {
     slot->data_shift = 0;
     slot->weight_shift = 0;
     if (record->gguf) {
@@ -10573,7 +10721,7 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         !v4_read_direct_window(state, record->scale_shard, rep, slot->slab,
                                record->scale_offset,
                                (size_t)record->record_bytes, 0,
-                               &slot->data_shift)) {
+                               &slot->data_shift, hook, 0)) {
         slot->weight_shift = slot->data_shift;
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_flock_reads, UINT64_C(1),
@@ -10587,16 +10735,20 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     size_t weight_pad = 0;
     int weight_direct = direct_available && !v4_read_direct_window(
         state, record->weight_shard, rep, slot->slab + weight_dest,
-        record->weight_offset, (size_t)record->weight_bytes, 0, &weight_pad);
+        record->weight_offset, (size_t)record->weight_bytes, 0, &weight_pad,
+        hook, record->scale_bytes);
     if (weight_direct) slot->weight_shift = weight_dest + weight_pad -
                                             (size_t)record->scale_bytes;
     if (weight_direct) {
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
-        return coli_st_read_at_rep(state->index, record->scale_shard, rep,
-                                   record->scale_offset,
-                                   (size_t)record->scale_bytes, slot->slab);
+        int r = coli_st_read_at_rep(state->index, record->scale_shard, rep,
+                                    record->scale_offset,
+                                    (size_t)record->scale_bytes, slot->slab);
+        if (!r && hook)   /* the scale run, at the slab's first byte */
+            hook->land(hook->ctx, 0, (size_t)record->scale_bytes, slot->slab);
+        return r;
     }
     if (direct_available)
         __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
@@ -10609,6 +10761,47 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
                                record->scale_offset,
                                (size_t)record->scale_bytes, slot->slab);
 }
+
+#ifdef COLI_V4_GPU_TIER
+/* The record as the pieces pipeline needs it: its scale run and weight run
+ * tiled by the three tensors (gate, up, down in the view's order), the dims
+ * as the views carry them. 0 for a GGUF or per-matrix record, or a layout
+ * the block mirror cannot hold. */
+static int v4_record_piece_layout(const V4ExpertRecord *r, V4PieceLayout *lay) {
+    static const int m[3] = { V4_W1, V4_W3, V4_W2 };
+    if (r->gguf || r->per_matrix) return 0;
+    long long ssum = 0, wsum = 0, ssz[3], wsz[3];
+    for (int k = 0; k < 3; k++) {
+        const ColiSafetensorsTensor *w = r->weight[m[k]], *sc = r->scale[m[k]];
+        if (!w || !sc || w->shape[0] <= 0 || w->shape[1] <= 0) return 0;
+        if (sc->off < r->scale_offset || sc->off + sc->nbytes > r->scale_offset + r->scale_bytes) return 0;
+        if (w->off < r->weight_offset || w->off + w->nbytes > r->weight_offset + r->weight_bytes) return 0;
+        if ((long long)w->nbytes != (long long)w->shape[0] * w->shape[1] ||
+            (long long)sc->nbytes * 16 != (long long)w->nbytes) return 0;
+        lay->soff[k] = (long long)(sc->off - r->scale_offset);
+        lay->woff[k] = (long long)(w->off - r->weight_offset);
+        if (lay->woff[k] & 15) return 0;
+        ssz[k] = (long long)sc->nbytes; wsz[k] = (long long)w->nbytes;
+        ssum += ssz[k]; wsum += wsz[k];
+        int rows = (int)w->shape[0], cols = (int)w->shape[1] * 2;
+        if (k == 0) { lay->dims[0] = rows; lay->dims[1] = cols; }
+        else if (k == 1) { if (rows != lay->dims[0] || cols != lay->dims[1]) return 0; }
+        else { lay->dims[2] = rows; lay->dims[3] = cols; }
+    }
+    if (ssum != (long long)r->scale_bytes || wsum != (long long)r->weight_bytes) return 0;
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            if (a != b && (lay->soff[a] < lay->soff[b] + ssz[b] && lay->soff[b] < lay->soff[a] + ssz[a]))
+                return 0;
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            if (a != b && (lay->woff[a] < lay->woff[b] + wsz[b] && lay->woff[b] < lay->woff[a] + wsz[a]))
+                return 0;
+    lay->S = (long long)r->scale_bytes;
+    lay->Wb = (long long)r->weight_bytes;
+    return 1;
+}
+#endif
 
 static void hot_fill_view(ColiTensorView *view,
                           const V4ExpertRecord *record,
@@ -11009,7 +11202,50 @@ retry_lookup:
     if (coli_v4_test_expert_read_hook)
         coli_v4_test_expert_read_hook(key);
 #endif
-    int read_result = v4_read_expert_record(state, record, slot, rep);
+    /* V4_UPLOAD_PIECES: a mirror reserved before the read takes each piece
+     * as it lands (the GPU unit decides; NULL = the old path) */
+    const V4ReadHook *hook = NULL;
+#ifdef COLI_V4_GPU_TIER
+    V4ReadHook piece_hook = { coli_v4_gpu_pieces_land, NULL };
+    V4PieceLayout lay;
+    if (store->gpu && v4_upload_pieces() > 1 && v4_record_piece_layout(record, &lay)) {
+        piece_hook.ctx = coli_v4_gpu_pieces_begin(store, key, &lay, slot->slab,
+                                                  (size_t)state->record_bytes + 16384u);
+        if (piece_hook.ctx) hook = &piece_hook;
+    }
+#endif
+    int read_result = v4_read_expert_record(state, record, slot, rep, hook);
+#ifdef COLI_V4_GPU_TIER
+    if (hook && !read_result) {
+        static int pv = -1;
+        if (pv < 0) { const char *e = getenv("V4_PIECES_VERIFY"); pv = e && *e ? atoi(e) : 0; }
+        if (pv == 8) {
+            static unsigned long long checked, bad;
+            unsigned char *tmp = malloc((size_t)record->weight_bytes);
+            if (tmp) {
+                const unsigned char *sw = slot->slab + slot->weight_shift + record->scale_bytes;
+                int r = coli_st_read_at_rep(state->index, record->weight_shard, rep,
+                                            record->weight_offset, (size_t)record->weight_bytes, tmp);
+                long long first = -1;
+                if (!r) for (uint64_t i = 0; i < record->weight_bytes; i++) if (tmp[i] != sw[i]) { first = (long long)i; break; }
+                int r2 = coli_st_read_at_rep(state->index, record->scale_shard, rep,
+                                             record->scale_offset, (size_t)record->scale_bytes, tmp);
+                long long first_s = -1;
+                if (!r2) for (uint64_t i = 0; i < record->scale_bytes; i++) if (tmp[i] != slot->slab[slot->data_shift + i]) { first_s = (long long)i; break; }
+                unsigned long long n = __atomic_add_fetch(&checked, 1ULL, __ATOMIC_RELAXED);
+                if (r || r2 || first >= 0 || first_s >= 0) {
+                    unsigned long long nb = __atomic_add_fetch(&bad, 1ULL, __ATOMIC_RELAXED);
+                    if (nb <= 30)
+                        fprintf(stderr, "v4 pieces slab-check: layer %d expert %d rep %d weights first_bad=%lld scales first_bad=%lld (reads %d %d) shift=%zu\n",
+                                key.layer, key.expert, rep, first, first_s, r, r2, slot->weight_shift);
+                }
+                if (n % 1000 == 0) fprintf(stderr, "v4 pieces slab-check: checked=%llu bad=%llu\n", n, __atomic_load_n(&bad, __ATOMIC_RELAXED));
+                free(tmp);
+            }
+        }
+    }
+    if (hook) coli_v4_gpu_pieces_end(piece_hook.ctx, read_result == 0);
+#endif
     struct timespec disk_t1;
     clock_gettime(CLOCK_MONOTONIC, &disk_t1);
     /* Pack outside the mutex: the slot holds our reference so its slab is
@@ -11273,7 +11509,7 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
     slot.slab = buffer; slot.aligned_slab = 1;
     slot.owner_layer = key.layer; slot.expert = key.expert; slot.loading_expert = -1;
     if (v4_read_expert_record(state, record, &slot,
-                              coli_st_expert_route(key.layer, key.expert)))
+                              coli_st_expert_route(key.layer, key.expert), NULL))
         return -1;
     memset(view, 0, sizeof(*view));
     view->key = key;
@@ -12427,6 +12663,9 @@ typedef struct {
      * weight run) for any expert of the same shape */
     int block;
     int dims[4];   /* Og, Ig, Od, Id */
+    /* reserved for a read in flight (V4_UPLOAD_PIECES): neither a hit nor
+     * a victim until the lane reports its last piece */
+    int pending;
 } V4GpuExpertMirror;
 
 /* Backend entry points a mirror cache calls. The primary cache uses the
@@ -12451,6 +12690,13 @@ typedef struct {
     int (*mirror_refill)(Dsv4CudaTensor *, Dsv4CudaTensor *, Dsv4CudaTensor *,
                          const uint8_t *, long long, const long long *,
                          const uint8_t *, long long, const long long *, int);
+    /* optional: read -> upload pieces (a piece of a run, enqueued on the aux
+     * stream; the re-pointing once the record is in) */
+    int (*mirror_copy)(Dsv4CudaTensor *, int, long long, const uint8_t *, long long);
+    int (*mirror_point)(Dsv4CudaTensor *, Dsv4CudaTensor *, Dsv4CudaTensor *,
+                        long long, const long long *, long long, const long long *);
+    long long (*mirror_check)(Dsv4CudaTensor *, int, long long, const uint8_t *, long long);   /* diagnostic */
+    int (*host_pin)(const void *, size_t);   /* optional: page-lock a slab before its first piece read */
 } V4GpuBackendOps;
 extern int dsv4_cuda_stream_drain(int device);
 extern int dsv4_cuda_group_fence(int device);
@@ -12460,6 +12706,14 @@ extern int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4Cud
                                    const uint8_t *scales, long long S, const long long *soff,
                                    const uint8_t *weights, long long Wb, const long long *woff,
                                    int sync);
+extern int dsv4_cuda_mirror_copy(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src,
+                                 long long len);
+extern int dsv4_cuda_mirror_point(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d,
+                                  long long S, const long long *soff, long long Wb,
+                                  const long long *woff);
+extern long long dsv4_cuda_mirror_check(Dsv4CudaTensor *g, int run, long long off,
+                                        const uint8_t *src, long long len);
+extern int dsv4_cuda_host_pin(const void *p, size_t len);
 
 #ifdef _WIN32
 /* Windows loader: the secondary module (backend_loader_dsv4.c). */
@@ -12481,6 +12735,14 @@ int dsv4_cuda2_stream_drain(int device);
 int dsv4_cuda2_group_fence(int device);
 int dsv4_cuda2_mirror_alloc(Dsv4CudaTensor **g, Dsv4CudaTensor **u, Dsv4CudaTensor **d,
                             int Og, int Ig, int Od, int Id, int device);
+int dsv4_cuda2_mirror_copy(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src,
+                           long long len);
+int dsv4_cuda2_mirror_point(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d,
+                            long long S, const long long *soff, long long Wb,
+                            const long long *woff);
+long long dsv4_cuda2_mirror_check(Dsv4CudaTensor *g, int run, long long off,
+                                  const uint8_t *src, long long len);
+int dsv4_cuda2_host_pin(const void *p, size_t len);
 int dsv4_cuda2_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d,
                              const uint8_t *scales, long long S, const long long *soff,
                              const uint8_t *weights, long long Wb, const long long *woff,
@@ -12507,6 +12769,10 @@ static void dsv4_cuda2_shutdown(void) {}
 #define dsv4_cuda2_group_fence dsv4_cuda_group_fence
 #define dsv4_cuda2_mirror_alloc dsv4_cuda_mirror_alloc
 #define dsv4_cuda2_mirror_refill dsv4_cuda_mirror_refill
+#define dsv4_cuda2_mirror_copy dsv4_cuda_mirror_copy
+#define dsv4_cuda2_mirror_point dsv4_cuda_mirror_point
+#define dsv4_cuda2_mirror_check dsv4_cuda_mirror_check
+#define dsv4_cuda2_host_pin dsv4_cuda_host_pin
 #define dsv4_cuda2_backend_name dsv4_cuda_backend_name
 #endif
 
@@ -12514,13 +12780,17 @@ static const V4GpuBackendOps v4_gpu_ops_primary = {
     dsv4_cuda_upload_fp4, dsv4_cuda_tensor_refill_fp4, dsv4_cuda_tensor_free,
     dsv4_cuda_expert_group, dsv4_cuda_mem_free_mb, dsv4_cuda_device_unified,
     dsv4_cuda_stream_drain, dsv4_cuda_group_fence,
-    dsv4_cuda_mirror_alloc, dsv4_cuda_mirror_refill
+    dsv4_cuda_mirror_alloc, dsv4_cuda_mirror_refill,
+    dsv4_cuda_mirror_copy, dsv4_cuda_mirror_point, dsv4_cuda_mirror_check,
+    dsv4_cuda_host_pin
 };
 static const V4GpuBackendOps v4_gpu_ops_second = {
     dsv4_cuda2_upload_fp4, dsv4_cuda2_tensor_refill_fp4, dsv4_cuda2_tensor_free,
     dsv4_cuda2_expert_group, dsv4_cuda2_mem_free_mb, dsv4_cuda2_device_unified,
     dsv4_cuda2_stream_drain, dsv4_cuda2_group_fence,
-    dsv4_cuda2_mirror_alloc, dsv4_cuda2_mirror_refill
+    dsv4_cuda2_mirror_alloc, dsv4_cuda2_mirror_refill,
+    dsv4_cuda2_mirror_copy, dsv4_cuda2_mirror_point, dsv4_cuda2_mirror_check,
+    dsv4_cuda2_host_pin
 };
 
 struct V4GpuExpertMirrorCache {
@@ -13310,17 +13580,9 @@ static double v4_up_now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
-static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
-                               ColiExpertView *view, int sync,
-                               int allow_recycle) {
-    double up_t0 = v4_up_now();
-    pthread_mutex_lock(&cache->mutex);
-    double up_t1 = v4_up_now();
-    if (sync >= 2) { g_v4_up_lock_s += up_t1 - up_t0; g_v4_up_prof_n++; }
-    /* Growth guard: new mirrors may only claim VRAM while the reserve stays
-     * free for the transient prefill allocations. Below the reserve, recycle
-     * the LRU slot instead of growing — decode keeps its hottest experts and
-     * the next large prefill still fits. */
+/* The growth guard of v4_gpu_mirror_place, shared with the pieces
+ * reservation: may this cache grow by one mirror now (the lock held)? */
+static int v4_gpu_mirror_may_grow(V4GpuExpertMirrorCache *cache, long long mirror_bytes) {
     int grow = cache->count < cache->capacity;
     /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
      * system's MemFree, which the page cache holding the model keeps
@@ -13336,11 +13598,6 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
                             "card's); capacity %d bounds the cache\n",
                     cache->capacity);
     }
-    /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
-    long long elements = (long long)view->gate.rows * view->gate.columns +
-                         (long long)view->up.rows * view->up.columns +
-                         (long long)view->down.rows * view->down.columns;
-    long long mirror_bytes = elements / 2 + elements / 32;
     /* The primary's reserve: the explicit DSV4_CUDA_VRAM_RESERVE_MB, else the
      * headroom (the bank makes its own room, V4_BANK_MAKE_ROOM) or the
      * bank-sized default (v4_gpu_mirror_reserve_mb). margin_mb is how far the
@@ -13375,6 +13632,25 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
              (cache->count >= 8 && cache->last_free_mb - grown_mb < reserve_mb - margin_mb)))
             grow = 0;
     }
+    return grow;
+}
+static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
+                               ColiExpertView *view, int sync,
+                               int allow_recycle) {
+    double up_t0 = v4_up_now();
+    pthread_mutex_lock(&cache->mutex);
+    double up_t1 = v4_up_now();
+    if (sync >= 2) { g_v4_up_lock_s += up_t1 - up_t0; g_v4_up_prof_n++; }
+    /* Growth guard: new mirrors may only claim VRAM while the reserve stays
+     * free for the transient prefill allocations. Below the reserve, recycle
+     * the LRU slot instead of growing — decode keeps its hottest experts and
+     * the next large prefill still fits. */
+    /* fp4 nibbles plus one UE8M0 scale per 32, as uploaded */
+    long long elements = (long long)view->gate.rows * view->gate.columns +
+                         (long long)view->up.rows * view->up.columns +
+                         (long long)view->down.rows * view->down.columns;
+    long long mirror_bytes = elements / 2 + elements / 32;
+    int grow = v4_gpu_mirror_may_grow(cache, mirror_bytes);
     int found;
     int appended = 0;   /* a new slot, not a recycled one (grown_bytes) */
     if (!grow) {
@@ -13399,10 +13675,15 @@ static int v4_gpu_mirror_place(V4GpuExpertMirrorCache *cache,
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }
-        found = 0;
-        for (int i = 1; i < cache->count; i++)
-            if (cache->entries[i].clock < cache->entries[found].clock)
+        found = -1;
+        for (int i = 0; i < cache->count; i++)
+            if (!cache->entries[i].pending &&
+                (found < 0 || cache->entries[i].clock < cache->entries[found].clock))
                 found = i;
+        if (found < 0) {   /* every entry reserved by a read in flight */
+            pthread_mutex_unlock(&cache->mutex);
+            return -1;
+        }
         /* RECYCLE IN PLACE: every routed expert has the same shape, so
          * refill the victim's device buffers (pinned DMA) instead of
          * cudaFree + cudaMalloc + pageable copy x3 — at long context
@@ -13572,7 +13853,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         pthread_mutex_lock(&c->mutex);
         for (int i = 0; i < c->count; i++) {
             if (c->entries[i].layer == view->key.layer &&
-                c->entries[i].expert == view->key.expert &&
+                c->entries[i].expert == view->key.expert && !c->entries[i].pending &&
                 c->entries[i].gate && c->entries[i].up && c->entries[i].down) {
                 c->entries[i].clock = ++c->clock;
                 view->gate.gpu = c->entries[i].gate;
@@ -13640,6 +13921,11 @@ typedef struct {
 } V4Uploader;
 static V4Uploader g_v4_up[2];
 static unsigned g_v4_up_split;
+/* the read -> upload pieces (V4_UPLOAD_PIECES, below): the lane window flag and its counters */
+static int g_v4_pc_window;
+static unsigned long long g_v4_pc_begun, g_v4_pc_done, g_v4_pc_abort, g_v4_pc_copies;
+static double g_v4_pc_enqueue_s;
+static pthread_mutex_t g_v4_pc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static double v4_up_clock(void) {
     struct timespec ts;
@@ -13787,6 +14073,234 @@ void coli_v4_gpu_expert_upload_stats(unsigned long long *jobs0,
                 1e3 * g_v4_up_pick_s / (double)g_v4_up_prof_n,
                 1e3 * g_v4_up_copy_s / (double)g_v4_up_prof_n, g_v4_up_prof_n,
                 g_v4_up_block_n, g_v4_up_split_n);
+    if (g_v4_pc_begun)
+        fprintf(stderr, "v4_gpu pieces: reserved=%llu mirrored=%llu abandoned=%llu copies=%llu enqueue=%.3f ms per expert\n",
+                g_v4_pc_begun, g_v4_pc_done, g_v4_pc_abort, g_v4_pc_copies,
+                g_v4_pc_done + g_v4_pc_abort
+                    ? 1e3 * g_v4_pc_enqueue_s / (double)(g_v4_pc_done + g_v4_pc_abort) : 0.0);
+}
+
+/* ---- chunked read -> upload pipeline (V4_UPLOAD_PIECES) -------------------
+ * A decode lane's miss reserves its mirror BEFORE the read (the LRU block
+ * mirror of the card the V4_DEV2_SPLIT ratio picks, or a grown one) and the
+ * store reports each piece of the record as it lands; the piece is copied to
+ * the mirror's block at once, enqueue-only on the card's aux stream, so the
+ * link works under the read instead of after it (measured before: a layer's
+ * 2-3 misses finished reading together and their ~33 MB crossed the link
+ * after the last read, ~1.7 ms per layer on the critical path). The entry
+ * is `pending` (no hit, no victim) until the last piece is enqueued and the
+ * tensors re-pointed; the expert group then fences the aux stream as it does
+ * for the uploader's copies. Anything short of a complete report (a fallback
+ * read, an error) leaves the entry empty for the next recycle and the expert
+ * takes the old path (the uploader thread). Only inside the decode MoE
+ * step's lane window: the prefill's lanes never reserve mirrors. */
+typedef struct {
+    V4GpuExpertMirrorCache *cache;
+    Dsv4CudaTensor *gate, *up, *down;
+    V4PieceLayout lay;
+    long long landed;
+    int ok, copies;
+    double enqueue_s;
+    const unsigned char *sptr, *wptr;   /* the runs' host bytes (V4_PIECES_VERIFY=1) */
+    ColiExpertKey key;
+} V4PieceJob;
+static int v4_pieces_verify(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_PIECES_VERIFY"); on = e && *e ? atoi(e) : 0; }
+    return on;
+}
+static int v4_pieces_on(V4GpuExpertMirrorCache *primary) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_UPLOAD_PIECES");
+        int n = e && *e ? atoi(e) : 4;
+        on = n > 1 && v4_mirror_block_on() && v4_upload_fence_on(primary) &&
+             primary->ops->mirror_copy && primary->ops->mirror_point &&
+             primary->ops->mirror_alloc;
+        if (!on && n > 1)
+            fprintf(stderr, "v4_gpu pieces: off (needs V4_MIRROR_BLOCK, V4_UPLOAD_FENCE "
+                            "and a DLL with mirror_copy/mirror_point)\n");
+    }
+    return on;
+}
+void coli_v4_gpu_pieces_window(int on) {
+    __atomic_store_n(&g_v4_pc_window, on, __ATOMIC_RELEASE);
+}
+/* Reserve an entry of cache for key: the LRU block mirror of this shape,
+ * else a grown one, else the LRU entry rebuilt as a block mirror. The lock
+ * is held by the caller. -1 when the card has nothing to give. */
+static int v4_gpu_mirror_reserve(V4GpuExpertMirrorCache *cache, ColiExpertKey key,
+                                 const V4PieceLayout *lay, V4PieceJob *job) {
+    long long elements = (long long)lay->dims[0] * lay->dims[1] * 2 +
+                         (long long)lay->dims[2] * lay->dims[3];
+    long long mirror_bytes = elements / 2 + elements / 32;
+    int grow = v4_gpu_mirror_may_grow(cache, mirror_bytes);
+    int found = -1;
+    if (!grow) {
+        if (cache->count < 8) return -1;
+        for (int i = 0; i < cache->count; i++)
+            if (!cache->entries[i].pending &&
+                (found < 0 || cache->entries[i].clock < cache->entries[found].clock))
+                found = i;
+        if (found < 0) return -1;
+        V4GpuExpertMirror *en = &cache->entries[found];
+        if (!(en->block && en->gate && en->up && en->down &&
+              memcmp(lay->dims, en->dims, sizeof(en->dims)) == 0)) {
+            /* not a block mirror of this shape: rebuild the entry as one */
+            if (en->gate) cache->ops->tensor_free(en->gate);
+            if (en->up) cache->ops->tensor_free(en->up);
+            if (en->down) cache->ops->tensor_free(en->down);
+            en->gate = en->up = en->down = NULL;
+            if (!cache->ops->mirror_alloc(&en->gate, &en->up, &en->down, lay->dims[0],
+                                          lay->dims[1], lay->dims[2], lay->dims[3],
+                                          cache->device)) {
+                if (found == cache->count - 1) cache->count--;
+                else cache->entries[found] = cache->entries[--cache->count];
+                cache->last_free_mb = 0;
+                cache->upload_failed = 1;
+                cache->grown_bytes = 0;
+                return -1;
+            }
+            en->block = 1;
+            memcpy(en->dims, lay->dims, sizeof(en->dims));
+        }
+    } else {
+        found = cache->count;
+        V4GpuExpertMirror *en = &cache->entries[found];
+        memset(en, 0, sizeof(*en));
+        if (!cache->ops->mirror_alloc(&en->gate, &en->up, &en->down, lay->dims[0],
+                                      lay->dims[1], lay->dims[2], lay->dims[3],
+                                      cache->device)) {
+            cache->last_free_mb = 0;
+            cache->upload_failed = 1;
+            cache->grown_bytes = 0;
+            return -1;
+        }
+        cache->count++;
+        cache->grown_bytes += mirror_bytes;
+        en->block = 1;
+        memcpy(en->dims, lay->dims, sizeof(en->dims));
+    }
+    V4GpuExpertMirror *en = &cache->entries[found];
+    en->layer = key.layer;
+    en->expert = key.expert;
+    en->pending = 1;
+    en->clock = ++cache->clock;
+    job->cache = cache;
+    job->gate = en->gate; job->up = en->up; job->down = en->down;
+    return 0;
+}
+void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
+                               const V4PieceLayout *lay, const void *slab, size_t slab_bytes) {
+    if (!store || !store->gpu || !lay) return NULL;
+    V4GpuExpertMirrorCache *primary = (V4GpuExpertMirrorCache *)store->gpu;
+    if (!__atomic_load_n(&g_v4_pc_window, __ATOMIC_ACQUIRE) || primary->capacity < 8 ||
+        !v4_pieces_on(primary))
+        return NULL;
+    if (lay->dims[1] % 32 || lay->dims[3] % 32 || lay->S <= 0 || lay->Wb <= 0) return NULL;
+    /* a DLL whose shims answer but whose exports are missing fails every
+     * copy: after the first failures with no success, stop reserving */
+    if (__atomic_load_n(&g_v4_pc_abort, __ATOMIC_RELAXED) >= 8 &&
+        !__atomic_load_n(&g_v4_pc_done, __ATOMIC_RELAXED))
+        return NULL;
+    /* the card, as the uploader thread would pick it (one split counter) */
+    V4GpuExpertMirrorCache *own = primary, *other = primary->next;
+    if (primary->next) {
+        int pct = v4_dev2_split_percent();
+        unsigned k = __atomic_fetch_add(&g_v4_up_split, 1u, __ATOMIC_RELAXED) % 100u;
+        if (pct > 0 && k < (unsigned)pct) { own = primary->next; other = primary; }
+    }
+    /* the slab page-locked NOW, with no read in flight on it: registering
+     * it under the drive's DMA left stale bytes in the pieces still landing
+     * (WDDM moves the pages); without the export the pieces stay off */
+    if (!primary->ops->host_pin || !slab || !slab_bytes ||
+        !primary->ops->host_pin(slab, slab_bytes))
+        return NULL;
+    V4PieceJob *job = calloc(1, sizeof(*job));
+    if (!job) return NULL;
+    job->lay = *lay;
+    job->key = key;
+    int placed = -1;
+    for (int attempt = 0; attempt < 2 && placed; attempt++) {
+        V4GpuExpertMirrorCache *c = attempt ? other : own;
+        if (!c || !c->ops->mirror_copy || !c->ops->mirror_point || !c->ops->mirror_alloc)
+            continue;
+        pthread_mutex_lock(&c->mutex);
+        placed = v4_gpu_mirror_reserve(c, key, lay, job);
+        pthread_mutex_unlock(&c->mutex);
+    }
+    if (placed) { free(job); return NULL; }
+    job->ok = 1;
+    __atomic_fetch_add(&primary->misses, 1ULL, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_v4_pc_begun, 1ULL, __ATOMIC_RELAXED);
+    return job;
+}
+void coli_v4_gpu_pieces_land(void *ctx, unsigned long long rec_off, size_t len,
+                             const unsigned char *ptr) {
+    V4PieceJob *job = ctx;
+    if (!job || !job->ok || !len || !ptr) return;
+    double t0 = v4_up_now();
+    long long a = (long long)rec_off, b = a + (long long)len;
+    long long S = job->lay.S, T = S + job->lay.Wb;
+    if (a < 0 || b > T) { job->ok = 0; return; }
+    if (a == 0) job->sptr = ptr;
+    if (a == S) job->wptr = ptr;
+    if (a < S) {
+        long long n = (b < S ? b : S) - a;
+        if (!job->cache->ops->mirror_copy(job->gate, 0, a, (const uint8_t *)ptr, n)) {
+            job->ok = 0; return;
+        }
+        job->copies++;
+    }
+    if (b > S) {
+        long long lo = a > S ? a : S;
+        if (!job->cache->ops->mirror_copy(job->gate, 1, lo - S,
+                                          (const uint8_t *)ptr + (lo - a), b - lo)) {
+            job->ok = 0; return;
+        }
+        job->copies++;
+    }
+    job->landed += (long long)len;
+    job->enqueue_s += v4_up_now() - t0;
+}
+void coli_v4_gpu_pieces_end(void *ctx, int ok) {
+    V4PieceJob *job = ctx;
+    if (!job) return;
+    V4GpuExpertMirrorCache *c = job->cache;
+    int complete = ok && job->ok && job->landed == job->lay.S + job->lay.Wb &&
+                   c->ops->mirror_point(job->gate, job->up, job->down, job->lay.S,
+                                        job->lay.soff, job->lay.Wb, job->lay.woff);
+    if (complete && v4_pieces_verify() == 1 && c->ops->mirror_check) {
+        static unsigned long long checked, bad;
+        long long rs = job->sptr ? c->ops->mirror_check(job->gate, 0, 0, job->sptr, job->lay.S) : -3;
+        long long rw = job->wptr ? c->ops->mirror_check(job->gate, 1, 0, job->wptr, job->lay.Wb) : -3;
+        unsigned long long n = __atomic_add_fetch(&checked, 1ULL, __ATOMIC_RELAXED);
+        if (rs != -1 || rw != -1) {
+            unsigned long long nb = __atomic_add_fetch(&bad, 1ULL, __ATOMIC_RELAXED);
+            if (nb <= 20)
+                fprintf(stderr, "v4_gpu pieces verify: layer %d expert %d scales=%lld weights=%lld (first bad offset; -1 equal, -2 error, -3 no pointer) S=%lld Wb=%lld\n",
+                        job->key.layer, job->key.expert, rs, rw, job->lay.S, job->lay.Wb);
+        }
+        if (n % 1000 == 0)
+            fprintf(stderr, "v4_gpu pieces verify: checked=%llu bad=%llu\n", n,
+                    __atomic_load_n(&bad, __ATOMIC_RELAXED));
+    }
+    pthread_mutex_lock(&c->mutex);
+    for (int i = 0; i < c->count; i++) {   /* by handle: entries move when one is dropped */
+        V4GpuExpertMirror *en = &c->entries[i];
+        if (en->gate != job->gate) continue;
+        en->pending = 0;
+        if (complete) en->clock = ++c->clock;
+        else { en->layer = -1; en->expert = -1; en->clock = 0; }   /* empty: recycled first */
+        break;
+    }
+    pthread_mutex_unlock(&c->mutex);
+    pthread_mutex_lock(&g_v4_pc_mutex);
+    if (complete) g_v4_pc_done++; else g_v4_pc_abort++;
+    g_v4_pc_copies += (unsigned long long)job->copies;
+    g_v4_pc_enqueue_s += job->enqueue_s;
+    pthread_mutex_unlock(&g_v4_pc_mutex);
+    free(job);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -13823,7 +14337,7 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
         pthread_mutex_lock(&c->mutex);
         for (int i = 0; i < c->count; i++) {
             if (c->entries[i].layer == view->key.layer &&
-                c->entries[i].expert == view->key.expert &&
+                c->entries[i].expert == view->key.expert && !c->entries[i].pending &&
                 c->entries[i].gate && c->entries[i].up &&
                 c->entries[i].down) {
                 c->entries[i].clock = ++c->clock;
@@ -13849,7 +14363,7 @@ int coli_v4_gpu_expert_resident(ColiExpertStore *store, ColiExpertKey key,
         pthread_mutex_lock(&c->mutex);
         for (int i = 0; i < c->count; i++) {
             if (c->entries[i].layer == key.layer &&
-                c->entries[i].expert == key.expert &&
+                c->entries[i].expert == key.expert && !c->entries[i].pending &&
                 c->entries[i].gate && c->entries[i].up &&
                 c->entries[i].down) {
                 c->entries[i].clock = ++c->clock;
@@ -13881,10 +14395,12 @@ int coli_v4_gpu_expert_mirrors_make_room(ColiExpertStore *store, long long need_
         for (;;) {
             long long free_mb = cache->ops->mem_free_mb(cache->device);
             if (free_mb < 0 || free_mb >= need_mb || cache->count == 0) break;
-            int victim = 0;
-            for (int i = 1; i < cache->count; i++)
-                if (cache->entries[i].clock < cache->entries[victim].clock)
+            int victim = -1;
+            for (int i = 0; i < cache->count; i++)
+                if (!cache->entries[i].pending &&
+                    (victim < 0 || cache->entries[i].clock < cache->entries[victim].clock))
                     victim = i;
+            if (victim < 0) break;
             if (cache->entries[victim].gate) cache->ops->tensor_free(cache->entries[victim].gate);
             if (cache->entries[victim].up) cache->ops->tensor_free(cache->entries[victim].up);
             if (cache->entries[victim].down) cache->ops->tensor_free(cache->entries[victim].down);

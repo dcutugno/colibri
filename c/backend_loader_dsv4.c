@@ -200,6 +200,10 @@ typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_group_fence)(int device);
 typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **g, Dsv4CudaTensor **u, Dsv4CudaTensor **d, int Og, int Ig, int Od, int Id, int device);
 typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, const uint8_t *scales, long long S, const long long *soff, const uint8_t *weights, long long Wb, const long long *woff, int sync);
+typedef int             (*fn_mirror_copy)(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len);
+typedef int             (*fn_host_pin)(const void *p, size_t len);
+typedef int             (*fn_mirror_point)(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, long long S, const long long *soff, long long Wb, const long long *woff);
+typedef long long       (*fn_mirror_check)(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -350,6 +354,9 @@ static struct {
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
     fn_group_fence group_fence;                  /* optional: upload fence inside the expert group */
     fn_mirror_alloc mirror_alloc; fn_mirror_refill mirror_refill;   /* optional: one-block mirrors */
+    fn_mirror_copy mirror_copy; fn_mirror_point mirror_point;       /* optional: read -> upload pieces */
+    fn_mirror_check mirror_check;                                   /* optional: diagnostic */
+    fn_host_pin host_pin;                                           /* optional: pieces pin the slab first */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -397,6 +404,7 @@ static struct {
     fn_tensor_refill_fp4 tensor_refill_fp4; fn_tensor_free tensor_free;
     fn_expert_group expert_group; fn_stream_drain stream_drain; fn_group_fence group_fence;
     fn_mirror_alloc mirror_alloc; fn_mirror_refill mirror_refill;
+    fn_mirror_copy mirror_copy; fn_mirror_point mirror_point; fn_mirror_check mirror_check; fn_host_pin host_pin;
     fn_mem_free_mb mem_free_mb; fn_backend_arch_ok backend_arch_ok;
     fn_backend_name backend_name; fn_device_unified device_unified;
 } g_dsv4b;
@@ -587,6 +595,10 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.group_fence = (fn_group_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_group_fence");
     g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
     g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
+    g_dsv4.mirror_copy = (fn_mirror_copy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_copy");
+    g_dsv4.mirror_point = (fn_mirror_point)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_point");
+    g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
+    g_dsv4.host_pin = (fn_host_pin)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_pin");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
@@ -1012,6 +1024,22 @@ int dsv4_cuda_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor
     if(!g_dsv4.available||!g_dsv4.mirror_refill) return 0;
     return g_dsv4.mirror_refill(g, u, d, scales, S, soff, weights, Wb, woff, sync);
 }
+int dsv4_cuda_mirror_copy(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len){
+    if(!g_dsv4.available||!g_dsv4.mirror_copy) return 0;   /* older DLL: the engine keeps its uploader path */
+    return g_dsv4.mirror_copy(g, run, off, src, len);
+}
+int dsv4_cuda_host_pin(const void *p, size_t len){
+    if(!g_dsv4.available||!g_dsv4.host_pin) return 0;
+    return g_dsv4.host_pin(p, len);
+}
+int dsv4_cuda_mirror_point(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, long long S, const long long *soff, long long Wb, const long long *woff){
+    if(!g_dsv4.available||!g_dsv4.mirror_point) return 0;
+    return g_dsv4.mirror_point(g, u, d, S, soff, Wb, woff);
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len){
+    if(!g_dsv4.available||!g_dsv4.mirror_check) return -2;
+    return g_dsv4.mirror_check(g, run, off, src, len);
+}
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,
                              int count, int window, int dim){
@@ -1258,6 +1286,10 @@ int dsv4_cuda_secondary_open(int device){
     RESOLVE2(group_fence, fn_group_fence, "dsv4_cuda_group_fence", 0);
     RESOLVE2(mirror_alloc, fn_mirror_alloc, "dsv4_cuda_mirror_alloc", 0);
     RESOLVE2(mirror_refill, fn_mirror_refill, "dsv4_cuda_mirror_refill", 0);
+    RESOLVE2(mirror_copy, fn_mirror_copy, "dsv4_cuda_mirror_copy", 0);
+    RESOLVE2(mirror_point, fn_mirror_point, "dsv4_cuda_mirror_point", 0);
+    RESOLVE2(mirror_check, fn_mirror_check, "dsv4_cuda_mirror_check", 0);
+    RESOLVE2(host_pin, fn_host_pin, "dsv4_cuda_host_pin", 0);
     RESOLVE2(backend_name, fn_backend_name, "dsv4_cuda_backend_name", 0);
     RESOLVE2(device_unified, fn_device_unified, "dsv4_cuda_device_unified", 0);
     #undef RESOLVE2
@@ -1306,6 +1338,18 @@ int dsv4_cuda2_mirror_alloc(Dsv4CudaTensor **g, Dsv4CudaTensor **u, Dsv4CudaTens
 }
 int dsv4_cuda2_mirror_refill(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, const uint8_t *scales, long long S, const long long *soff, const uint8_t *weights, long long Wb, const long long *woff, int sync){
     return g_dsv4b.available && g_dsv4b.mirror_refill ? g_dsv4b.mirror_refill(g, u, d, scales, S, soff, weights, Wb, woff, sync) : 0;
+}
+int dsv4_cuda2_mirror_copy(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len){
+    return g_dsv4b.available && g_dsv4b.mirror_copy ? g_dsv4b.mirror_copy(g, run, off, src, len) : 0;
+}
+int dsv4_cuda2_mirror_point(Dsv4CudaTensor *g, Dsv4CudaTensor *u, Dsv4CudaTensor *d, long long S, const long long *soff, long long Wb, const long long *woff){
+    return g_dsv4b.available && g_dsv4b.mirror_point ? g_dsv4b.mirror_point(g, u, d, S, soff, Wb, woff) : 0;
+}
+int dsv4_cuda2_host_pin(const void *p, size_t len){
+    return g_dsv4b.available && g_dsv4b.host_pin ? g_dsv4b.host_pin(p, len) : 0;
+}
+long long dsv4_cuda2_mirror_check(Dsv4CudaTensor *g, int run, long long off, const uint8_t *src, long long len){
+    return g_dsv4b.available && g_dsv4b.mirror_check ? g_dsv4b.mirror_check(g, run, off, src, len) : -2;
 }
 long long dsv4_cuda2_mem_free_mb(int device){
     return g_dsv4b.available ? g_dsv4b.mem_free_mb(device) : -1;

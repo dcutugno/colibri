@@ -63,6 +63,10 @@ EXPORTS
     dsv4_cuda_group_fence
     dsv4_cuda_mirror_alloc
     dsv4_cuda_mirror_refill
+    dsv4_cuda_mirror_copy
+    dsv4_cuda_host_pin
+    dsv4_cuda_mirror_point
+    dsv4_cuda_mirror_check
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
     dsv4_cuda_final_argmax
