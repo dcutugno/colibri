@@ -957,6 +957,14 @@ are cheaper than pinned DMA, and the pageable downloads between launches
 were not stalling the host (the `DSV4_PROJ_KPROF` per-launch times in
 `dsv4_cuda_decode_proj_multi` sit at a ~35 us floor either way).
 
+Twenty-fifth measurement (2026-10-30): the hyper-connection post and
+the pre's collapse as plain loops when `V4_HC_PAR` <= 1. Their OpenMP
+forms with the `if` clause false were still outlined by the runtime and
+ran scalar (`collapse(2)` recovering the two indices per iteration); the
+plain loops vectorize across columns with each element's chain in its
+order: bitwise (md5 85d209f4e138). `decprof` hc post 4.8 -> 3.8 ms per
+token, pre unchanged (14).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection

@@ -196,8 +196,19 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
         free(mixes);
         return -1;
     }
+    /* V4_HC_PAR <= 1: a plain loop, so the compiler vectorizes across
+     * columns (each column's own short chain, in its order: bitwise); the
+     * OpenMP form, even with its `if` false, is outlined and stays scalar. */
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(coli_hc_par() > 1)
+    if (coli_hc_par() > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int column = 0; column < dimension; column++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++)
+                sum += pre[copy] * input[copy * dimension + column];
+            output[column] = sum;
+        }
+    } else
 #endif
     for (int column = 0; column < dimension; column++) {
         float sum = 0.0f;
@@ -223,8 +234,23 @@ static inline int coli_hc_post(float *output, const float *branch,
      * collapse(2) gives full-width parallelism regardless of hc's small
      * size. The inner source-reduction (hc terms) keeps its own order. */
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static) if(coli_hc_par() > 1)
+    if (coli_hc_par() > 1) {
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int destination = 0; destination < hc; destination++) {
+            for (int column = 0; column < dimension; column++) {
+                float value = 0.0f;
+                for (int source = 0; source < hc; source++)
+                    value += comb[source * hc + destination] *
+                             residual[source * dimension + column];
+                value += post[destination] * branch[column];
+                output[destination * dimension + column] = value;
+            }
+        }
+        return 0;
+    }
 #endif
+    /* V4_HC_PAR <= 1: the plain loops (see coli_hc_pre): vectorized across
+     * columns, each element's chain in its order. */
     for (int destination = 0; destination < hc; destination++) {
         for (int column = 0; column < dimension; column++) {
             float value = 0.0f;
