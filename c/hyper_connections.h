@@ -325,8 +325,8 @@ static inline void coli_hc_prof_add(int part, double sec) {
                 acc[3] / calls * 1e6, acc[4] / calls * 1e6);
 }
 
-static inline int coli_hc_pre(float *output, float *post, float *comb,
-                              const float *input, const float *hc_fn,
+static inline int coli_hc_pre(float *restrict output, float *restrict post, float *restrict comb,
+                              const float *restrict input, const float *restrict hc_fn,
                               const float scale[3], const float *base,
                               int hc, int dimension, int iterations,
                               float norm_eps, float hc_eps) {
@@ -428,9 +428,9 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
 /* Leaving a block: mix the incoming streams through `comb` and add the block's
  * output where `post` says it goes. `output` and `residual` are [hc*dimension]
  * and may not overlap. */
-static inline int coli_hc_post(float *output, const float *branch,
-                               const float *residual, const float *post,
-                               const float *comb, int hc, int dimension) {
+static inline int coli_hc_post(float *restrict output, const float *restrict branch,
+                               const float *restrict residual, const float *restrict post,
+                               const float *restrict comb, int hc, int dimension) {
     if (!output || !branch || !residual || !post || !comb ||
         hc < 1 || dimension < 1)
         return -1;

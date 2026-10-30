@@ -1747,6 +1747,44 @@ __global__ void indexer_headw_lanes_kernel(float*hw,const uint16_t*w,const float
     if(lane==0)hw[(long long)t*heads+h]=__fmul_rn(sum,wscale);
 }
 
+/* DSV4_IDX_HEADW (2): one warp per head on its own block (the lanes kernel
+ * above puts all heads' lanes in one block, on one SM), the row's 256-column
+ * chunks (512 bytes, one coalesced load) double-buffered so the next
+ * chunk's load overlaps the chain's 256 steps, and x staged in shared
+ * memory once; lane 0 runs the chain in the same element order (bitwise:
+ * DSV4_IDX_VERIFY counts its head weights against the CPU's). hidden a
+ * multiple of 256. 1 = the lanes kernel, 0 = the direct one. */
+#define HEADW_WCHUNK 256
+__global__ void __launch_bounds__(32) indexer_headw_warp_kernel(float*hw,const uint16_t*w,const float*x,int heads,int hidden,
+        float wscale,int hw_fma){
+    extern __shared__ unsigned char headw_wsh[];
+    int t=blockIdx.y,h=blockIdx.x,lane=threadIdx.x;
+    if(h>=heads)return;
+    uint4*buf=(uint4*)headw_wsh;                       /* [2][32] */
+    float4*xs=(float4*)(headw_wsh+2*32*sizeof(uint4));  /* hidden/4 float4 */
+    const uint16_t*row=w+(long long)h*hidden;const float4*xv=(const float4*)(x+(long long)t*hidden);
+    for(int i=lane;i<hidden/4;i+=32)xs[i]=xv[i];
+    buf[lane]=*(const uint4*)(row+lane*8);
+    __syncwarp();
+    float sum=0.f;
+    int chunks=hidden/HEADW_WCHUNK;
+    for(int it=0;it<chunks;it++){
+        int c0=it*HEADW_WCHUNK;
+        if(it+1<chunks)buf[((it+1)&1)*32+lane]=*(const uint4*)(row+c0+HEADW_WCHUNK+lane*8);
+        if(lane==0){
+            const uint4*my=buf+(it&1)*32;
+            #pragma unroll
+            for(int part=0;part<32;part++){
+                int c=(c0>>3)+part;
+                headw_step8(sum,my[part],xs[2*c],xs[2*c+1],hw_fma);
+            }
+        }
+        __syncwarp();
+    }
+    if(lane==0)hw[(long long)t*heads+h]=__fmul_rn(sum,wscale);
+}
+static int idx_headw_mode(void){static int m=-1;if(m<0){const char*e=getenv("DSV4_IDX_HEADW");m=e&&*e?atoi(e):2;if(m<0)m=0;if(m>2)m=2;}return m;}
+
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what);
 
 /* Batch of one: one thread per output row (the per-token kernels above give a
@@ -1827,6 +1865,44 @@ __global__ void indexer_score_small_kernel(float*scores,const float*queries,cons
         scores[(long long)t*count+c]=score;
     }
 }
+
+/* DSV4_IDX_SCORE_K (8): the few-token scoring with a block of `heads`
+ * threads walking K candidates in a row over queries staged in shared
+ * memory once (the kernel above stages the token's 32 KB of queries for
+ * every candidate: ~27 MB of L2 traffic per layer for 830 candidates,
+ * 0.09 ms with the chains ~0.5 us); per candidate the key row, each
+ * thread's sequential dot and thread 0's fold over the heads in order, as
+ * above (bitwise: DSV4_IDX_VERIFY counts the scores). 1 = the kernel above. */
+__global__ void indexer_score_multi_kernel(float*scores,const float*queries,const float*keys,
+        const float*head_w,const int*counts,int heads,int dim,int count,int K){
+    int t=blockIdx.y,c0=blockIdx.x*K,h=threadIdx.x;
+    extern __shared__ float sm_[];
+    float*qs=sm_;                      /* heads x (dim+1) */
+    float*ks=sm_+(size_t)heads*(dim+1);  /* dim */
+    float*dots=ks+dim;                 /* heads */
+    int qn=heads*dim;
+    for(int i=h;i<qn;i+=blockDim.x){int hh=i/dim,d=i-hh*dim;qs[hh*(dim+1)+d]=queries[(long long)t*qn+i];}
+    const float*q=qs+h*(dim+1);
+    int cn=counts[t];
+    for(int k=0;k<K;k++){
+        int c=c0+k;if(c>=count)break;
+        __syncthreads();
+        for(int i=h;i<dim;i+=blockDim.x)ks[i]=keys[(long long)c*dim+i];
+        __syncthreads();
+        float dot=0.f;
+        for(int i=0;i<dim;i++)dot=__fadd_rn(dot,__fmul_rn(q[i],ks[i]));
+        dots[h]=dot;
+        __syncthreads();
+        if(!h){
+            float score=0.f;
+            if(c<cn)
+                for(int hh=0;hh<heads;hh++)
+                    score=__fadd_rn(score,__fmul_rn(fmaxf(dots[hh],0.f),head_w[(long long)t*heads+hh]));
+            scores[(long long)t*count+c]=score;
+        }
+    }
+}
+static int idx_score_k(void){static int k=-1;if(k<0){const char*e=getenv("DSV4_IDX_SCORE_K");k=e&&*e?atoi(e):8;if(k<1)k=1;if(k>64)k=64;}return k;}
 
 static int g_idx_kprof=-1;
 
@@ -1944,7 +2020,10 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     indexer_prep_kernel<<<dim3(heads,tokens),dim,(size_t)dim*4,c->stream>>>(c->p2,dcos,dsin,heads,dim,rope_dim,had_scale,rope_fma);
     if(!ok(cudaGetLastError(),"fused indexer prep launch"))return 0;
     if(g_idx_kprof)cudaEventRecord(ev[2],c->stream);
-    if(tokens==1&&hidden%HEADW_CHUNK==0&&heads*HEADW_LANES<=1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
+    size_t wsh=2*32*sizeof(uint4)+(size_t)hidden*sizeof(float);
+    if(idx_headw_mode()==2&&hidden%HEADW_WCHUNK==0&&wsh<=48*1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
+        indexer_headw_warp_kernel<<<dim3(heads,tokens),32,wsh,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    else if(idx_headw_mode()==1&&tokens==1&&hidden%HEADW_CHUNK==0&&heads*HEADW_LANES<=1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
         indexer_headw_lanes_kernel<<<1,heads*HEADW_LANES,(size_t)heads*HEADW_PAD,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
     else
         indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
@@ -1952,7 +2031,9 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     if(g_idx_kprof)cudaEventRecord(ev[3],c->stream);
     size_t sm_small=((size_t)heads*(dim+1)+dim+heads)*4;
     if(tokens<=4&&sm_small<=48*1024){
-        indexer_score_small_kernel<<<dim3(count,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
+        int K=idx_score_k();
+        if(K>1)indexer_score_multi_kernel<<<dim3((count+K-1)/K,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count,K);
+        else indexer_score_small_kernel<<<dim3(count,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
     }else{
         if(idx_coal_on()&&g_idx_keys_t[layer]){
             if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_coal_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;

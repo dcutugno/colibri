@@ -995,6 +995,26 @@ copies. `decprof` hc 13.6 -> 10.2 ms per token (pre 10.0 -> 7.0); after
 the first token 11.40 / 11.26 s (36 tokens). A concurrent caller finds
 the helpers taken and runs the groups itself.
 
+Twenty-eighth measurement (2026-10-30): the indexer's two latency-bound
+one-token kernels (`DSV4_IDX_KPROF`, per token over the 21 indexer
+layers). `DSV4_IDX_HEADW` (2): the head weights as one warp per head on
+its own block (the lanes kernel put all 64 heads' lanes in one block on
+one SM), the row's 256-column chunks double-buffered so the next chunk's
+load overlaps the chain's steps, x staged in shared memory once; lane 0
+runs the same chain: headw 1.84 -> 0.38 ms. `DSV4_IDX_SCORE_K` (8): the
+scoring with a block of 64 head threads walking eight candidates over
+queries staged once (the per-candidate kernel re-staged the token's 32 KB
+of queries 830 times, ~27 MB of traffic per layer): score 1.90 -> 0.83
+ms (K=4 1.09, K=16 1.13, K=1 the old kernel). Both bitwise:
+`DSV4_IDX_VERIFY=1` over the 3.3k prompt and 36 tokens, 1,281 calls
+(prefill batches and decode tokens), 0 differing head weights or
+scores; md5 85d209f4e138. Attention 36 -> 34 ms per token; after the
+first token 11.20 s. The indexer's device time per token is now proj
+1.8 (the serial reference chain over 32 MB, at ~400 GB/s) + 1.6 of
+kernels; the select phase's rest is host. Also tried: `restrict` on
+the hyper-connection pre/post pointers (no change: post stays 3.0 ms,
+so its time is not the loop), kept as documentation of the contract.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1150,6 +1170,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_HC_MIX_TEAM` (4) | the grouped mix's threads: the calling thread and N-1 persistent helpers (spin, then sleep on a condition variable); `1` = the calling thread alone |
 | `V4_HC_MIX_SPIN` (50000) | pauses a helper spins for the next job before it sleeps |
 | `DSV4_HC_PROF` (off) | the pre's parts timed per call, printed every 1000 calls (`hcprof`) |
+| `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
+| `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
