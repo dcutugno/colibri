@@ -29,6 +29,37 @@
 
 #include <math.h>
 #include <stdlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* V4_HC_PAR (1): how the two steps use OpenMP. 0 = every loop on the
+ * calling thread; 1 = only the mix (the ~400k-MAC row loop) on a team no
+ * larger than its row count, the column loops on the calling thread (a
+ * decode token's 4 x 4096 column work is a few microseconds, a 32-thread
+ * fork and join several times that); 2 = every loop on the full team.
+ * Each row's and each column's summation order is the same in all three:
+ * bitwise. */
+static inline int coli_hc_par(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("V4_HC_PAR");
+        mode = e && *e ? atoi(e) : 1;
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+    }
+    return mode;
+}
+static inline int coli_hc_team(int rows) {
+#ifdef _OPENMP
+    int team = omp_get_max_threads();
+    if (coli_hc_par() == 1 && rows < team) team = rows;
+    return team > 0 ? team : 1;
+#else
+    (void)rows;
+    return 1;
+#endif
+}
 
 static inline float coli_hc_sigmoid(float value) {
     if (value >= 0.0f) {
@@ -151,7 +182,7 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
      * this distributes whole rows across threads and is not a SIMD reduction
      * reorder. Nested parallelism was checked separately and is safe here. */
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(coli_hc_par() > 0) num_threads(coli_hc_team(mix_count))
 #endif
     for (int row = 0; row < mix_count; row++) {
         float sum = 0.0f;
@@ -166,7 +197,7 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
         return -1;
     }
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(coli_hc_par() > 1)
 #endif
     for (int column = 0; column < dimension; column++) {
         float sum = 0.0f;
@@ -192,7 +223,7 @@ static inline int coli_hc_post(float *output, const float *branch,
      * collapse(2) gives full-width parallelism regardless of hc's small
      * size. The inner source-reduction (hc terms) keeps its own order. */
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) if(coli_hc_par() > 1)
 #endif
     for (int destination = 0; destination < hc; destination++) {
         for (int column = 0; column < dimension; column++) {

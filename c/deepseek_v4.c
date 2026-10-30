@@ -4973,7 +4973,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         int qok = xq && yq && xs;
         if (qok) {
             int qfail = 0;
-            #pragma omp parallel for schedule(dynamic, 4)
+            #pragma omp parallel for schedule(dynamic, 4) if(need > 1)
             for (int i = 0; i < need; i++) {
                 int t = stoken[i];
                 if (coli_fp8_activation_qdq_ref(
@@ -4997,8 +4997,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 fsq = (float *)scratch_ptr; scratch_ptr += sz_fsq;
                 fhw = (float *)scratch_ptr; scratch_ptr += sz_fhw;
             }
-            int rok = 1;
-            #pragma omp parallel for schedule(dynamic, 4)
+            int rok = 1;   /* a decode token (need 1) stays on this thread: no team for one iteration */
+            #pragma omp parallel for schedule(dynamic, 4) if(need > 1)
             for (int i = 0; i < need; i++) {
                 int t = stoken[i];
                 memcpy(xin + (size_t)i * hidden, inputs + (size_t)t * hidden,
@@ -7618,7 +7618,7 @@ static int block_token_pipeline(float *output_hc,
     /* DSV4_DECODE_PROF=1: per-token stage totals across layers (printed at
      * layer 0 for the previous token). */
     static int dprof = -1;
-    static double dp_hc = 0, dp_attn = 0, dp_moe = 0;
+    static double dp_hc = 0, dp_attn = 0, dp_moe = 0, dp_hc_pre = 0, dp_hc_post = 0;
     static int dp_layers = 0;
     struct timespec dp0, dp1;
     if (dprof < 0) dprof = getenv("DSV4_DECODE_PROF") != NULL;
@@ -7627,14 +7627,14 @@ static int block_token_pipeline(float *output_hc,
         for (int j = 0, off = 0; j < 16 && g_v4_pred_rank_total[j] && off < 100; j++)
             off += snprintf(rank_hit + off, sizeof(rank_hit) - (size_t)off, "%s%.0f", j ? "/" : "",
                             100.0 * g_v4_pred_rank_hit[j] / g_v4_pred_rank_total[j]);
-        fprintf(stderr, "decprof position=%d layers=%d hc=%.0f attn=%.0f moe=%.0f ms "
+        fprintf(stderr, "decprof position=%d layers=%d hc=%.0f (pre=%.0f post=%.0f) attn=%.0f moe=%.0f ms "
                         "(moe: shared=%.0f loads=%.0f of which attach=%.0f compute=%.0f second=%.0f; "
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
                         "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu pred-hit=%.1f%% of %llu queued=%llu pred2-hit=%.1f%% of %llu dup=%llu rank-hit=%s; "
                         "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms)\n",
-                position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3,
+                position - 1, dp_layers, dp_hc * 1e3, dp_hc_pre * 1e3, dp_hc_post * 1e3, dp_attn * 1e3, dp_moe * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
                 g_v4_dp_compute * 1e3, g_v4_dp_second * 1e3,
                 (unsigned long long)g_v4_dp_read_n,
@@ -7655,7 +7655,7 @@ static int block_token_pipeline(float *output_hc,
                 g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3);
         g_v4_ap_qa = g_v4_ap_comp = g_v4_ap_qb = g_v4_ap_kv = g_v4_ap_sattn = g_v4_ap_wo = 0;
         g_v4_ap_comp_c = g_v4_ap_comp_a = 0;
-        dp_hc = dp_attn = dp_moe = 0; dp_layers = 0;
+        dp_hc = dp_attn = dp_moe = dp_hc_pre = dp_hc_post = 0; dp_layers = 0;
         g_v4_dp_shared = g_v4_dp_loads = g_v4_dp_attach = g_v4_dp_compute = 0;
         g_v4_dp_second = 0;
         g_v4_dp_read_ns = g_v4_dp_read_n = 0;
@@ -7670,8 +7670,10 @@ static int block_token_pipeline(float *output_hc,
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
+    double dph0 = dprof ? v4_wait_clock() : 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (dprof) dp_hc_pre += v4_wait_clock() - dph0;
     DP_MARK(dp_hc);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
@@ -7679,20 +7681,25 @@ static int block_token_pipeline(float *output_hc,
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
     DP_MARK(dp_attn);
+    if (dprof) dph0 = v4_wait_clock();
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (dprof) { double t = v4_wait_clock(); dp_hc_post += t - dph0; dph0 = t; }
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
+    if (dprof) dp_hc_pre += v4_wait_clock() - dph0;
     DP_MARK(dp_hc);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
+    if (dprof) dph0 = v4_wait_clock();
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
+    if (dprof) dp_hc_post += v4_wait_clock() - dph0;
     DP_MARK(dp_hc);
     if (dprof) dp_layers++;
 #undef DP_MARK

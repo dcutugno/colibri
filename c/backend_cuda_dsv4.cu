@@ -1575,6 +1575,21 @@ __global__ void indexer_prep_kernel(float*q,const float*cosv,const float*sinv,in
 
 /* head_w[t][h] = (sum_c bf16(w[h][c]) * x[t][c]) * wscale, sequential fp32;
  * hw_fma 1 = the accumulate fused (vfmadd132ss in the build), 0 = separate. */
+__device__ __forceinline__ void headw_step8(float&sum,uint4 wv,float4 x0,float4 x1,int hw_fma){
+    float w0=__uint_as_float(wv.x<<16),w1=__uint_as_float(wv.x&0xffff0000u),
+          w2=__uint_as_float(wv.y<<16),w3=__uint_as_float(wv.y&0xffff0000u),
+          w4=__uint_as_float(wv.z<<16),w5=__uint_as_float(wv.z&0xffff0000u),
+          w6=__uint_as_float(wv.w<<16),w7=__uint_as_float(wv.w&0xffff0000u);
+    if(hw_fma){
+        sum=fmaf(w0,x0.x,sum);sum=fmaf(w1,x0.y,sum);sum=fmaf(w2,x0.z,sum);sum=fmaf(w3,x0.w,sum);
+        sum=fmaf(w4,x1.x,sum);sum=fmaf(w5,x1.y,sum);sum=fmaf(w6,x1.z,sum);sum=fmaf(w7,x1.w,sum);
+    }else{
+        sum=__fadd_rn(sum,__fmul_rn(w0,x0.x));sum=__fadd_rn(sum,__fmul_rn(w1,x0.y));
+        sum=__fadd_rn(sum,__fmul_rn(w2,x0.z));sum=__fadd_rn(sum,__fmul_rn(w3,x0.w));
+        sum=__fadd_rn(sum,__fmul_rn(w4,x1.x));sum=__fadd_rn(sum,__fmul_rn(w5,x1.y));
+        sum=__fadd_rn(sum,__fmul_rn(w6,x1.z));sum=__fadd_rn(sum,__fmul_rn(w7,x1.w));
+    }
+}
 __global__ void indexer_headw_kernel(float*hw,const uint16_t*w,const float*x,int heads,int hidden,
         float wscale,int hw_fma){
     int t=blockIdx.x,h=threadIdx.x;
@@ -1585,25 +1600,43 @@ __global__ void indexer_headw_kernel(float*hw,const uint16_t*w,const float*x,int
         /* 8 columns per step through 16-byte loads (the chain is latency-bound
          * on the loads, not the FMAs); the same elements in the same order. */
         const uint4*rv=(const uint4*)row;const float4*xv=(const float4*)xi;
-        for(int c=0;c<hidden/8;c++){
-            uint4 wv=rv[c];float4 x0=xv[2*c],x1=xv[2*c+1];
-            float w0=__uint_as_float(wv.x<<16),w1=__uint_as_float(wv.x&0xffff0000u),
-                  w2=__uint_as_float(wv.y<<16),w3=__uint_as_float(wv.y&0xffff0000u),
-                  w4=__uint_as_float(wv.z<<16),w5=__uint_as_float(wv.z&0xffff0000u),
-                  w6=__uint_as_float(wv.w<<16),w7=__uint_as_float(wv.w&0xffff0000u);
-            if(hw_fma){
-                sum=fmaf(w0,x0.x,sum);sum=fmaf(w1,x0.y,sum);sum=fmaf(w2,x0.z,sum);sum=fmaf(w3,x0.w,sum);
-                sum=fmaf(w4,x1.x,sum);sum=fmaf(w5,x1.y,sum);sum=fmaf(w6,x1.z,sum);sum=fmaf(w7,x1.w,sum);
-            }else{
-                sum=__fadd_rn(sum,__fmul_rn(w0,x0.x));sum=__fadd_rn(sum,__fmul_rn(w1,x0.y));
-                sum=__fadd_rn(sum,__fmul_rn(w2,x0.z));sum=__fadd_rn(sum,__fmul_rn(w3,x0.w));
-                sum=__fadd_rn(sum,__fmul_rn(w4,x1.x));sum=__fadd_rn(sum,__fmul_rn(w5,x1.y));
-                sum=__fadd_rn(sum,__fmul_rn(w6,x1.z));sum=__fadd_rn(sum,__fmul_rn(w7,x1.w));
-            }
-        }
+        for(int c=0;c<hidden/8;c++)headw_step8(sum,rv[c],xv[2*c],xv[2*c+1],hw_fma);
     }else if(hw_fma)for(int c=0;c<hidden;c++)sum=fmaf(__uint_as_float((unsigned)row[c]<<16),xi[c],sum);
     else for(int c=0;c<hidden;c++)sum=__fadd_rn(sum,__fmul_rn(__uint_as_float((unsigned)row[c]<<16),xi[c]));
     hw[(long long)t*heads+h]=__fmul_rn(sum,wscale);
+}
+/* One token's head weights with sixteen lanes per head: the lanes fetch the
+ * head's next 128 columns (256 bytes, one coalesced load) into shared
+ * memory and lane 0 runs the row's serial chain from there in the same
+ * element order as the kernel above (bitwise). The direct kernel's one
+ * thread per head is latency-bound on 512 strided 16-byte loads (0.115
+ * ms per layer at 64 heads x 4096); here each chunk costs one load and
+ * 128 steps of the chain. heads*16 threads per block (heads <= 64),
+ * heads*272 bytes of shared memory. */
+#define HEADW_LANES 16
+#define HEADW_CHUNK (HEADW_LANES*8)
+#define HEADW_PAD (HEADW_LANES*16+16)
+__global__ void indexer_headw_lanes_kernel(float*hw,const uint16_t*w,const float*x,int heads,int hidden,
+        float wscale,int hw_fma){
+    extern __shared__ unsigned char headw_sh[];
+    int t=blockIdx.x,h=threadIdx.x/HEADW_LANES,lane=threadIdx.x%HEADW_LANES;
+    if(h>=heads)return;
+    const uint16_t*row=w+(long long)h*hidden;const float4*xv=(const float4*)(x+(long long)t*hidden);
+    uint4*my=(uint4*)(headw_sh+(size_t)h*HEADW_PAD);
+    float sum=0.f;
+    for(int c0=0;c0<hidden;c0+=HEADW_CHUNK){
+        my[lane]=*(const uint4*)(row+c0+lane*8);
+        __syncwarp();
+        if(lane==0){
+            #pragma unroll
+            for(int part=0;part<HEADW_LANES;part++){
+                int c=(c0>>3)+part;
+                headw_step8(sum,my[part],xv[2*c],xv[2*c+1],hw_fma);
+            }
+        }
+        __syncwarp();
+    }
+    if(lane==0)hw[(long long)t*heads+h]=__fmul_rn(sum,wscale);
 }
 
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what);
@@ -1612,22 +1645,33 @@ static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what);
  * block of 32 threads to each row and leave 31 idle), the same per-row
  * accumulation. */
 __global__ void fp8_ref_matmul_rows8_t1_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
+    __shared__ float tab[256];   /* e4m3_dev's values, one load per element instead of its ldexpf */
+    for(int i=threadIdx.x;i<256;i+=blockDim.x)tab[i]=e4m3_dev((uint8_t)i);
+    __syncthreads();
     int o=blockIdx.x*blockDim.x+threadIdx.x;
     if(o>=rows)return;
     int nblk=cols/128;
     const float*scl=bscale+(long long)(o/128)*nblk;
     long long tile=o>>3;int r=o&7;
     float sum=0.f;
+    /* The chain is one thread's serial fadd (the reference order); what
+     * hides its load latency is loads in flight: the inner 128 unrolled by
+     * 16 lets the compiler issue the byte loads ahead of the chain
+     * (DSV4_IDX_KPROF: the 8 MB layer's proj time, before 0.18 ms). */
     for(int base=0;base<cols;base+=128){
         float sc=scl[base/128];
+        #pragma unroll 16
         for(int i=base;i<base+128;i++){
-            float v=e4m3_dev(w[((tile*cols)+i)*8+r]);
+            float v=tab[w[((tile*cols)+i)*8+r]];
             sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(x[i],v),sc));
         }
     }
     y[o]=sum;
 }
 __global__ void fp8_ref_matmul_t1_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
+    __shared__ float tab[256];
+    for(int i=threadIdx.x;i<256;i+=blockDim.x)tab[i]=e4m3_dev((uint8_t)i);
+    __syncthreads();
     int o=blockIdx.x*blockDim.x+threadIdx.x;
     if(o>=rows)return;
     const uint8_t*wr=w+(long long)o*cols;
@@ -1637,7 +1681,8 @@ __global__ void fp8_ref_matmul_t1_kernel(float*y,const uint8_t*w,const float*bsc
     for(int bi=0;bi*128<cols;bi++){
         int base=bi*128,blen=cols-base<128?cols-base:128;
         float acc=0.f;
-        for(int i=base;i<base+blen;i++)acc=__fadd_rn(acc,__fmul_rn(e4m3_dev(wr[i]),x[i]));
+        #pragma unroll 16
+        for(int i=base;i<base+blen;i++)acc=__fadd_rn(acc,__fmul_rn(tab[wr[i]],x[i]));
         a=__dadd_rn(a,__dmul_rn((double)acc,(double)scl[bi]));
     }
     y[o]=__double2float_rn(a);
@@ -1776,10 +1821,12 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     if(g_idx_kprof)for(int i=0;i<6;i++)cudaEventCreate(&ev[i]);
     if(g_idx_kprof)cudaEventRecord(ev[0],c->stream);
     if(tokens==1){
+        /* 64-thread blocks: 8192 rows as 128 blocks over the card's SMs
+         * instead of 32 (each thread's serial chain is unchanged) */
         if(g_idx_packed[layer])
-            fp8_ref_matmul_rows8_t1_kernel<<<(rows+255)/256,256,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+            fp8_ref_matmul_rows8_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
         else
-            fp8_ref_matmul_t1_kernel<<<(rows+255)/256,256,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+            fp8_ref_matmul_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
         if(!ok(cudaGetLastError(),"fused indexer projection launch"))return 0;
     }else{
         float*xt=(idx_coal_on()&&buf((void**)&c->p3,&c->p3cap,xb))?c->p3:nullptr;
@@ -1789,7 +1836,10 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     indexer_prep_kernel<<<dim3(heads,tokens),dim,(size_t)dim*4,c->stream>>>(c->p2,dcos,dsin,heads,dim,rope_dim,had_scale,rope_fma);
     if(!ok(cudaGetLastError(),"fused indexer prep launch"))return 0;
     if(g_idx_kprof)cudaEventRecord(ev[2],c->stream);
-    indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    if(tokens==1&&hidden%HEADW_CHUNK==0&&heads*HEADW_LANES<=1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
+        indexer_headw_lanes_kernel<<<1,heads*HEADW_LANES,(size_t)heads*HEADW_PAD,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    else
+        indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
     if(!ok(cudaGetLastError(),"fused indexer head-weight launch"))return 0;
     if(g_idx_kprof)cudaEventRecord(ev[3],c->stream);
     size_t sm_small=((size_t)heads*(dim+1)+dim+heads)*4;

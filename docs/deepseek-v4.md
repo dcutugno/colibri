@@ -870,6 +870,46 @@ MiB over the x8 link plus the kernels, however they are ordered, and the
 second card's link is already taking its half of the pieces. Left at
 `V4_PRED_TOPK=16`.
 
+Twenty-first measurement (2026-10-30): the token's time outside the MoE
+(hc 26 + attention 43 ms of ~265 at 3.3k context, one card). `decprof`
+splits `hc=` into `pre=`/`post=` (the mHC pre with its norm, the post with
+its round) and the kernel timers (`DSV4_IDX_KPROF`, `DSV4_WO_KPROF`) run
+on decode: the attention chain's device time is its host wall (q 0.08,
+attention 0.135 / 0.047, wo 0.1 ms per layer: the card's bandwidth); the
+fused indexer selection is 0.4 ms of device time per layer (proj 0.18,
+headw 0.10, score 0.09) for one token. The hc pre was 0.21 ms per call for
+~400k multiply-adds: `V4_HC_PAR` (1) keeps the OpenMP team only for the
+mix (the 24-row loop, a team no larger than its rows) and runs the column
+loops of the pre and the whole post on the calling thread (a 4 x 4096
+column pass is microseconds, a 32-thread fork and join several times
+that); `0` = every loop serial (the mix alone is then 0.3 ms per call),
+`2` = every loop on the full team (the old behaviour). Each row's and
+column's summation order is the same in all three: bitwise. Measured (36
+tokens): hc 26 -> 19 ms per token (pre 18 -> 14, post 7 -> 5; `0`: 31),
+after the first token 11.95 -> 11.79 s, md5 bd9c9eae2f2f. The selection
+staging's two one-token OpenMP regions (`if(need > 1)`) go with it.
+
+Twenty-second measurement (2026-10-30): the fused indexer selection's
+one-token kernels (`DSV4_IDX_KPROF`, 64 heads x 128, hidden 4096, ~830
+candidates). The projection (8 MB fp8, one thread per row for the
+reference's serial order) spent its time in `e4m3_dev`'s `ldexpf` and
+branches per element with one warp per scheduler to issue them: the
+kernel now decodes through a 256-entry shared-memory copy of the same
+values (0.18 -> 0.085 ms); unrolling the inner loop and 64-thread blocks,
+tried first, changed nothing (0.17). The head weights (64 rows of 4096
+bf16, one thread per row: 512 strided 16-byte loads in a chain, 0.115 ms)
+run with sixteen lanes per head for one token: the lanes fetch the row's
+next 128 columns as one coalesced load into shared memory and lane 0 runs
+the serial chain from there (0.084 ms). Two staged block designs were
+measured slower on the way (64-column chunks 0.20, 256-column chunks with
+a per-thread load array 0.15: sync round trips, then local-memory
+spills). The device time per indexer layer 0.40 -> 0.28 ms; `DSV4_IDX_VERIFY=1`
+reports no mismatch over the prompt and the decode (every fused layer:
+q, head weights and scores 0). Measured with the hc change above (3.3k
+prompt, 36 tokens, one card): attention 43 -> 40 ms per token (`select`
+15 -> 10), hc 26 -> 18, after the first token 11.95 -> 11.64 s, md5
+bd9c9eae2f2f.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1017,6 +1057,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PRED_PIECES` (1) | the prefetch lanes also reserve VRAM mirrors and copy the pieces as they read (a hit is a mirror); `0` = RAM only; `2` = the copies on a prefetch stream of their own, the group waiting per mirror (measured equal to `1`) |
 | `V4_PRED_DEPTH` (1) | `2` = the layer after next predicted too, by its own gate on this layer's FFN input, queued behind the next layer's; measured slower (moe 198 -> 203 ms: the extra uploads and mirror reservations outweigh the wider window) |
 | `V4_PRED_TOPK` (16) | `=M` queues only the first M of a router layer's predicted set in the router's rank order (ranks 5 and 6 hit ~55 / 40 %); measured equal (fewer reads, the same time) |
+| `V4_HC_PAR` (1) | the hyper-connection steps' OpenMP use: `1` = a team (no larger than its 24 rows) for the pre's mix only, the column loops and the post on the calling thread; `0` = all serial; `2` = every loop on the full team (bitwise in all three; measured hc 26 / 31 / 19 ms per token for 2 / 0 / 1) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
