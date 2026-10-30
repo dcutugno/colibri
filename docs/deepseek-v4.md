@@ -807,6 +807,36 @@ and dropped whenever a mirror is about to be rewritten. `2` = verify:
 the device copy against the host array before each take (`resident`
 lines). Same bytes: bitwise. Measured (3.3k prompt, 36 tokens, two A/B pairs): time to first token 40.6 / 40.5 -> 39.8 / 39.7 s; the verify over the whole prompt (4472 takes) reports no mismatch; the greedy text unchanged.
 
+Eighteenth measurement (2026-10-30): the next layer's experts predicted
+and read ahead during decode. `V4_PRED_NEXT` (2): a predictor thread
+scores layer L+1's gate (bf16 rows, the router's own sqrt(softplus)+bias
+top-k order) on layer L's FFN input the moment layer L's routing is
+done, and queues the predicted experts that neither the RAM cache nor a
+card holds to N lanes of the prefetch pool; a hash-router layer's set is
+exact from the token id and is queued before the layer starts. Measured
+hit rate 74-78 % of the 258 routed experts per token (~110 queued).
+`V4_PRED_PIECES` (1): the lanes reserve VRAM mirrors and copy the pieces
+as they land, as the decode lanes do (`V4_UPLOAD_PIECES`), so a hit is a
+mirror and not a RAM slab to upload; `0` = RAM only; `2` = the copies on
+a prefetch stream of their own with a per-mirror event the expert group
+waits on (measured equal to `1`: the fence the group waits for is the
+lanes' own uploads, not the prefetch's). `decprof` gained
+`pred-hit=P% of N queued=Q`. Never a different token: a wrong guess
+costs disk bandwidth in a window the disk would otherwise idle, and the
+one-card text is bitwise (md5 bd9c9eae2f2f). Measured (3.3k prompt, 36
+tokens, --memory-gb 16): one card moe 224 -> 197 ms per token (loads 167
+-> 87, compute 29 -> 82: the lanes' PCIe uploads, ~100 experts x 12 MB
+per token, are now the exposed floor under the fence that the reads used
+to hide), after the first token 12.58 -> 11.87 s; two cards moe 188 ->
+163 ms. 3 or 4 lanes: no better than 2. Found on the way and fixed: with
+two cards, an expert that a lane's probe found resident during the layer
+(common now that the prefetch lands mirrors mid-layer) was counted into
+the second card's late group but excluded from its arrays as if the early
+group had covered it, leaving uninitialized expert pointers (a crash at
+the first token or a hang after a few); the early group's experts are
+now flagged apart and the late group is counted by the test that fills
+it.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -950,6 +980,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_KPROF` (0, `.cu`) | per card: device time of the group's kernels vs the call's host wall (`moekprof`, every 430 calls) |
 | `V4_UPLOAD_THREADS` (1) | decode attach on one uploader thread per card (aux-stream copies, joined before compute); `0` = attach inline from the lane loop |
 | `V4_READ_STRIPE` (off) | `1` = read each expert window as two halves from the two mirror replicas at once (Windows overlapped twins). Measured with `COLI_MODEL_MIRROR` on a second NVMe (826-token prompt, 60 tokens): decode 24.2 -> 21.3 s (-12 %), prefill 52.4 -> 44.6 s (-15 %), text identical; needs a real second drive — two copies on one drive gain nothing |
+| `V4_PRED_NEXT` (2) | decode: `=N` lanes reading the next layer's experts as its gate, scored on this layer's FFN input by a predictor thread, predicts them (hash layers: exact from the token id), skipping what RAM or a card already holds; 74-78 % hit; `0` = off |
+| `V4_PRED_PIECES` (1) | the prefetch lanes also reserve VRAM mirrors and copy the pieces as they read (a hit is a mirror); `0` = RAM only; `2` = the copies on a prefetch stream of their own, the group waiting per mirror (measured equal to `1`) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |

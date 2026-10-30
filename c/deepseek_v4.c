@@ -6243,6 +6243,157 @@ static struct {
 } g_v4_pf = { {0}, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0, NULL, {{0, 0}} };
 unsigned long long g_v4_pf_enqueued, g_v4_pf_dropped, g_v4_pf_read;
 
+static int v4_prefetch_next_lanes(void);
+/* V4_PRED_NEXT=N (2): the next layer's experts predicted by its gate on
+ * this layer's FFN input (router layers) or by the token id (hash layers),
+ * read ahead by N lanes of the pool above (0 = off; 3 and 4 measured no
+ * better than 2). */
+static int v4_pred_next_lanes(void) {
+    static int lanes = -1;
+    if (lanes < 0) {
+        const char *e = getenv("V4_PRED_NEXT");
+        lanes = e && *e ? atoi(e) : 2;
+        if (lanes > 8) lanes = 8;
+        if (lanes < 0) lanes = 0;
+    }
+    return lanes;
+}
+static int v4_pf_lanes(void) {
+    int a = v4_prefetch_next_lanes(), b = v4_pred_next_lanes();
+    return a > b ? a : b;
+}
+static int g_v4_pred_ids[COLI_V4_RESIDENT_MAX_LAYERS][16];
+static int g_v4_pred_n[COLI_V4_RESIDENT_MAX_LAYERS];
+unsigned long long g_v4_pred_hit, g_v4_pred_total, g_v4_pred_queued;
+
+/* The predictor thread: one slot (the FFN input of layer L, layer L+1's
+ * weights, the store); it scores the gate single-threaded (no OpenMP team
+ * of its own next to the main thread's) and queues the misses. */
+static struct {
+    pthread_t thread;
+    int started, pending;
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    ColiExpertStore *store;
+    ColiDeepSeekV4LayerWeights next;   /* set by the decode loop */
+    int have_next;
+    float input[8192];
+    int d, topk, experts;
+    float scale;
+} g_v4_pred = { 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0, NULL, {{0}}, 0, {0}, 0, 0, 0, 0.0f };
+
+static float v4_pred_bf16(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16; float f; memcpy(&f, &bits, sizeof(f)); return f;
+}
+/* the router's selection order (sqrt(softplus(logit)) + bias, top-k), ids only */
+static int v4_pred_route(int *ids, const float *hidden, const uint16_t *gate,
+                         const float *bias, int experts, int d, int topk) {
+    float sel[COLI_V4_ROUTE_STACK_EXPERTS];
+    unsigned char taken[COLI_V4_ROUTE_STACK_EXPERTS];
+    if (experts > COLI_V4_ROUTE_STACK_EXPERTS) return 0;
+    for (int e = 0; e < experts; e++) {
+        const uint16_t *row = gate + (size_t)e * d;
+        float sum = 0.0f;
+        for (int c = 0; c < d; c++) sum += v4_pred_bf16(row[c]) * hidden[c];
+        float sp = fmaxf(sum, 0.0f) + log1pf(expf(-fabsf(sum)));
+        sel[e] = sqrtf(sp) + (bias ? bias[e] : 0.0f);
+        taken[e] = 0;
+    }
+    int n = 0;
+    for (int rank = 0; rank < topk; rank++) {
+        int best = -1;
+        for (int e = 0; e < experts; e++)
+            if (!taken[e] && (best < 0 || sel[e] > sel[best])) best = e;
+        if (best < 0) break;
+        taken[best] = 1; ids[n++] = best;
+    }
+    return n;
+}
+static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n, int layer);
+/* the predicted set, minus what RAM or a card already holds, to the pool */
+static void v4_pred_publish(ColiExpertStore *store, int layer, const int *ids, int n) {
+    if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS || n > 16) return;
+    for (int i = 0; i < n; i++) g_v4_pred_ids[layer][i] = ids[i];
+    g_v4_pred_n[layer] = n;
+    int wanted[16], count = 0;
+    for (int i = 0; i < n; i++) {
+        ColiExpertKey key = {layer, ids[i]};
+        if (coli_v4_expert_store_cached(store, key)) continue;
+#ifdef COLI_V4_GPU_TIER
+        ColiExpertView probe;
+        if (store->gpu && coli_v4_gpu_expert_resident(store, key, &probe) == 0) continue;
+#endif
+        wanted[count++] = ids[i];
+    }
+    __atomic_fetch_add(&g_v4_pred_queued, (unsigned long long)count, __ATOMIC_RELAXED);
+    if (count) v4_pf_enqueue(store, wanted, count, layer);
+}
+static void *v4_pred_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_v4_pred.mutex);
+        while (!g_v4_pred.pending) pthread_cond_wait(&g_v4_pred.ready, &g_v4_pred.mutex);
+        g_v4_pred.pending = 0;
+        ColiDeepSeekV4LayerWeights next = g_v4_pred.next;
+        ColiExpertStore *store = g_v4_pred.store;
+        int d = g_v4_pred.d, topk = g_v4_pred.topk, experts = g_v4_pred.experts;
+        float hidden[8192];
+        memcpy(hidden, g_v4_pred.input, (size_t)d * sizeof(*hidden));
+        pthread_mutex_unlock(&g_v4_pred.mutex);
+        const uint16_t *gate = value(&next, "ffn.gate.weight", NULL);
+        const float *bias = value(&next, "ffn.gate.bias", NULL);
+        int ids[16], n = 0;
+        if (gate && topk <= 16)
+            n = v4_pred_route(ids, hidden, gate, bias, experts, d, topk);
+        if (n) v4_pred_publish(store, next.plan.layer, ids, n);
+    }
+    return NULL;
+}
+/* the decode loop, before layer L runs: layer L+1's weights (NULL = none).
+ * A hash layer's set is exact from the token: queued here, at once. */
+void coli_v4_pred_next_set(const ColiDeepSeekV4LayerWeights *next, int token,
+                           ColiExpertStore *store, const ColiDeepSeekV4Config *config) {
+    if (!v4_pred_next_lanes()) return;
+    pthread_mutex_lock(&g_v4_pred.mutex);
+    g_v4_pred.have_next = next != NULL;
+    if (next) g_v4_pred.next = *next;
+    g_v4_pred.store = store;
+    pthread_mutex_unlock(&g_v4_pred.mutex);
+    if (!next || !store || !config || !next->plan.uses_hash_router) return;
+    const int64_t *table = value(next, "ffn.gate.tid2eid", NULL);
+    int topk = config->num_experts_per_tok;
+    if (!table || topk > 16 || token < 0 || token >= config->vocab_size) return;
+    int ids[16];
+    for (int i = 0; i < topk; i++) ids[i] = (int)table[(size_t)token * topk + i];
+    v4_pred_publish(store, next->plan.layer, ids, topk);
+}
+/* layer L's MoE step, after its routing: hand layer L's FFN input to the
+ * predictor for layer L+1 (a router layer; hash layers were queued already) */
+static void v4_pred_hand(ColiExpertStore *store, int layer, const float *input,
+                         const ColiDeepSeekV4Config *config) {
+    if (!v4_pred_next_lanes() || !g_v4_pred.have_next || !input || !config) return;
+    if (config->hidden_size > 8192 || g_v4_pred.next.plan.layer != layer + 1 ||
+        g_v4_pred.next.plan.uses_hash_router) return;
+    pthread_mutex_lock(&g_v4_pred.mutex);
+    if (!g_v4_pred.started) {
+        g_v4_pred.started = 1;
+        pthread_cond_init(&g_v4_pred.ready, NULL);
+        if (pthread_create(&g_v4_pred.thread, NULL, v4_pred_worker, NULL) == 0)
+            pthread_detach(g_v4_pred.thread);
+        else g_v4_pred.started = 0;
+    }
+    if (g_v4_pred.started) {
+        memcpy(g_v4_pred.input, input, (size_t)config->hidden_size * sizeof(float));
+        g_v4_pred.d = config->hidden_size;
+        g_v4_pred.topk = config->num_experts_per_tok;
+        g_v4_pred.experts = config->n_routed_experts;
+        g_v4_pred.store = store;
+        g_v4_pred.pending = 1;
+        pthread_cond_signal(&g_v4_pred.ready);
+    }
+    pthread_mutex_unlock(&g_v4_pred.mutex);
+}
+
 static int v4_prefetch_next_lanes(void) {
     static int lanes = -1;
     if (lanes < 0) {
@@ -6254,8 +6405,19 @@ static int v4_prefetch_next_lanes(void) {
     return lanes;
 }
 
+extern __thread int g_v4_pc_thread_off, g_v4_pc_thread_pre;
 static void *v4_pf_worker(void *arg) {
     (void)arg;
+    {   /* V4_PRED_PIECES (1): the workers reserve and copy VRAM mirror
+         * pieces as they read, while the window is open, on the aux stream
+         * the group fences; 0 = they fill RAM only; 2 = on the DLL's
+         * prefetch stream with a per-mirror event (the group waits only for
+         * what it uses; measured equal to 1) */
+        const char *e = getenv("V4_PRED_PIECES");
+        int mode = e && *e ? atoi(e) : 1;
+        g_v4_pc_thread_off = mode <= 0;
+        g_v4_pc_thread_pre = mode >= 2;
+    }
     for (;;) {
         pthread_mutex_lock(&g_v4_pf.mutex);
         while (g_v4_pf.head == g_v4_pf.tail)
@@ -6276,7 +6438,7 @@ static void *v4_pf_worker(void *arg) {
 
 static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n,
                           int layer) {
-    int lanes = v4_prefetch_next_lanes();
+    int lanes = v4_pf_lanes();
     if (!lanes || !store) return;
     pthread_mutex_lock(&g_v4_pf.mutex);
     if (!g_v4_pf.started) {
@@ -6622,6 +6784,16 @@ static int moe_token_pipeline(float *output,
         }
         for (int i = 0; i < selected; i++) g_v4_last_ids[layer][i] = expert_ids[i];
         g_v4_last_n[layer] = selected;
+        if (v4_pred_next_lanes()) {
+            if (g_v4_pred_n[layer]) {
+                for (int i = 0; i < selected; i++)
+                    for (int j = 0; j < g_v4_pred_n[layer]; j++)
+                        if (expert_ids[i] == g_v4_pred_ids[layer][j]) { g_v4_pred_hit++; break; }
+                g_v4_pred_total += (unsigned long long)selected;
+                g_v4_pred_n[layer] = 0;
+            }
+            v4_pred_hand(store, layer, input, config);
+        }
         /* V4_EXPERT_TRACE=1: the routed set with its VRAM / RAM state at
          * routing time, one line per layer, for cache-policy simulation. */
         static int xtrace = -1;
@@ -6718,6 +6890,7 @@ static int moe_token_pipeline(float *output,
                 int k = 0;
                 for (int i = 0; i < selected; i++)
                     if (resident[i] && rviews[i].gpu_second) {
+                        resident[i] = 2;   /* in the early group (an expert found resident later, by a lane's probe, is not) */
                         egates[k] = rviews[i].gate.gpu;
                         eups[k] = rviews[i].up.gpu;
                         edowns[k] = rviews[i].down.gpu;
@@ -7058,8 +7231,18 @@ static int moe_token_pipeline(float *output,
          * is timed to feed the host-bandwidth EMA. A backend failure on the
          * GPU half degrades that subset to the CPU loop instead of failing
          * the token. */
-        int gpu_n = hybrid_gpu_count, sec_n = second_count - early_n,
+        /* the early group's experts (resident on the second card at routing
+         * time, resident[i] == 2) are covered by it; the late group takes the
+         * ones mirrored there during this layer, counted by the same test
+         * that fills its arrays below (a count by subtraction left slots
+         * unfilled when a lane's probe found an expert resident late) */
+        int early_covered = early_ok && early_n > 0;
+        int gpu_n = hybrid_gpu_count, sec_n = 0,
             cpu_n = selected - hybrid_gpu_count - second_count;
+        for (int i = 0; i < selected; i++)
+            if (views[i].gate.gpu && views[i].up.gpu && views[i].down.gpu &&
+                views[i].gpu_second && !(resident[i] == 2 && early_covered))
+                sec_n++;
         void **gates = malloc((size_t)(gpu_n ? gpu_n : 1) * sizeof(*gates));
         void **ups = malloc((size_t)(gpu_n ? gpu_n : 1) * sizeof(*ups));
         void **downs = malloc((size_t)(gpu_n ? gpu_n : 1) * sizeof(*downs));
@@ -7073,10 +7256,6 @@ static int moe_token_pipeline(float *output,
         float *sec_weights = malloc((size_t)(sec_n ? sec_n : 1) * sizeof(*sec_weights));
         float *sec_sum = malloc((size_t)d * sizeof(*sec_sum));
         int sec_ok = sec_n > 0 && sgates && sups && sdowns && sec_weights && sec_sum;
-        /* the early group's experts (resident on the second card at routing
-         * time) are covered by it; the late group takes the ones uploaded
-         * there during this layer */
-        int early_covered = early_ok && early_n > 0;
         /* CPU subset FIRST: it computes while the fill DMA enqueued by the
          * q* pass is still in flight. The host bandwidth EMA is measured
          * right here, under bus contention — which is exactly the number the
@@ -7087,7 +7266,7 @@ static int moe_token_pipeline(float *output,
             int on_gpu = views[current].gate.gpu && views[current].up.gpu &&
                          views[current].down.gpu;
             if (on_gpu && (views[current].gpu_second
-                               ? (resident[current] && early_covered) || sec_ok
+                               ? (resident[current] == 2 && early_covered) || sec_ok
                                : gpu_ok))
                 continue;   /* covered by its card's group below */
             if (v4_view_ensure_host(store, &views[current])) {
@@ -7139,7 +7318,7 @@ static int moe_token_pipeline(float *output,
             for (int i = 0; i < selected; i++)
                 if (views[i].gate.gpu && views[i].up.gpu &&
                     views[i].down.gpu && views[i].gpu_second &&
-                    !(resident[i] && early_covered)) {
+                    !(resident[i] == 2 && early_covered)) {
                     sgates[k] = views[i].gate.gpu;
                     sups[k] = views[i].up.gpu;
                     sdowns[k] = views[i].down.gpu;
@@ -7191,7 +7370,7 @@ static int moe_token_pipeline(float *output,
                   views[current].down.gpu))
                 continue;   /* already computed by the CPU loop above */
             if (views[current].gpu_second
-                    ? (resident[current] && early_covered) || sec_ok
+                    ? (resident[current] == 2 && early_covered) || sec_ok
                     : gpu_ok)
                 continue;   /* its card's group computed it */
             if (v4_view_ensure_host(store, &views[current])) {
@@ -7365,7 +7544,7 @@ static int block_token_pipeline(float *output_hc,
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
-                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu; "
+                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu pred-hit=%.1f%% of %llu queued=%llu; "
                         "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms)\n",
                 position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
@@ -7379,6 +7558,8 @@ static int block_token_pipeline(float *output_hc,
                 (unsigned long long)g_v4_dp_pair_err,
                 g_v4_overlap_total ? 100.0 * g_v4_overlap_hit / g_v4_overlap_total : 0.0,
                 g_v4_pf_enqueued, g_v4_pf_read, g_v4_pf_dropped,
+                g_v4_pred_total ? 100.0 * g_v4_pred_hit / g_v4_pred_total : 0.0,
+                g_v4_pred_total, g_v4_pred_queued,
                 g_v4_ap_qa * 1e3, (g_v4_ap_comp + g_v4_ap_comp_c + g_v4_ap_comp_a) * 1e3,
                 g_v4_ap_comp_c * 1e3, g_v4_ap_comp_a * 1e3, g_v4_ap_qb * 1e3,
                 g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3);
@@ -7392,6 +7573,7 @@ static int block_token_pipeline(float *output_hc,
         g_v4_dp_pair_ok = g_v4_dp_pair_fail = 0;
         g_v4_overlap_hit = g_v4_overlap_total = 0;
         g_v4_pf_enqueued = g_v4_pf_read = g_v4_pf_dropped = 0;
+        g_v4_pred_hit = g_v4_pred_total = g_v4_pred_queued = 0;
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
@@ -14469,6 +14651,10 @@ static V4Uploader g_v4_up[2];
 static unsigned g_v4_up_split;
 /* the read -> upload pieces (V4_UPLOAD_PIECES, below): the lane window flag and its counters */
 static int g_v4_pc_window;
+/* a thread that opts out of the window (V4_PRED_PIECES=0: the prefetch
+ * workers read into RAM only; the lanes upload on the critical path, on
+ * their own fence timing) */
+__thread int g_v4_pc_thread_off;
 static unsigned long long g_v4_pc_begun, g_v4_pc_done, g_v4_pc_abort, g_v4_pc_copies;
 static double g_v4_pc_enqueue_s;
 static pthread_mutex_t g_v4_pc_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -14649,7 +14835,10 @@ typedef struct {
     double enqueue_s;
     const unsigned char *sptr, *wptr;   /* the runs' host bytes (V4_PIECES_VERIFY=1) */
     ColiExpertKey key;
+    int prefetch;   /* a prefetch worker's job (V4_PRED_PIECES=2): the copies on the DLL's prefetch stream, the point records the mirror's event */
 } V4PieceJob;
+/* set by a prefetch worker thread: its jobs go on the prefetch stream */
+__thread int g_v4_pc_thread_pre;
 static int v4_pieces_verify(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("V4_PIECES_VERIFY"); on = e && *e ? atoi(e) : 0; }
@@ -14740,8 +14929,8 @@ void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
                                const V4PieceLayout *lay, const void *slab, size_t slab_bytes) {
     if (!store || !store->gpu || !lay) return NULL;
     V4GpuExpertMirrorCache *primary = (V4GpuExpertMirrorCache *)store->gpu;
-    if (!__atomic_load_n(&g_v4_pc_window, __ATOMIC_ACQUIRE) || primary->capacity < 8 ||
-        !v4_pieces_on(primary))
+    if (!__atomic_load_n(&g_v4_pc_window, __ATOMIC_ACQUIRE) || g_v4_pc_thread_off ||
+        primary->capacity < 8 || !v4_pieces_on(primary))
         return NULL;
     if (lay->dims[1] % 32 || lay->dims[3] % 32 || lay->S <= 0 || lay->Wb <= 0) return NULL;
     /* a DLL whose shims answer but whose exports are missing fails every
@@ -14766,6 +14955,7 @@ void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
     if (!job) return NULL;
     job->lay = *lay;
     job->key = key;
+    job->prefetch = g_v4_pc_thread_pre;
     int placed = -1;
     for (int attempt = 0; attempt < 2 && placed; attempt++) {
         V4GpuExpertMirrorCache *c = attempt ? other : own;
@@ -14793,14 +14983,14 @@ void coli_v4_gpu_pieces_land(void *ctx, unsigned long long rec_off, size_t len,
     if (a == S) job->wptr = ptr;
     if (a < S) {
         long long n = (b < S ? b : S) - a;
-        if (!job->cache->ops->mirror_copy(job->gate, 0, a, (const uint8_t *)ptr, n)) {
+        if (!job->cache->ops->mirror_copy(job->gate, job->prefetch ? 2 : 0, a, (const uint8_t *)ptr, n)) {
             job->ok = 0; return;
         }
         job->copies++;
     }
     if (b > S) {
         long long lo = a > S ? a : S;
-        if (!job->cache->ops->mirror_copy(job->gate, 1, lo - S,
+        if (!job->cache->ops->mirror_copy(job->gate, job->prefetch ? 3 : 1, lo - S,
                                           (const uint8_t *)ptr + (lo - a), b - lo)) {
             job->ok = 0; return;
         }
@@ -14814,7 +15004,8 @@ void coli_v4_gpu_pieces_end(void *ctx, int ok) {
     if (!job) return;
     V4GpuExpertMirrorCache *c = job->cache;
     int complete = ok && job->ok && job->landed == job->lay.S + job->lay.Wb &&
-                   c->ops->mirror_point(job->gate, job->up, job->down, job->lay.S,
+                   c->ops->mirror_point(job->gate, job->up, job->down,
+                                        job->prefetch ? -job->lay.S : job->lay.S,
                                         job->lay.soff, job->lay.Wb, job->lay.woff);
     if (complete && v4_pieces_verify() == 1 && c->ops->mirror_check) {
         static unsigned long long checked, bad;
@@ -18267,6 +18458,11 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
     g_v4_prof_forwards += 1;
     return result;
 }
+static int v4_pred_loop_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_PRED_NEXT"); on = !e || !*e || atoi(e) > 0; }
+    return on;
+}
 static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
@@ -18285,10 +18481,24 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
+    if (v4_pred_loop_on() && first_layer < config->num_hidden_layers) {
+        ColiDeepSeekV4LayerWeights first;
+        if (coli_v4_layer_load(engine, &first, config, index, first_layer, NULL, 0) == 0) {
+            coli_v4_pred_next_set(&first, token, experts, config);
+            coli_v4_layer_free(engine, &first);
+        }
+    }
     for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
+        if (v4_pred_loop_on()) {
+            ColiDeepSeekV4LayerWeights after;
+            int have = layer_id + 1 < config->num_hidden_layers &&
+                       coli_v4_layer_load(engine, &after, config, index, layer_id + 1, NULL, 0) == 0;
+            coli_v4_pred_next_set(have ? &after : NULL, token, experts, config);
+            if (have) coli_v4_layer_free(engine, &after);
+        }
         int result = coli_v4_block_window_token_ref(
             next, attention[layer_id], &layer, config, experts,
             state, token, position, error, error_size);

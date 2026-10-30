@@ -45,7 +45,8 @@
 #else
 #define COLI_DSV4_TC 1
 #endif
-struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; void *block,*block2; long long blockpad; /* block mirror: the owner's weight-run and scale-run allocations (dsv4_cuda_mirror_alloc) */ };
+struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; void *block,*block2; long long blockpad; /* block mirror: the owner's weight-run and scale-run allocations (dsv4_cuda_mirror_alloc) */
+    cudaEvent_t ev;int evwait; /* a prefetched mirror's completion on the prefetch stream (mirror_point with S<0); the expert group waits for it once */ };
 static bool run_fp8_attn(const Dsv4CudaTensor*t,const float*x,float*y,int groups,cudaStream_t st);   /* below, by mv_fp8_dec */
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
@@ -56,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -2457,15 +2458,26 @@ extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4Cud
  * expert group fences the stream (group_fence) as it does for the
  * uploader's copies. mirror_point re-points the three tensors once every
  * piece is in (host side only, no device work). */
+static cudaStream_t pre_stream(Dev*c){
+    if(!c->pre&&!ok(cudaStreamCreateWithFlags(&c->pre,cudaStreamNonBlocking),"prefetch stream"))c->pre=nullptr;
+    return c->pre;}
 extern "C" int dsv4_cuda_mirror_copy(Dsv4CudaTensor*g,int run,long long off,const uint8_t*src,long long len){
+    int pre=run&2;run&=~2;   /* run | 2: a prefetch worker's piece, on the prefetch stream (V4_PRED_PIECES=2) */
     if(!g||!g->block||!g->block2||!src||off<0||len<=0||(run!=0&&run!=1))return 0;
     long long cap=run?g->bytes:g->blockpad;if(off+len>cap)return 0;
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror piece device"))return 0;
+    cudaStream_t cs=pre?pre_stream(c):c->aux;if(!cs)return 0;
     host_pinned(src,(size_t)len);
     void*dst=(uint8_t*)(run?g->block:g->block2)+off;
-    return ok(cudaMemcpyAsync(dst,src,(size_t)len,cudaMemcpyHostToDevice,c->aux),"mirror piece upload")?1:0;}
+    return ok(cudaMemcpyAsync(dst,src,(size_t)len,cudaMemcpyHostToDevice,cs),"mirror piece upload")?1:0;}
 extern "C" int dsv4_cuda_mirror_point(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4CudaTensor*d,long long S,const long long*soff,long long Wb,const long long*woff){
+    int pre=S<0;if(pre)S=-S;
     if(!g||!g->block||!g->block2||!u||!d||!soff||!woff||S<=0||Wb<=0||S>g->blockpad||Wb>g->bytes)return 0;
+    if(pre){Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror point device")||!pre_stream(c))return 0;
+        if(!g->ev&&!ok(cudaEventCreateWithFlags(&g->ev,cudaEventDisableTiming),"prefetch mirror event"))return 0;
+        if(!ok(cudaEventRecord(g->ev,c->pre),"prefetch mirror event record"))return 0;g->evwait=1;
+        for(int k=0;k<3;k++){Dsv4CudaTensor*t=k?(k==1?u:d):g;t->scale=(uint8_t*)g->block2+soff[k];t->w=(uint8_t*)g->block+woff[k];}
+        return 1;}
     Dsv4CudaTensor*t[3]={g,u,d};
     for(int k=0;k<3;k++){long long sb=(long long)t[k]->O*t[k]->I/32,wb=(long long)t[k]->O*t[k]->I/2;
         if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
@@ -2478,6 +2490,7 @@ extern "C" long long dsv4_cuda_mirror_check(Dsv4CudaTensor*g,int run,long long o
     long long cap=run?g->bytes:g->blockpad;if(off+len>cap)return -2;
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror check device"))return -2;
     if(!ok(cudaStreamSynchronize(c->aux),"mirror check drain"))return -2;
+    if(c->pre&&!ok(cudaStreamSynchronize(c->pre),"mirror check prefetch drain"))return -2;
     std::vector<uint8_t> h((size_t)len);
     if(!ok(cudaMemcpy(h.data(),(uint8_t*)(run?g->block:g->block2)+off,(size_t)len,cudaMemcpyDeviceToHost),"mirror check download"))return -2;
     for(long long i=0;i<len;i++)if(h[(size_t)i]!=src[i])return i;
@@ -2910,6 +2923,12 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
  * the pieces were built came from page-locking a slab under the drive's
  * DMA, see dsv4_cuda_host_pin.) */
 static void aux_flush(Dev*c){cudaError_t e=cudaStreamQuery(c->aux);if(e!=cudaSuccess&&e!=cudaErrorNotReady)ok(e,"aux flush");else cudaGetLastError();}
+/* the prefetched mirrors among a group's experts: the compute stream
+ * waits for each one's event, once (the prefetch stream is not fenced) */
+static int group_wait_pre(Dev*c,Dsv4CudaTensor *const *gate,int count){
+    for(int e=0;e<count;e++){Dsv4CudaTensor*t=gate[e];if(t&&t->evwait&&t->ev){
+        if(!ok(cudaStreamWaitEvent(c->stream,t->ev,0),"prefetch mirror wait"))return 0;t->evwait=0;}}
+    return 1;}
 static int group_fence(Dev*c){
     if(!c->upfence&&!ok(cudaEventCreateWithFlags(&c->upfence,cudaEventDisableTiming),"upload fence event"))return 0;
     return ok(cudaEventRecord(c->upfence,c->aux),"upload fence record")&&ok(cudaStreamWaitEvent(c->stream,c->upfence,0),"upload fence wait");
@@ -3057,7 +3076,7 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
        !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
-    if(!group_fence(c))return 0;int pinned=group_stage(c,xb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,xb);xs=c->hx_pin;}
+    if(!group_fence(c)||!group_wait_pre(c,gate,count))return 0;int pinned=group_stage(c,xb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,xb);xs=c->hx_pin;}
     if(!ok(cudaMemcpyAsync(c->dx,xs,xb,cudaMemcpyHostToDevice,c->stream),"expert-group activation upload"))return 0;GroupProf gp(c);
 #if COLI_DSV4_TC
     static int tc=-1;if(tc<0)tc=getenv("DSV4_CUDA_TC")?atoi(getenv("DSV4_CUDA_TC")):0;
@@ -3108,7 +3127,7 @@ extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *
     size_t hb=(size_t)H*4,ib=(size_t)count*I*4,parts=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts))return 0;
-    if(!group_fence(c))return 0;int pinned=group_stage(c,hb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,hb);xs=c->hx_pin;}
+    if(!group_fence(c)||!group_wait_pre(c,gate,count))return 0;int pinned=group_stage(c,hb);const float*xs=x;if(pinned){memcpy(c->hx_pin,x,hb);xs=c->hx_pin;}
     if(!ok(cudaMemcpyAsync(c->dx,xs,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;GroupProf gp(c);
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
     int dec=mv_dec_on()&&H%32==0&&I%32==0;
@@ -3826,6 +3845,6 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
     bf16_round<<<(H+255)/256,256,0,c->stream>>>(c->p2,H);
     return ok(cudaGetLastError(),"wo launch")&&ok(cudaMemcpyAsync(out,c->p2,hb,cudaMemcpyDeviceToHost,c->stream),"wo result download")&&ok(cudaStreamSynchronize(c->stream),"wo sync");
 }
-extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->block)cudaFree(t->block);if(t->block2)cudaFree(t->block2);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
+extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->ev)cudaEventDestroy(t->ev);if(t->block)cudaFree(t->block);if(t->block2)cudaFree(t->block2);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}
