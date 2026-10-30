@@ -965,6 +965,23 @@ plain loops vectorize across columns with each element's chain in its
 order: bitwise (md5 85d209f4e138). `decprof` hc post 4.8 -> 3.8 ms per
 token, pre unchanged (14).
 
+Twenty-sixth measurement (2026-10-30): the hyper-connection pre's mix.
+`DSV4_HC_PROF=1` (`hcprof`, the pre's parts per call): the mix took 145
+of the call's 165 us, the row-per-thread OpenMP loop over 24 rows x
+16384 columns: ~20 us of work per thread (a 16384-long fma chain over 64
+KB) and the rest the wake and join of a 24-thread team. `V4_HC_MIX_GROUP`
+(8): the rows in groups of eight, each group one column loop with eight
+accumulators (every row's own serial order: bitwise), the mean square as
+one more task; `V4_HC_MIX_TEAM` (1): on the calling thread alone. The
+single thread's three groups run memory-bound at 108 us per call; a
+team of four measured 113 (the fork and join cost what the threads
+saved), two threads 144, the row-per-thread loop 145; spinning workers
+(`OMP_WAIT_POLICY=active`, `GOMP_SPINCOUNT`) changed nothing. `decprof`
+hc 18.3 -> 14.2 ms per token (pre 14.8 -> 10.6), md5 85d209f4e138. What
+is left of the pre is that 1.5 MB read per call (F32 in the checkpoint,
+full mantissas: not storable smaller) and the L3 cannot hold it across
+the MoE's expert copies.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1116,6 +1133,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MV_WARP` (1) | the one-token fp8 / bf16 matvec kernels as a warp per row with 8/16-byte lane loads, the block kernels' summation order (bitwise); `DSV4_MV_WARP_VERIFY=1` runs both and counts differing words (`mvwverify`) |
 | `V4_IDX_RADIX` (1) | the indexer candidates ranked by a stable byte-radix sort instead of qsort (the same list); `DSV4_IDX_SORT_VERIFY=1` compares the two per token (`idxsort`) |
 | `DSV4_PROJ_KPROF` (off) | per-launch device times of `dsv4_cuda_decode_proj_multi` (`projkprof`, with `V4_DECODE_PROJ6=1`) |
+| `V4_HC_MIX_GROUP` (8) | the hyper-connection pre's mix rows in groups of this many chains interleaved on one thread (bitwise); `0` = the row-per-thread OpenMP loop |
+| `V4_HC_MIX_TEAM` (1) | the grouped mix's thread count: `1` = the calling thread, `0` = one thread per group plus one for the mean square |
+| `DSV4_HC_PROF` (off) | the pre's parts timed per call, printed every 1000 calls (`hcprof`) |
 | `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
