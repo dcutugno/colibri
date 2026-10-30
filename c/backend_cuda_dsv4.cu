@@ -3210,10 +3210,14 @@ static void run_fp4_dec(const MvDesc*desc,int count,int O,int I,cudaStream_t st)
     mv_fp4_dec<4><<<dim3((O+31)/32,count),256,(size_t)(I+(I>>5))*sizeof(float),st>>>(desc,count,O,I);}
 static void run_fp8_dec(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,cudaStream_t st){
     mv_fp8_dec<4,0><<<(O+31)/32,256,(size_t)(I+(I>>4))*sizeof(float),st>>>(w,sc,x,y,O,I);}
-/* DSV4_ATTN_MV (1): the decode attention chain's fp8 matvecs on the shaped
- * kernel; a matrix it cannot take (I not a multiple of 16, the x slice past
- * the shared-memory budget, O not a multiple of 128 per group) keeps mv. */
-static int attn_mv_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_ATTN_MV");on=!e||!*e||*e!='0';}return on;}
+/* DSV4_ATTN_MV (0): the decode attention chain's fp8 matvecs on the shaped
+ * kernel (its own summation order: a few 1-ulp elements per layer against
+ * the reference). Off since the warp kernel (DSV4_MV_WARP) runs the
+ * reference order at the same speed: the chain is then bitwise the CPU
+ * path. =1 keeps the shaped kernel; a matrix it cannot take (I not a
+ * multiple of 16, the x slice past the shared-memory budget, O not a
+ * multiple of 128 per group) keeps mv either way. */
+static int attn_mv_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_ATTN_MV");on=e&&*e&&*e!='0';}return on;}
 static bool run_fp8_attn(const Dsv4CudaTensor*t,const float*x,float*y,int groups,cudaStream_t st){
     int Og=t->O/groups,I=t->I;size_t sm=(size_t)(I+(I>>4))*sizeof(float);
     if(!attn_mv_on()||groups<1||t->O%groups||I%16||Og%128||sm>48*1024)return false;

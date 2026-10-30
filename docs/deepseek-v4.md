@@ -939,8 +939,10 @@ md5 bd9c9eae2f2f): attention 38 -> 36 ms per token, the shared expert
 matrices the warp kernel runs at the shaped kernel's speed
 (`DSV4_WO_KPROF`: wq_b 3.9 vs 4.1, wo_a 2.0 vs 2.2, wo_b 2.3 vs 2.3 ms
 per token), so `DSV4_ATTN_MV=0`, the exact reference order, now costs
-nothing (after the first token 11.53 s, md5 85d209f4e138); the default
-stays 1 for the standing baseline. `V4_IDX_RADIX` (1): the ranking of a
+nothing (after the first token 11.53 s, md5 85d209f4e138), so the
+default is now 0: the decode chain bitwise the CPU reference, and
+85d209f4e138 the bench baseline from here on (`DSV4_ATTN_MV=1` gives the
+earlier bd9c9eae2f2f). `V4_IDX_RADIX` (1): the ranking of a
 token's indexer candidates (score descending, index ascending) as a
 stable byte-radix sort over the score's order-preserving key instead of
 qsort with its comparator callback, the same ranked list element for
@@ -1089,7 +1091,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_PF_KPROF` (0, `.cu`) | per-call device time of the prefill chain's stages and its host wall (`pfkprof`) |
 | `DSV4_SATTN_HPB` (4) | heads per block of the shaped sparse attention from 256 rows up (`1` = one head per block, the rows read once per head) |
 | `DSV4_SATTN_V2` (1) | the cached sparse attention kernel shaped for latency (same arithmetic, same order, bitwise); `0` = the old kernel |
-| `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the reference order (the `DSV4_MV_WARP` kernel since the twenty-fourth measurement: the same speed, bitwise the reference, md5 85d209f4e138 on the 36-token bench) |
+| `DSV4_ATTN_MV` (0) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) in the reference order (the `DSV4_MV_WARP` kernel; bitwise the CPU path, md5 85d209f4e138 on the 36-token bench, the baseline since the twenty-fourth measurement); `1` = the bandwidth-shaped kernel of the sixth measurement, the same speed, 1-ulp elements at near ties (the earlier baseline md5 bd9c9eae2f2f) |
 | `V4_UPLOAD_PIECES` (4) | decode: a lane's expert read lands in this many pieces, all in flight at once, each copied to a mirror reserved before the read as it lands (the link works under the read); the slab is page-locked before the read. `0`/`1` = one read, the uploader thread copies after it. Needs `V4_MIRROR_BLOCK`, `V4_UPLOAD_FENCE` and the DLL's `dsv4_cuda_mirror_copy`/`_point`/`_host_pin`. `V4_PIECES_VERIFY=1` compares each piece-built mirror with its slab, `=8` compares each slab with a buffered re-read (diagnostics) |
 | `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
 | `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
