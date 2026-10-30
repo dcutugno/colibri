@@ -982,6 +982,19 @@ is left of the pre is that 1.5 MB read per call (F32 in the checkpoint,
 full mantissas: not storable smaller) and the L3 cannot hold it across
 the MoE's expert copies.
 
+Twenty-seventh measurement (2026-10-30): the grouped mix over persistent
+helper threads. `V4_HC_MIX_TEAM` (4): the calling thread and three
+helpers (created at the first call) take the groups round-robin, handed
+a job through a flag they spin on for `V4_HC_MIX_SPIN` (50000 pauses,
+~100 us) and then sleep on a condition variable; each row's chain is
+unchanged, so bitwise (md5 85d209f4e138). `hcprof` mix per call: one
+thread 108 us, two 82, three 75, four 70; helpers that never sleep 76
+and 73, so the wake is not the floor: at three or four threads the mix
+runs at ~20 GB/s, the DRAM bandwidth left beside the expert loaders'
+copies. `decprof` hc 13.6 -> 10.2 ms per token (pre 10.0 -> 7.0); after
+the first token 11.40 / 11.26 s (36 tokens). A concurrent caller finds
+the helpers taken and runs the groups itself.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1134,7 +1147,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_IDX_RADIX` (1) | the indexer candidates ranked by a stable byte-radix sort instead of qsort (the same list); `DSV4_IDX_SORT_VERIFY=1` compares the two per token (`idxsort`) |
 | `DSV4_PROJ_KPROF` (off) | per-launch device times of `dsv4_cuda_decode_proj_multi` (`projkprof`, with `V4_DECODE_PROJ6=1`) |
 | `V4_HC_MIX_GROUP` (8) | the hyper-connection pre's mix rows in groups of this many chains interleaved on one thread (bitwise); `0` = the row-per-thread OpenMP loop |
-| `V4_HC_MIX_TEAM` (1) | the grouped mix's thread count: `1` = the calling thread, `0` = one thread per group plus one for the mean square |
+| `V4_HC_MIX_TEAM` (4) | the grouped mix's threads: the calling thread and N-1 persistent helpers (spin, then sleep on a condition variable); `1` = the calling thread alone |
+| `V4_HC_MIX_SPIN` (50000) | pauses a helper spins for the next job before it sleeps |
 | `DSV4_HC_PROF` (off) | the pre's parts timed per call, printed every 1000 calls (`hcprof`) |
 | `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |

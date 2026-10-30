@@ -71,20 +71,143 @@ static inline int coli_hc_mix_group(void) {
     }
     return group;
 }
-/* V4_HC_MIX_TEAM (1): the grouped mix's team; 1 = the calling thread
- * alone, no OpenMP region (measured equal to a team of groups + 1: the
- * fork and join cost what the threads saved, and the single thread's
- * three groups of eight chains are memory-bound at ~108 us per call);
- * 0 = groups + 1 threads. */
+/* V4_HC_MIX_TEAM (4): the grouped mix's threads. 1 = the calling thread
+ * alone (the single thread's three groups of eight chains are
+ * memory-bound at ~108 us per call); N > 1 = the calling thread and N-1
+ * persistent helpers that take the groups round-robin, handed a job
+ * through a flag they spin on for a while and then sleep on a condition
+ * variable (an OpenMP team of the same size measured no faster than one
+ * thread: its fork and join cost what the threads saved). Measured
+ * (DSV4_HC_PROF, the mix per call): 1 thread 108 us, 2 82, 3 75, 4 70;
+ * helpers that never sleep 76 / 73: at three or four threads the mix is
+ * bound by the DRAM bandwidth left beside the expert loaders' copies. */
 static inline int coli_hc_mix_team(int groups) {
     static int team = -1;
     if (team < 0) {
         const char *e = getenv("V4_HC_MIX_TEAM");
-        team = e && *e ? atoi(e) : 1;
-        if (team < 0) team = 0;
+        team = e && *e ? atoi(e) : 4;
+        if (team < 1) team = 1;
+        if (team > 8) team = 8;
     }
-    return team ? team : groups + 1;
+    (void)groups;
+    return team;
 }
+struct coli_hc_job {
+    const float *hc_fn, *input;
+    float *mixes;
+    int mix_count, flattened, group, groups, team;
+    float mean_square;
+};
+/* one task: a group's rows interleaved (an accumulator per row, each
+ * row's own serial order), or task == groups: the mean square */
+static inline void coli_hc_mix_task(struct coli_hc_job *job, int task) {
+    int flattened = job->flattened;
+    const float *input = job->input;
+    if (task == job->groups) {
+        float ms = 0.0f;
+        for (int index = 0; index < flattened; index++)
+            ms += input[index] * input[index];
+        job->mean_square = ms;
+        return;
+    }
+    int r0 = task * job->group;
+    int rn = job->mix_count - r0 < job->group ? job->mix_count - r0 : job->group;
+    const float *rows[8];
+    float sums[8];
+    for (int r = 0; r < 8; r++) {
+        rows[r] = job->hc_fn + (size_t)(r0 + (r < rn ? r : 0)) * flattened;
+        sums[r] = 0.0f;
+    }
+    for (int column = 0; column < flattened; column++) {
+        float x = input[column];
+        for (int r = 0; r < 8; r++)
+            sums[r] += rows[r][column] * x;
+    }
+    for (int r = 0; r < rn; r++) job->mixes[r0 + r] = sums[r];
+}
+static inline void coli_hc_mix_share(struct coli_hc_job *job, int who) {
+    for (int task = who; task <= job->groups; task += job->team)
+        coli_hc_mix_task(job, task);
+}
+#ifdef _OPENMP
+#include <pthread.h>
+#include <sched.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define COLI_HC_PAUSE() _mm_pause()
+#else
+#define COLI_HC_PAUSE() ((void)0)
+#endif
+struct coli_hc_helper {
+    pthread_t thread;
+    volatile int state;   /* 0 idle, 1 job posted, 2 done */
+    struct coli_hc_job *job;
+    int index;
+};
+static struct coli_hc_helper coli_hc_helpers[8];
+static int coli_hc_helper_count = -1;
+static volatile int coli_hc_helpers_busy;
+static pthread_mutex_t coli_hc_helpers_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t coli_hc_helpers_cond = PTHREAD_COND_INITIALIZER;
+/* V4_HC_MIX_SPIN (50000, ~100 us): pauses a helper spins for a job before
+ * it yields between checks */
+static inline long coli_hc_mix_spin(void) {
+    static long spin = -1;
+    if (spin < 0) { const char *e = getenv("V4_HC_MIX_SPIN"); spin = e && *e ? atol(e) : 50000; if (spin < 0) spin = 0; }
+    return spin;
+}
+static void *coli_hc_helper_main(void *arg) {
+    struct coli_hc_helper *h = (struct coli_hc_helper *)arg;
+    long budget = coli_hc_mix_spin();
+    for (;;) {
+        long spins = 0;
+        while (__atomic_load_n(&h->state, __ATOMIC_ACQUIRE) != 1) {
+            if (++spins < budget) { COLI_HC_PAUSE(); continue; }
+            pthread_mutex_lock(&coli_hc_helpers_lock);
+            while (__atomic_load_n(&h->state, __ATOMIC_ACQUIRE) != 1)
+                pthread_cond_wait(&coli_hc_helpers_cond, &coli_hc_helpers_lock);
+            pthread_mutex_unlock(&coli_hc_helpers_lock);
+        }
+        coli_hc_mix_share(h->job, h->index);
+        __atomic_store_n(&h->state, 2, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+static inline int coli_hc_helpers_ready(int team) {
+    if (coli_hc_helper_count >= 0) return coli_hc_helper_count + 1 >= team;
+    int made = 0;
+    for (int i = 1; i < team; i++) {
+        struct coli_hc_helper *h = &coli_hc_helpers[i];
+        h->state = 0; h->job = NULL; h->index = i;
+        if (pthread_create(&h->thread, NULL, coli_hc_helper_main, h) != 0) break;
+        made++;
+    }
+    coli_hc_helper_count = made;
+    return made + 1 >= team;
+}
+/* the job over the calling thread and the helpers; 0 when the helpers are
+ * taken (a concurrent call runs serial) */
+static inline int coli_hc_mix_helpers(struct coli_hc_job *job) {
+    if (job->team < 2 || !coli_hc_helpers_ready(job->team)) return 0;
+    if (__atomic_exchange_n(&coli_hc_helpers_busy, 1, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&coli_hc_helpers_lock);
+    for (int i = 1; i < job->team; i++) {
+        coli_hc_helpers[i].job = job;
+        __atomic_store_n(&coli_hc_helpers[i].state, 1, __ATOMIC_RELEASE);
+    }
+    pthread_cond_broadcast(&coli_hc_helpers_cond);
+    pthread_mutex_unlock(&coli_hc_helpers_lock);
+    coli_hc_mix_share(job, 0);
+    for (int i = 1; i < job->team; i++) {
+        while (__atomic_load_n(&coli_hc_helpers[i].state, __ATOMIC_ACQUIRE) != 2) COLI_HC_PAUSE();
+        coli_hc_helpers[i].state = 0;
+    }
+    __atomic_store_n(&coli_hc_helpers_busy, 0, __ATOMIC_RELEASE);
+    return 1;
+}
+#else
+static inline int coli_hc_mix_helpers(struct coli_hc_job *job) { (void)job; return 0; }
+#endif
 static inline int coli_hc_team(int rows) {
 #ifdef _OPENMP
     int team = omp_get_max_threads();
@@ -247,35 +370,13 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
     if (group) {
         /* V4_HC_MIX_GROUP: see coli_hc_mix_group */
         int groups = (mix_count + group - 1) / group;
-        float mean_square_task = 0.0f;
-        int team = coli_hc_mix_team(groups);
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static, 1) if(team > 1) num_threads(team)
-#endif
-        for (int task = 0; task <= groups; task++) {
-            if (task == groups) {
-                float ms = 0.0f;
-                for (int index = 0; index < flattened; index++)
-                    ms += input[index] * input[index];
-                mean_square_task = ms;
-                continue;
-            }
-            int r0 = task * group;
-            int rn = mix_count - r0 < group ? mix_count - r0 : group;
-            const float *rows[8];
-            float sums[8];
-            for (int r = 0; r < 8; r++) {
-                rows[r] = hc_fn + (size_t)(r0 + (r < rn ? r : 0)) * flattened;
-                sums[r] = 0.0f;
-            }
-            for (int column = 0; column < flattened; column++) {
-                float x = input[column];
-                for (int r = 0; r < 8; r++)
-                    sums[r] += rows[r][column] * x;
-            }
-            for (int r = 0; r < rn; r++) mixes[r0 + r] = sums[r];
+        struct coli_hc_job job = {hc_fn, input, mixes, mix_count, flattened,
+                                  group, groups, coli_hc_mix_team(groups), 0.0f};
+        if (!coli_hc_mix_helpers(&job)) {
+            job.team = 1;
+            coli_hc_mix_share(&job, 0);
         }
-        mean_square = mean_square_task;
+        mean_square = job.mean_square;
         inverse_rms = 1.0f / sqrtf(mean_square / flattened + norm_eps);
         for (int row = 0; row < mix_count; row++)
             mixes[row] = mixes[row] * inverse_rms;
