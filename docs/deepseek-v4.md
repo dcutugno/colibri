@@ -910,6 +910,18 @@ prompt, 36 tokens, one card): attention 43 -> 40 ms per token (`select`
 15 -> 10), hc 26 -> 18, after the first token 11.95 -> 11.64 s, md5
 bd9c9eae2f2f.
 
+Twenty-third measurement (2026-10-30): the decode token's six projections
+of the attention input in one round trip, tried and kept off.
+`V4_DECODE_PROJ6=1`: wq_a, wkv (their fp8 mirrors, the kernel their own
+matvec call runs) and the compressor's and the indexer-compressor's bf16
+pairs through one upload, six launches and one sync
+(`dsv4_cuda_decode_proj_multi`, optional in the loader) where three round
+trips used to be. Bitwise (md5 bd9c9eae2f2f), and equal: the three
+phases' sum 15.1 -> 13.9 ms per token (qa 4.4 -> 10.0 as the call's
+host, compressor 7.8 -> 2.8, kv 2.9 -> 1.1), attention 40 -> 40, after
+the first token within noise. The device work is the same ~0.1 ms per
+layer; only two sync latencies went. Left off.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1058,6 +1070,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PRED_DEPTH` (1) | `2` = the layer after next predicted too, by its own gate on this layer's FFN input, queued behind the next layer's; measured slower (moe 198 -> 203 ms: the extra uploads and mirror reservations outweigh the wider window) |
 | `V4_PRED_TOPK` (16) | `=M` queues only the first M of a router layer's predicted set in the router's rank order (ranks 5 and 6 hit ~55 / 40 %); measured equal (fewer reads, the same time) |
 | `V4_HC_PAR` (1) | the hyper-connection steps' OpenMP use: `1` = a team (no larger than its 24 rows) for the pre's mix only, the column loops and the post on the calling thread; `0` = all serial; `2` = every loop on the full team (bitwise in all three; measured hc 26 / 31 / 19 ms per token for 2 / 0 / 1) |
+| `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |

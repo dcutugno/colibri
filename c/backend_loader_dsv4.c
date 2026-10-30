@@ -180,6 +180,8 @@ typedef int             (*fn_indexer_select_fused)(int device, int layer, const 
                                                    float *head_w_out);
 typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
                                                 int tokens, float *const *ys);
+typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                float *const *ys);
 typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
                                                 int chunk_start, const float *sinks, const int *meta,
                                                 const int *sel, int selstride, int abs_base, int comp_limit,
@@ -350,6 +352,7 @@ static struct {
     fn_indexer_select_fused indexer_select_fused;
     fn_attn_decode_chain attn_decode_chain;
     fn_matmul_bf16_multi matmul_bf16_multi;
+    fn_decode_proj_multi decode_proj_multi;   /* optional: one-token projections in one round trip */
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -604,6 +607,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
     g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
     g_dsv4.mirror_copy = (fn_mirror_copy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_copy");
+    g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
     g_dsv4.mirror_point = (fn_mirror_point)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_point");
     g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
     g_dsv4.host_pin = (fn_host_pin)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_pin");
@@ -972,6 +976,10 @@ int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts, int n, const float *x
                                 float *const *ys){
     if(!g_dsv4.available) return 0;
     return g_dsv4.matmul_bf16_multi(ts, n, x, tokens, ys);
+}
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* older DLL: the separate calls */
+    return g_dsv4.decode_proj_multi(ts, n, x, ys);
 }
 
 int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,

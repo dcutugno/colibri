@@ -2364,7 +2364,29 @@ static int attention_token_impl(float *output,
     if (aprof < 0) aprof = getenv("DSV4_DECODE_PROF") != NULL;
     if (aprof) clock_gettime(CLOCK_MONOTONIC, &ap0);
 #define AP_MARK(acc) do { if (aprof) { clock_gettime(CLOCK_MONOTONIC, &ap1); acc += (ap1.tv_sec - ap0.tv_sec) + (ap1.tv_nsec - ap0.tv_nsec) * 1e-9; ap0 = ap1; } } while (0)
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    int gpu_proj = 0, qa_done = 0, kv_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    float comp_kv[1024], comp_gate[1024];
+    float idx_kv[256], idx_gate[256];
+    int idx_proj = 0;
+    int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
+    int idx_rows = 2 * config->index_head_dim;
+    /* V4_DECODE_PROJ6: wq_a, wkv and the two compressor pairs in one round
+     * trip (one upload of the input, six launches, one sync) where three
+     * used to be (the qa matvec, the pairs' call, the kv matvec); each
+     * tensor's kernel is the one its own call runs: bitwise */
+    if (!result && state && weights->plan.compression_ratio && state->indexer &&
+        v4_decode_gpu_proj_on() && wq_a.gpu && wkv.gpu && comp_rows <= 1024 && idx_rows <= 256) {
+        static const char *const keys4[4] = {
+            "attn.compressor.wkv", "attn.compressor.wgate",
+            "attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
+        void *const fp8s[2] = {wq_a.gpu, wkv.gpu};
+        float *const outs6[6] = {qa, kv, comp_kv, comp_gate, idx_kv, idx_gate};
+        if (coli_v4_gpu_decode_proj_multi(weights, fp8s, 2, keys4, 4, outs6, input) == 0)
+            gpu_proj = idx_proj = qa_done = kv_done = 1;
+    }
+#endif
+    if (!result && !qa_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2380,7 +2402,6 @@ static int attention_token_impl(float *output,
         int produced = 0;
         float *emit_row = state->compressed +
                           (size_t)state->compressed_count * head_dim;
-        int gpu_proj = 0;
 #ifdef COLI_V4_GPU_TIER
         /* The wkv/wgate projections on the card: the batched prefill kernel
          * with a batch of one, over the mirrors COLI_CUDA_ATTN_BATCH=1
@@ -2388,15 +2409,10 @@ static int attention_token_impl(float *output,
          * CPU (coli_v4_compressor_advance). The CPU projection is a scalar
          * bf16 loop over 8-16 MB per layer: measured 75 ms of a 3.3k-context
          * token's 129 ms of attention went to it and the indexer's. */
-        float comp_kv[1024], comp_gate[1024];
-        float idx_kv[256], idx_gate[256];
-        int idx_proj = 0;
-        int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
-        int idx_rows = 2 * config->index_head_dim;
         /* The indexer-compressor's pair rides in the same round trip (one
          * upload of the input, four launches, one sync) when the layer has
          * an indexer; a refusal leaves each pair to its own call. */
-        if (!result && v4_decode_gpu_proj_on() && comp_rows <= 1024 &&
+        if (!result && !gpu_proj && v4_decode_gpu_proj_on() && comp_rows <= 1024 &&
             state->indexer && idx_rows <= 256) {
             static const char *const keys4[4] = {
                 "attn.compressor.wkv", "attn.compressor.wgate",
@@ -2467,7 +2483,7 @@ static int attention_token_impl(float *output,
               (!state->indexer || compressed_indices);
 #endif
     AP_MARK(g_v4_ap_qb);
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result && !kv_done) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -16339,6 +16355,26 @@ int coli_v4_gpu_bf16_project_multi(
         if (!ts[i] || !outs[i]) return -1;
     }
     return dsv4_cuda_matmul_bf16_multi(ts, n, inputs, batch, outs) ? 0 : -1;
+}
+/* V4_DECODE_PROJ6 (0): a decode token's projections of the attention input
+ * (the fp8 wq_a and wkv views' mirrors, the compressor's and the indexer-
+ * compressor's bf16 pairs) in one device round trip; -1 when the DLL has
+ * no such entry or a mirror is missing (each call then runs on its own,
+ * the same kernels: bitwise either way). */
+int coli_v4_gpu_decode_proj_multi(const ColiDeepSeekV4LayerWeights *weights,
+                                  void *const *fp8_gpu, int nf, const char *const *keys, int nk,
+                                  float *const *outs, const float *input) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_DECODE_PROJ6"); on = e && *e && atoi(e) != 0; }   /* measured equal: off */
+    Dsv4CudaTensor *ts[8];
+    if (!on || !coli_v4_gpu_attn_batch_wanted() || !weights || !outs || !input ||
+        nf < 0 || nk < 0 || nf + nk < 1 || nf + nk > 8) return -1;
+    for (int i = 0; i < nf; i++) { ts[i] = (Dsv4CudaTensor *)fp8_gpu[i]; if (!ts[i] || !outs[i]) return -1; }
+    for (int i = 0; i < nk; i++) {
+        ts[nf + i] = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, keys[i]);
+        if (!ts[nf + i] || !outs[nf + i]) return -1;
+    }
+    return dsv4_cuda_decode_proj_multi(ts, nf + nk, input, outs) ? 0 : -1;
 }
 
 /* V4_IDX_FUSED (1): the indexer selection as one device round trip over

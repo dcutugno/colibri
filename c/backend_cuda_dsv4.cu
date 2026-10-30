@@ -2887,6 +2887,35 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
+/* One token's projections of one input through several mirrors (bf16, fp8
+ * or fp8-bf16) in one round trip: one upload, a launch per mirror (the
+ * kernel each mirror's own call runs: mm_bf16_batch with a batch of one,
+ * run_mv for fp8), the downloads, one sync. The outputs are what the
+ * separate calls return, bitwise. */
+extern "C" int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor*const*ts,int n,const float*x,float*const*ys){
+    if(!ts||!ys||n<1||n>8||!x||!ts[0])return 0;
+    Dev*c=ctx(ts[0]->device);
+    if(!c||!ok(cudaSetDevice(ts[0]->device),"select decode proj device"))return 0;
+    size_t xb=(size_t)ts[0]->I*4,yb=0;
+    for(int i=0;i<n;i++){
+        if(!ts[i]||!ys[i]||ts[i]->device!=ts[0]->device||ts[i]->I!=ts[0]->I)return 0;
+        int f=ts[i]->fmt;if(f!=16&&f!=8&&f!=9)return 0;
+        yb+=(size_t)ts[i]->O*4;
+    }
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"decode proj upload"))return 0;
+    size_t off=0;
+    for(int i=0;i<n;i++){
+        size_t ob=(size_t)ts[i]->O*4;float*dy=(float*)((char*)c->dy+off);
+        if(ts[i]->fmt==16)mm_bf16_batch<<<dim3(ts[i]->O,1),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,1);
+        else if(ts[i]->fmt==8)run_mv<8>((uint8_t*)ts[i]->w,ts[i]->scale,c->dx,dy,ts[i]->O,ts[i]->I,1,c->stream);
+        else run_mv<9>((uint8_t*)ts[i]->w,ts[i]->scale,c->dx,dy,ts[i]->O,ts[i]->I,1,c->stream);
+        if(!ok(cudaGetLastError(),"decode proj launch")||
+           !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"decode proj download"))return 0;
+        off+=ob;
+    }
+    return ok(cudaStreamSynchronize(c->stream),"decode proj sync");
+}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;

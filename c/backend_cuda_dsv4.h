@@ -29,6 +29,8 @@ int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor *t,const float *x,int tokens,floa
 /* n (<= 8) bf16 matmuls over the same x [tokens][I] in one round trip. */
 int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts,int n,const float *x,int tokens,
                                 float *const *ys);
+/* one token, one round trip through several mirrors (bf16 / fp8); 0 on an older DLL */
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts,int n,const float *x,float *const *ys);
 /* Host-pointer batched sparse window attention (prefill). vals holds
  * [0,comp_base) window rows in position order then the compressed rows;
  * meta[3t]=window row offset, meta[3t+1]=window rows, meta[3t+2]=compressed
