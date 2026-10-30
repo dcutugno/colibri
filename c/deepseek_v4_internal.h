@@ -319,7 +319,9 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            char *error, size_t error_size);
 /* V4_PRED_NEXT: the decode loop hands the next layer's weights (NULL = none)
  * to the MoE step's expert predictor before each layer */
-void coli_v4_pred_next_set(const ColiDeepSeekV4LayerWeights *next, int token,
+int coli_v4_pred_depth(void);   /* V4_PRED_DEPTH (1 or 2) */
+void coli_v4_pred_next_set(const ColiDeepSeekV4LayerWeights *next,
+                           const ColiDeepSeekV4LayerWeights *next2, int token,
                            ColiExpertStore *store, const ColiDeepSeekV4Config *config);
 int coli_v4_layer_load(ColiV4Engine *engine,
                        ColiDeepSeekV4LayerWeights *weights,
