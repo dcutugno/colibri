@@ -794,7 +794,7 @@ bitwise), yet the unprofiled time to first token was 0.4 s worse over two
 A/B pairs (40.9 / 40.8 s fused, 40.4 / 40.5 s two-call). Dropped; the
 device grouping goes with it (it only served the fused path).
 
-Nineteenth measurement (2026-10-29): a chunk's intermediate activations
+Seventeenth measurement (2026-10-29): a chunk's intermediate activations
 taken on the card where the producer's device copy still holds them.
 `V4_RESIDENT` (1): a small tag table (device activation, host array,
 count) that the producers set after their download and the consumers
