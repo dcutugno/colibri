@@ -852,6 +852,24 @@ mirror reservations cost more than their earlier landing saves (the
 non-resident count at routing time, ~100 lane lookups per token, does
 not fall). Left in at depth 1 (its default), the dedupe with it.
 
+Twentieth measurement (2026-10-30): the guess cut by rank, and the CPU
+split again. `decprof` now reports the next-layer guess's hit rate by
+router rank (`rank-hit=`): 99/95/90/75/55/40 % for ranks 1-6, so the two
+lowest ranks are the wrong guesses. `V4_PRED_TOPK=M` (16 = all) queues
+only the first M of a router layer's predicted set: M=4 cuts the reads
+per token 127 -> 106 and compute 82 -> 68, but loads rise 87 -> 100 by
+the same amount (the right guesses among the cut ranks are now the
+lanes' to read at the layer): moe 197 -> 196 (M=5) / 196 (M=4) / 200
+(M=3), bitwise. `DSV4_HYBRID=1` (the misses split between a PCIe fill
+and the CPU, measurable only with `V4_UPLOAD_PIECES=0` since a piece read
+lands in a mirror before the split decides): moe 251, compute 147, as
+the earlier run of it (moe 384 on the build of its day). Three
+schedules of the same bytes (a wider window, fewer guesses, a later
+landing) all come to ~197 ms: a token's MoE is its ~100 uploads x 12.75
+MiB over the x8 link plus the kernels, however they are ordered, and the
+second card's link is already taking its half of the pieces. Left at
+`V4_PRED_TOPK=16`.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -998,6 +1016,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PRED_NEXT` (2) | decode: `=N` lanes reading the next layer's experts as its gate, scored on this layer's FFN input by a predictor thread, predicts them (hash layers: exact from the token id), skipping what RAM or a card already holds; 74-78 % hit; `0` = off |
 | `V4_PRED_PIECES` (1) | the prefetch lanes also reserve VRAM mirrors and copy the pieces as they read (a hit is a mirror); `0` = RAM only; `2` = the copies on a prefetch stream of their own, the group waiting per mirror (measured equal to `1`) |
 | `V4_PRED_DEPTH` (1) | `2` = the layer after next predicted too, by its own gate on this layer's FFN input, queued behind the next layer's; measured slower (moe 198 -> 203 ms: the extra uploads and mirror reservations outweigh the wider window) |
+| `V4_PRED_TOPK` (16) | `=M` queues only the first M of a router layer's predicted set in the router's rank order (ranks 5 and 6 hit ~55 / 40 %); measured equal (fewer reads, the same time) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |

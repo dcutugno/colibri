@@ -6284,6 +6284,20 @@ static int g_v4_pred2_ids[COLI_V4_RESIDENT_MAX_LAYERS][16];   /* the two-ahead g
 static int g_v4_pred2_n[COLI_V4_RESIDENT_MAX_LAYERS];
 unsigned long long g_v4_pred_hit, g_v4_pred_total, g_v4_pred_queued;
 unsigned long long g_v4_pred2_hit, g_v4_pred2_total;
+unsigned long long g_v4_pred_rank_hit[16], g_v4_pred_rank_total[16];   /* the guess by its router rank */
+/* V4_PRED_TOPK (16 = all): only the first M of a router layer's predicted
+ * set, in the router's rank order, are queued (a hash layer's exact set
+ * always is); the lower ranks are the likelier wrong guesses */
+static int v4_pred_topk(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("V4_PRED_TOPK");
+        m = e && *e ? atoi(e) : 16;
+        if (m < 1) m = 1;
+        if (m > 16) m = 16;
+    }
+    return m;
+}
 
 /* The predictor thread: one slot (the FFN input of layer L, layer L+1's
  * weights, the store); it scores the gate single-threaded (no OpenMP team
@@ -6333,13 +6347,14 @@ static int v4_pred_route(int *ids, const float *hidden, const uint16_t *gate,
 }
 static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n, int layer);
 /* the predicted set, minus what RAM or a card already holds, to the pool */
-static void v4_pred_publish(ColiExpertStore *store, int layer, const int *ids, int n, int deep) {
+static void v4_pred_publish(ColiExpertStore *store, int layer, const int *ids, int n, int deep,
+                            int exact) {
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS || n > 16) return;
     int *rec = deep ? g_v4_pred2_ids[layer] : g_v4_pred_ids[layer];
     for (int i = 0; i < n; i++) rec[i] = ids[i];
     if (deep) g_v4_pred2_n[layer] = n; else g_v4_pred_n[layer] = n;
-    int wanted[16], count = 0;
-    for (int i = 0; i < n; i++) {
+    int wanted[16], count = 0, queue_n = exact ? n : (n < v4_pred_topk() ? n : v4_pred_topk());
+    for (int i = 0; i < queue_n; i++) {
         ColiExpertKey key = {layer, ids[i]};
         if (coli_v4_expert_store_cached(store, key)) continue;
 #ifdef COLI_V4_GPU_TIER
@@ -6372,7 +6387,7 @@ static void *v4_pred_worker(void *arg) {
             int ids[16], n = 0;
             if (gate && topk <= 16)
                 n = v4_pred_route(ids, hidden, gate, bias, experts, d, topk);
-            if (n) v4_pred_publish(store, w->plan.layer, ids, n, deep);
+            if (n) v4_pred_publish(store, w->plan.layer, ids, n, deep, 0);
         }
     }
     return NULL;
@@ -6401,7 +6416,7 @@ void coli_v4_pred_next_set(const ColiDeepSeekV4LayerWeights *next,
         if (!table) continue;
         int ids[16];
         for (int i = 0; i < topk; i++) ids[i] = (int)table[(size_t)token * topk + i];
-        v4_pred_publish(store, w->plan.layer, ids, topk, deep);
+        v4_pred_publish(store, w->plan.layer, ids, topk, deep, 1);
     }
 }
 /* layer L's MoE step, after its routing: hand layer L's FFN input to the
@@ -6846,6 +6861,12 @@ static int moe_token_pipeline(float *output,
                     for (int j = 0; j < g_v4_pred_n[layer]; j++)
                         if (expert_ids[i] == g_v4_pred_ids[layer][j]) { g_v4_pred_hit++; break; }
                 g_v4_pred_total += (unsigned long long)selected;
+                if (!weights->plan.uses_hash_router)
+                    for (int j = 0; j < g_v4_pred_n[layer]; j++) {   /* the guess by rank */
+                        g_v4_pred_rank_total[j]++;
+                        for (int i = 0; i < selected; i++)
+                            if (expert_ids[i] == g_v4_pred_ids[layer][j]) { g_v4_pred_rank_hit[j]++; break; }
+                    }
                 g_v4_pred_n[layer] = 0;
             }
             if (g_v4_pred2_n[layer]) {
@@ -7602,12 +7623,16 @@ static int block_token_pipeline(float *output_hc,
     struct timespec dp0, dp1;
     if (dprof < 0) dprof = getenv("DSV4_DECODE_PROF") != NULL;
     if (dprof && weights->plan.layer == 0 && dp_layers) {
+        char rank_hit[128] = "";
+        for (int j = 0, off = 0; j < 16 && g_v4_pred_rank_total[j] && off < 100; j++)
+            off += snprintf(rank_hit + off, sizeof(rank_hit) - (size_t)off, "%s%.0f", j ? "/" : "",
+                            100.0 * g_v4_pred_rank_hit[j] / g_v4_pred_rank_total[j]);
         fprintf(stderr, "decprof position=%d layers=%d hc=%.0f attn=%.0f moe=%.0f ms "
                         "(moe: shared=%.0f loads=%.0f of which attach=%.0f compute=%.0f second=%.0f; "
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
-                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu pred-hit=%.1f%% of %llu queued=%llu pred2-hit=%.1f%% of %llu dup=%llu; "
+                        "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu pred-hit=%.1f%% of %llu queued=%llu pred2-hit=%.1f%% of %llu dup=%llu rank-hit=%s; "
                         "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms)\n",
                 position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
@@ -7624,7 +7649,7 @@ static int block_token_pipeline(float *output_hc,
                 g_v4_pred_total ? 100.0 * g_v4_pred_hit / g_v4_pred_total : 0.0,
                 g_v4_pred_total, g_v4_pred_queued,
                 g_v4_pred2_total ? 100.0 * g_v4_pred2_hit / g_v4_pred2_total : 0.0,
-                g_v4_pred2_total, g_v4_pf_dup,
+                g_v4_pred2_total, g_v4_pf_dup, rank_hit,
                 g_v4_ap_qa * 1e3, (g_v4_ap_comp + g_v4_ap_comp_c + g_v4_ap_comp_a) * 1e3,
                 g_v4_ap_comp_c * 1e3, g_v4_ap_comp_a * 1e3, g_v4_ap_qb * 1e3,
                 g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3);
@@ -7640,6 +7665,8 @@ static int block_token_pipeline(float *output_hc,
         g_v4_pf_enqueued = g_v4_pf_read = g_v4_pf_dropped = 0;
         g_v4_pred_hit = g_v4_pred_total = g_v4_pred_queued = 0;
         g_v4_pred2_hit = g_v4_pred2_total = g_v4_pf_dup = 0;
+        memset(g_v4_pred_rank_hit, 0, sizeof(g_v4_pred_rank_hit));
+        memset(g_v4_pred_rank_total, 0, sizeof(g_v4_pred_rank_total));
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
