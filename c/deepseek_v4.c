@@ -4601,6 +4601,43 @@ static int descending_score(const void *left, const void *right) {
     return a->index - b->index;
 }
 
+/* V4_IDX_RADIX (1): a token's candidates ranked by (score descending,
+ * index ascending) as a stable LSD radix sort, a pass per byte of the
+ * score's order-preserving key, over the candidates in index order (so
+ * equal scores keep their index order): the total order descending_score
+ * defines, hence qsort's ranked list, element for element. ~5 us for 830
+ * candidates where qsort took ~120 (the comparator callback per compare).
+ * A NaN score, which descending_score cannot place consistently, ranks by
+ * its bit pattern here. DSV4_IDX_SORT_VERIFY=1 runs both per token and
+ * counts differing positions. `tmp` holds n entries, `keys` 2n words. */
+static int v4_idx_radix_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_IDX_RADIX"); on = !(e && *e == '0'); }
+    return on;
+}
+static void rank_radix(IndexScore *rk, IndexScore *tmp, uint32_t *keys, int n) {
+    uint32_t *ktmp = keys + n;
+    for (int i = 0; i < n; i++) {
+        uint32_t u; memcpy(&u, &rk[i].score, sizeof(u));
+        u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);   /* ascending float order */
+        keys[i] = ~u;                                       /* descending */
+    }
+    IndexScore *src = rk, *dst = tmp; uint32_t *ks = keys, *kd = ktmp;
+    for (int shift = 0; shift < 32; shift += 8) {
+        int count[256] = {0};
+        for (int i = 0; i < n; i++) count[(ks[i] >> shift) & 255]++;
+        int pos = 0;
+        for (int b = 0; b < 256; b++) { int c = count[b]; count[b] = pos; pos += c; }
+        for (int i = 0; i < n; i++) {
+            int b = (ks[i] >> shift) & 255, j = count[b]++;
+            dst[j] = src[i]; kd[j] = ks[i];
+        }
+        IndexScore *ts = src; src = dst; dst = ts;
+        uint32_t *tk = ks; ks = kd; kd = tk;
+    }
+    /* four passes: the result is back in rk */
+}
+
 int coli_v4_indexer_create(ColiDeepSeekV4Indexer **output,
                            const ColiDeepSeekV4LayerWeights *weights,
                            const ColiDeepSeekV4Config *config,
@@ -4921,6 +4958,16 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
     size_t sz_ranked = ALIGN32((size_t)need * max_count * sizeof(IndexScore));
+    int radix = v4_idx_radix_on();
+    static int sort_verify = -1;
+    if (sort_verify < 0) {
+        const char *env = getenv("DSV4_IDX_SORT_VERIFY");
+        sort_verify = env && *env && *env != '0';
+    }
+    if (sort_verify) radix = 1;
+    size_t sz_radix = radix ? ALIGN32((size_t)need * max_count *
+                                      ((sort_verify ? 2 : 1) * sizeof(IndexScore) +
+                                       2 * sizeof(uint32_t))) : 0;
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -4942,7 +4989,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #endif
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                           sz_scores + sz_ranked + sz_xq + sz_yq + sz_xs +
+                           sz_scores + sz_ranked + sz_radix + sz_xq + sz_yq + sz_xs +
                            sz_xin + 2 * sz_rope + sz_fsc + sz_fsq + sz_fhw + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
@@ -4960,6 +5007,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
+    char *radix_scratch = scratch_ptr; scratch_ptr += sz_radix;
     int result = 0;
 
     /* Slots: the scored tokens in order, each with its candidate count. */
@@ -5215,14 +5263,32 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
      * order: score, then index), so they run across tokens, each in its
      * own ranked row: the same output as the serial loop. */
     if (!result) {
-        #pragma omp parallel for schedule(dynamic, 1)
+        #pragma omp parallel for schedule(dynamic, 1) if(need > 1)
         for (int i = 0; i < need; i++) {
             int t = stoken[i];
             const float *row = scores + (size_t)i * max_count;
             IndexScore *rk = ranked + (size_t)i * max_count;
             for (int candidate = 0; candidate < scounts[i]; candidate++)
                 rk[candidate] = (IndexScore){row[candidate], candidate};
-            qsort(rk, (size_t)scounts[i], sizeof(*rk), descending_score);
+            if (radix) {
+                size_t per = (size_t)max_count * ((sort_verify ? 2 : 1) * sizeof(IndexScore) +
+                                                  2 * sizeof(uint32_t));
+                char *base = radix_scratch + (size_t)i * per;
+                IndexScore *tmp = (IndexScore *)base;
+                uint32_t *keys = (uint32_t *)(base + (size_t)max_count * sizeof(IndexScore));
+                if (sort_verify) {
+                    IndexScore *qs = (IndexScore *)(base + (size_t)max_count *
+                                                    (sizeof(IndexScore) + 2 * sizeof(uint32_t)));
+                    memcpy(qs, rk, (size_t)scounts[i] * sizeof(*rk));
+                    qsort(qs, (size_t)scounts[i], sizeof(*qs), descending_score);
+                    rank_radix(rk, tmp, keys, scounts[i]);
+                    long long bad = 0;
+                    for (int k = 0; k < scounts[i]; k++)
+                        if (qs[k].index != rk[k].index || qs[k].score != rk[k].score) bad++;
+                    fprintf(stderr, "idxsort layer=%d start=%d cand=%d mismatches=%lld\n",
+                            state->layer, start_position + t, scounts[i], bad);
+                } else rank_radix(rk, tmp, keys, scounts[i]);
+            } else qsort(rk, (size_t)scounts[i], sizeof(*rk), descending_score);
             int n = scounts[i];
             if (n > topk) n = topk;
             if (n > index_capacity) n = index_capacity;

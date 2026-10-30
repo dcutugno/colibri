@@ -118,6 +118,7 @@ __device__ float e4m3(uint8_t b){int sign=b>>7,e=(b>>3)&15,m=b&7;float v;
     return sign?-v:v;}
 __device__ float e8(uint8_t b){return e8_table[b];}
 __device__ float f4(uint8_t q){const float a[8]={0,.5f,1,1.5f,2,3,4,6};return q&8?-a[q&7]:a[q];}
+__global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,int I,int T);
 template<int F> __global__ void mv(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
     int o=blockIdx.x;if(o>=O)return;float sum=0;
     const float *xi=x+(long long)(o/(O/groups))*I;for(int i=threadIdx.x;i<I;i+=blockDim.x){float v;
@@ -144,6 +145,102 @@ template<int F,int R> __global__ void mv_rows(const uint8_t *w,const uint8_t *sc
     if(!threadIdx.x){
         #pragma unroll
         for(int r=0;r<R;r++)if(base+r<O)y[base+r]=s[r][0];}
+}
+/* DSV4_MV_WARP (1): the one-token fp8 matvec as one warp per row. mv<F>
+ * has thread j of its 256-thread block sum partial j (i = j, j+256, ... in
+ * order) and then fold the 256 partials as a tree (128, 64, ..., 1). Here
+ * lane l holds partials 8l..8l+7: eight consecutive bytes of the row, one
+ * 8-byte load per lane and 256 contiguous bytes per warp per step, x as two
+ * float4 (mv<F> loads one byte per thread). The tree's 128/64/32/16/8 steps
+ * are shuffles over lanes 16/8/4/2/1 apart, its 4/2/1 steps in-lane adds:
+ * every output has mv<F>'s operands in mv<F>'s order (bit-identical;
+ * DSV4_MV_WARP_VERIFY runs both and counts differing words). I % 256 == 0
+ * and 8-byte aligned rows. Eight rows per 256-thread block; e4m3 through a
+ * shared table of exactly e4m3()'s values. */
+template<int F> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
+    __shared__ float lut[256];
+    lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();
+    int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
+    const float *xi=x+(long long)(o/(O/groups))*I;
+    const uint8_t *wr=w+(long long)o*I;
+    const uint8_t *scr=sc+(long long)(o/128)*((I+127)/128);
+    float p[8];
+    #pragma unroll
+    for(int k=0;k<8;k++)p[k]=0.f;
+    for(int c=0;c<I;c+=256){
+        int i0=c+8*lane;
+        uint2 wv=*(const uint2*)(wr+i0);
+        float4 xa=*(const float4*)(xi+i0),xb=*(const float4*)(xi+i0+4);
+        float es=e8(scr[i0/128]);
+        unsigned b[8]={wv.x&255u,(wv.x>>8)&255u,(wv.x>>16)&255u,wv.x>>24,wv.y&255u,(wv.y>>8)&255u,(wv.y>>16)&255u,wv.y>>24};
+        float xs[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int k=0;k<8;k++){float v=lut[b[k]]*es;if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
+    }
+    #pragma unroll
+    for(int k=0;k<8;k++){
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],16);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],8);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],4);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],2);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],1);
+    }
+    if(!lane){float v0=p[0]+p[4],v1=p[1]+p[5],v2=p[2]+p[6],v3=p[3]+p[7];v0=v0+v2;v1=v1+v3;y[o]=v0+v1;}
+}
+/* The bf16 one (mm_bf16_batch with a batch of one, mv_bf16: the same
+ * partials and tree): lane l's eight bf16 as one 16-byte load. */
+__global__ void __launch_bounds__(256) mv_bf16_warp(const __nv_bfloat16 *w,const float *x,float *y,int O,int I){
+    int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
+    const __nv_bfloat16 *wr=w+(long long)o*I;
+    float p[8];
+    #pragma unroll
+    for(int k=0;k<8;k++)p[k]=0.f;
+    for(int c=0;c<I;c+=256){
+        int i0=c+8*lane;
+        uint4 wv=*(const uint4*)(wr+i0);
+        float4 xa=*(const float4*)(x+i0),xb=*(const float4*)(x+i0+4);
+        unsigned u[4]={wv.x,wv.y,wv.z,wv.w};
+        float xs[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int k=0;k<8;k++){float v=__uint_as_float((k&1)?(u[k>>1]&0xffff0000u):(u[k>>1]<<16));p[k]+=xs[k]*v;}
+    }
+    #pragma unroll
+    for(int k=0;k<8;k++){
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],16);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],8);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],4);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],2);
+        p[k]+=__shfl_down_sync(0xffffffffu,p[k],1);
+    }
+    if(!lane){float v0=p[0]+p[4],v1=p[1]+p[5],v2=p[2]+p[6],v3=p[3]+p[7];v0=v0+v2;v1=v1+v3;y[o]=v0+v1;}
+}
+static int mv_warp_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP");on=!(e&&*e=='0');}return on;}
+static int mv_warp_verify(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP_VERIFY");on=e&&*e&&*e!='0';}return on;}
+static bool mv_warp_fits(const void*w,const float*x,int I,int walign){return I>0&&I%256==0&&!((uintptr_t)x&15)&&!((uintptr_t)w&(walign-1));}
+__global__ void mv_warp_diff_kernel(const float*a,const float*b,int n,unsigned*cnt){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(cnt,1u);}
+/* DSV4_MV_WARP_VERIFY: `got` (the warp kernel's output, O floats) against
+ * `ref` (the block kernel's), counted on the device, reported per call and
+ * in total; synchronous. */
+static void mv_warp_report(const char*tag,const float*ref,const float*got,int O,int I,cudaStream_t st){
+    static unsigned*dc=nullptr;static unsigned long long calls=0,bad_calls=0,words=0;
+    if(!dc){if(cudaMalloc((void**)&dc,sizeof(unsigned))!=cudaSuccess){dc=nullptr;return;}}
+    cudaMemsetAsync(dc,0,sizeof(unsigned),st);
+    mv_warp_diff_kernel<<<(O+255)/256,256,0,st>>>(ref,got,O,dc);
+    unsigned n=0;cudaMemcpyAsync(&n,dc,sizeof(n),cudaMemcpyDeviceToHost,st);cudaStreamSynchronize(st);
+    calls++;words+=n;if(n)bad_calls++;
+    fprintf(stderr,"mvwverify %s O=%d I=%d mismatches=%u (calls=%llu bad=%llu words=%llu)\n",tag,O,I,n,calls,bad_calls,words);
+}
+static float*mv_warp_scratch(size_t n){static float*p=nullptr;static size_t cap=0;if(cap<n){if(p)cudaFree(p);p=nullptr;cap=0;if(cudaMalloc((void**)&p,n*4)!=cudaSuccess){p=nullptr;return nullptr;}cap=n;}return p;}
+/* bf16 rows for one token: the warp kernel when it fits, else
+ * mm_bf16_batch with a batch of one (what the callers launched). */
+static void launch_bf16_one(const __nv_bfloat16*w,const float*x,float*y,int O,int I,cudaStream_t st){
+    if(mv_warp_on()&&mv_warp_fits(w,x,I,16)){
+        if(mv_warp_verify()){float*t=mv_warp_scratch((size_t)O);if(t){
+            mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
+            mv_bf16_warp<<<(O+7)/8,256,0,st>>>(w,x,t,O,I);
+            mv_warp_report("bf16",y,t,O,I,st);return;}}
+        mv_bf16_warp<<<(O+7)/8,256,0,st>>>(w,x,y,O,I);
+    }else mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
 }
 template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int O,int I){
     int matrix=blockIdx.y,base=blockIdx.x*R;if(matrix>=count)return;MvDesc d=desc[matrix];float sum[R]={};
@@ -228,7 +325,18 @@ template<int F> static void run_mv(const uint8_t*w,const uint8_t*sc,const float*
     else if(rows==16)mv_rows<F,16><<<(O+15)/16,256,0,stream>>>(w,sc,x,y,O,I,groups);
     else if(rows==8)mv_rows<F,8><<<(O+7)/8,256,0,stream>>>(w,sc,x,y,O,I,groups);
     else if(rows==4)mv_rows<F,4><<<(O+3)/4,256,0,stream>>>(w,sc,x,y,O,I,groups);
-    else mv<F><<<O,256,0,stream>>>(w,sc,x,y,O,I,groups);
+    else{
+        if constexpr(F==8||F==9){
+            if(mv_warp_on()&&mv_warp_fits(w,x,I,8)){
+                if(mv_warp_verify()){float*t=mv_warp_scratch((size_t)O);if(t){
+                    mv<F><<<O,256,0,stream>>>(w,sc,x,y,O,I,groups);
+                    mv_warp<F><<<(O+7)/8,256,0,stream>>>(w,sc,x,t,O,I,groups);
+                    mv_warp_report(F==9?"fp8b":"fp8",y,t,O,I,stream);return;}}
+                mv_warp<F><<<(O+7)/8,256,0,stream>>>(w,sc,x,y,O,I,groups);return;
+            }
+        }
+        mv<F><<<O,256,0,stream>>>(w,sc,x,y,O,I,groups);
+    }
 }
 static void run_fp4_grouped(const MvDesc *desc,int count,int O,int I,cudaStream_t stream){
     static int rows=-1;if(rows<0){const char *p=getenv("DSV4_CUDA_FP4_ROWS");rows=p?atoi(p):2;}
@@ -2230,7 +2338,8 @@ extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int to
     size_t xb=(size_t)tokens*t->I*4,yb=(size_t)tokens*t->O*4;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 batch upload"))return 0;
-    mm_bf16_batch<<<dim3(t->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,tokens);
+    if(tokens==1)launch_bf16_one((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,c->stream);
+    else mm_bf16_batch<<<dim3(t->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,tokens);
     return ok(cudaGetLastError(),"bf16 batch launch")&&
            ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"bf16 batch download")&&
            ok(cudaStreamSynchronize(c->stream),"bf16 batch sync");
@@ -2252,7 +2361,8 @@ extern "C" int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor*const*ts,int n,const f
     for(int i=0;i<n;i++){
         size_t ob=(size_t)tokens*ts[i]->O*4;
         float*dy=(float*)((char*)c->dy+off);
-        mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
+        if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,c->stream);
+        else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
         if(!ok(cudaGetLastError(),"bf16 multi launch")||
            !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;
         off+=ob;
@@ -2884,7 +2994,7 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else if(t->fmt==9)run_mv<9>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
     else if(t->fmt==4)run_mv<4>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
     else if(t->fmt==32)mv_f32<<<t->O,256,0,c->stream>>>((float*)t->w,c->dx,c->dy,t->O,t->I);
-    else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
+    else launch_bf16_one((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,c->stream);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
 /* One token's projections of one input through several mirrors (bf16, fp8
@@ -2904,17 +3014,29 @@ extern "C" int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor*const*ts,int n,const f
     }
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"decode proj upload"))return 0;
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_PROJ_KPROF");kprof=e&&*e&&*e!='0';}
+    cudaEvent_t ev[9];
+    if(kprof){for(int i=0;i<=n;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
     size_t off=0;
     for(int i=0;i<n;i++){
         size_t ob=(size_t)ts[i]->O*4;float*dy=(float*)((char*)c->dy+off);
-        if(ts[i]->fmt==16)mm_bf16_batch<<<dim3(ts[i]->O,1),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,1);
+        if(ts[i]->fmt==16)launch_bf16_one((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,c->stream);
         else if(ts[i]->fmt==8)run_mv<8>((uint8_t*)ts[i]->w,ts[i]->scale,c->dx,dy,ts[i]->O,ts[i]->I,1,c->stream);
         else run_mv<9>((uint8_t*)ts[i]->w,ts[i]->scale,c->dx,dy,ts[i]->O,ts[i]->I,1,c->stream);
+        if(kprof)cudaEventRecord(ev[i+1],c->stream);
         if(!ok(cudaGetLastError(),"decode proj launch")||
            !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"decode proj download"))return 0;
         off+=ob;
     }
-    return ok(cudaStreamSynchronize(c->stream),"decode proj sync");
+    int done=ok(cudaStreamSynchronize(c->stream),"decode proj sync");
+    if(kprof){
+        fprintf(stderr,"projkprof n=%d",n);
+        for(int i=0;i<n;i++){float ms=0;cudaEventElapsedTime(&ms,ev[i],ev[i+1]);fprintf(stderr," [%d]%s%dx%d=%.3f",i,ts[i]->fmt==16?"bf16":"fp8",ts[i]->O,ts[i]->I,ms);}
+        fprintf(stderr," ms\n");
+        for(int i=0;i<=n;i++)cudaEventDestroy(ev[i]);
+    }
+    return done;
 }
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||

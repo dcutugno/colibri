@@ -922,6 +922,39 @@ host, compressor 7.8 -> 2.8, kv 2.9 -> 1.1), attention 40 -> 40, after
 the first token within noise. The device work is the same ~0.1 ms per
 layer; only two sync latencies went. Left off.
 
+Twenty-fourth measurement (2026-10-30): the one-token matvec kernels as a
+warp per row, bitwise. `DSV4_MV_WARP` (1): `mv<F>` (fp8 and fp8-bf16
+mirrors: wq_a, wkv, the shared expert's three, the chain's three under
+`DSV4_ATTN_MV=0`) and `mm_bf16_batch` with a batch of one (the
+compressor's and the indexer-compressor's pairs) read one byte or one
+bf16 per thread; `mv_warp` / `mv_bf16_warp` give each lane eight
+consecutive columns (one 8- or 16-byte load, 256 contiguous bytes per
+warp per step) and fold the same 256 partials in the same tree order
+(the 128..8 steps as shuffles, 4..1 in-lane), so every output is the
+block kernel's operands in its order. `DSV4_MV_WARP_VERIFY=1` runs both
+per call and counts differing words: 11,865 calls over a 3.3k prompt and
+36 tokens, 0 (`mvwverify`). Measured (3.3k context, one card, 36 tokens,
+md5 bd9c9eae2f2f): attention 38 -> 36 ms per token, the shared expert
+10 -> 7, after the first token 11.64 -> 11.50 s. On the chain's 32 MB
+matrices the warp kernel runs at the shaped kernel's speed
+(`DSV4_WO_KPROF`: wq_b 3.9 vs 4.1, wo_a 2.0 vs 2.2, wo_b 2.3 vs 2.3 ms
+per token), so `DSV4_ATTN_MV=0`, the exact reference order, now costs
+nothing (after the first token 11.53 s, md5 85d209f4e138); the default
+stays 1 for the standing baseline. `V4_IDX_RADIX` (1): the ranking of a
+token's indexer candidates (score descending, index ascending) as a
+stable byte-radix sort over the score's order-preserving key instead of
+qsort with its comparator callback, the same ranked list element for
+element (`DSV4_IDX_SORT_VERIFY=1`: 69,510 sorts, candidate counts 1 to
+828, 0 mismatches); select 10 -> 9 ms per token; the sort's OpenMP team
+no longer starts for one decode token. Tried and reverted: the decode
+chain's seven small inputs and its output through the pinned staging
+block as one copy each (`DSV4_PIN_STAGE`, as the prefill chain does) and
+the projection calls' outputs the same way: the chain 14 -> 16 ms per
+token, the projections equal. On this driver the small pageable copies
+are cheaper than pinned DMA, and the pageable downloads between launches
+were not stalling the host (the `DSV4_PROJ_KPROF` per-launch times in
+`dsv4_cuda_decode_proj_multi` sit at a ~35 us floor either way).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1056,7 +1089,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_PF_KPROF` (0, `.cu`) | per-call device time of the prefill chain's stages and its host wall (`pfkprof`) |
 | `DSV4_SATTN_HPB` (4) | heads per block of the shaped sparse attention from 256 rows up (`1` = one head per block, the rows read once per head) |
 | `DSV4_SATTN_V2` (1) | the cached sparse attention kernel shaped for latency (same arithmetic, same order, bitwise); `0` = the old kernel |
-| `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the byte-per-lane kernel, bitwise the reference (slower by ~0.27 ms per layer) |
+| `DSV4_ATTN_MV` (1) | decode: the attention chain's fp8 matvecs (wq_b, wo_a, wo_b) on the bandwidth-shaped kernel; `0` = the reference order (the `DSV4_MV_WARP` kernel since the twenty-fourth measurement: the same speed, bitwise the reference, md5 85d209f4e138 on the 36-token bench) |
 | `V4_UPLOAD_PIECES` (4) | decode: a lane's expert read lands in this many pieces, all in flight at once, each copied to a mirror reserved before the read as it lands (the link works under the read); the slab is page-locked before the read. `0`/`1` = one read, the uploader thread copies after it. Needs `V4_MIRROR_BLOCK`, `V4_UPLOAD_FENCE` and the DLL's `dsv4_cuda_mirror_copy`/`_point`/`_host_pin`. `V4_PIECES_VERIFY=1` compares each piece-built mirror with its slab, `=8` compares each slab with a buffered re-read (diagnostics) |
 | `V4_UPLOAD_FENCE` (1) | decode: the uploader threads only enqueue their copies; the expert group waits for them on the device (`dsv4_cuda_group_fence`, aux-stream event) instead of the host joining the DMA before launching. Needs the export in every backend module in use (else, or `0`: drained as before) |
 | `DSV4_MOE_PINNED` (1, `.cu`) | pinned staging for the decode group's small copies (x, descriptors + weights in one transfer, y); `0` = pageable |
@@ -1070,6 +1103,9 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PRED_DEPTH` (1) | `2` = the layer after next predicted too, by its own gate on this layer's FFN input, queued behind the next layer's; measured slower (moe 198 -> 203 ms: the extra uploads and mirror reservations outweigh the wider window) |
 | `V4_PRED_TOPK` (16) | `=M` queues only the first M of a router layer's predicted set in the router's rank order (ranks 5 and 6 hit ~55 / 40 %); measured equal (fewer reads, the same time) |
 | `V4_HC_PAR` (1) | the hyper-connection steps' OpenMP use: `1` = a team (no larger than its 24 rows) for the pre's mix only, the column loops and the post on the calling thread; `0` = all serial; `2` = every loop on the full team (bitwise in all three; measured hc 26 / 31 / 19 ms per token for 2 / 0 / 1) |
+| `DSV4_MV_WARP` (1) | the one-token fp8 / bf16 matvec kernels as a warp per row with 8/16-byte lane loads, the block kernels' summation order (bitwise); `DSV4_MV_WARP_VERIFY=1` runs both and counts differing words (`mvwverify`) |
+| `V4_IDX_RADIX` (1) | the indexer candidates ranked by a stable byte-radix sort instead of qsort (the same list); `DSV4_IDX_SORT_VERIFY=1` compares the two per token (`idxsort`) |
+| `DSV4_PROJ_KPROF` (off) | per-launch device times of `dsv4_cuda_decode_proj_multi` (`projkprof`, with `V4_DECODE_PROJ6=1`) |
 | `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
