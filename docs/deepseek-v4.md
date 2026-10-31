@@ -1035,6 +1035,25 @@ download per output); attention 34 -> 30 ms, after the first token 11.35
 -> 11.20 s, md5 85d209f4e138 on all. The ~160 us per call left is the
 round trip (upload, launches, one sync) over ~30 us of kernels.
 
+Thirtieth measurement (2026-10-31): the decode token's cached sparse
+attention as two launches. `DSV4_SATTN_SPLIT` (1): the v2 kernel runs a
+token on 16 blocks (four heads per block of 512 threads), so a layer's
+~390 rows took 0.09 ms of latency on 16 of the card's SMs
+(`DSV4_WO_KPROF`, `attn=`). The score kernel runs the v2 kernel's score
+phase over (head quads x tiles of 64 rows) into a device buffer; the
+value kernel, over (head quads x slices of `DSV4_SATTN_SPLIT_DS` (128)
+columns), takes its heads' scores through the v2 kernel's softmax (the
+block max, the exponentials, the serial denominator, the bf16 round) and
+the row-ordered weighted sum for its columns: 64 + 64 blocks where 16
+were, every output the v2 kernel's operands in its order. Measured (3.3k
+prompt, 36 tokens, one card, per token): the attention kernel 0.093 ->
+0.049 ms per layer, `sattn` 14 -> 13 ms, attention 30 -> 28, after the
+first token 11.20 -> 11.10 s; slices of 64 and 256 within noise of 128;
+md5 85d209f4e138 on all, `DSV4_WO_VERIFY` clean. The chain's device time
+per layer is now q 0.10 (the wq_b matvec with its uploads, round, norm,
+RoPE), attention 0.05, wo_a 0.05, wo_b 0.05 ms (the three 32 MB matrices
+at ~650 GB/s).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1193,6 +1212,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `DSV4_SATTN_SPLIT` (1) | the decode token's cached sparse attention as a score kernel over row tiles and a value kernel over column slices (bitwise); `0` = the one v2 launch |
+| `DSV4_SATTN_SPLIT_DS` (128) | columns per value-kernel block (32..512) |
 | `DSV4_PROJ_ONEDL` (1) | that round trip's outputs as one download scattered on the host; `0` = a pageable download per output (bitwise, +5 ms per token) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |

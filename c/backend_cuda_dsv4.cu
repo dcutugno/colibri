@@ -57,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -1179,6 +1179,134 @@ template<int IDX,int HPB> __global__ void __launch_bounds__(512) sparse_attn_cac
     }
 }
 static int sattn_v2_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_SATTN_V2");on=!e||!*e||*e!='0';}return on;}
+/* DSV4_SATTN_SPLIT (1): the one-token cached sparse attention as two
+ * launches over many more blocks than the v2 kernel's 16 (four heads per
+ * block of 512 threads, so a 64-head layer runs on 16 of the card's SMs:
+ * 0.09 ms per layer at ~390 rows, latency). The score kernel runs the v2
+ * kernel's score phase (four rows per warp, each lane's dot over its
+ * columns in order, the shuffle tree, times scale) over a grid of
+ * (head quads x tiles of 64 rows) and writes the scores to a device
+ * buffer; the value kernel, over (head quads x slices of DSV4_SATTN_SPLIT_DS
+ * columns), reads its heads' scores into shared memory and runs the v2
+ * kernel's softmax (the block max, the exponentials, the serial
+ * denominator with the sink first, the bf16 round) and the weighted sum
+ * over the rows in order for its columns. Every output is the v2 kernel's
+ * operands in its order: bitwise. 0 = the v2 kernel. */
+static int sattn_split_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_SATTN_SPLIT");on=!(e&&*e=='0');}return on;}
+static int sattn_split_ds(void){static int n=-1;if(n<0){const char*e=getenv("DSV4_SATTN_SPLIT_DS");n=e&&*e?atoi(e):128;if(n<32)n=32;if(n>512)n=512;n&=~31;}return n;}
+template<int IDX> __global__ void __launch_bounds__(512) sattn_split_score(float*gsc,const float*q,const float*win,
+        const float*chunk,const float*comp,const int*meta,const int*sel,int abs_base,int chunk_start,int window,
+        int heads,int dim,float scale){
+    const int HPB=4;
+    int h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
+    int wo=meta[0],wn=meta[1],cn=meta[2],total=wn+cn;
+    const int*ts=IDX?sel:nullptr;
+    const float*qb=q+(long long)h0*dim;
+    int qo[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++)qo[k]=(k<nh?k:0)*dim;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,nw=blockDim.x>>5;
+    int item=blockIdx.y*nw*4+warp*4;
+    if(item>=total)return;
+    int nr=total-item;if(nr>4)nr=4;
+    const float*v[4];
+    #pragma unroll
+    for(int r=0;r<4;r++){int it=item+(r<nr?r:0);
+        v[r]=it<wn?cached_row(win,chunk,abs_base+wo+it,chunk_start,window,dim)
+                  :comp+(long long)(IDX?ts[it-wn]:(it-wn))*dim;}
+    float z[HPB][4];
+    #pragma unroll
+    for(int k=0;k<HPB;k++){
+        #pragma unroll
+        for(int r=0;r<4;r++)z[k][r]=0.f;}
+    for(int d=lane;d<dim;d+=32){float vd[4];
+        #pragma unroll
+        for(int r=0;r<4;r++)vd[r]=r<nr?v[r][d]:0.f;
+        #pragma unroll
+        for(int k=0;k<HPB;k++){float qd=qb[qo[k]+d];
+            #pragma unroll
+            for(int r=0;r<4;r++)if(r<nr)z[k][r]+=qd*vd[r];}}
+    #pragma unroll
+    for(int k=0;k<HPB;k++){
+        #pragma unroll
+        for(int r=0;r<4;r++){float zz=z[k][r];
+            for(int n=16;n;n>>=1)zz+=__shfl_down_sync(0xffffffff,zz,n);
+            if(!lane&&r<nr&&k<nh)gsc[(long long)(h0+k)*total+item+r]=zz*scale;}}
+}
+template<int IDX> __global__ void sattn_split_value(float*out,const float*gsc,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int abs_base,int chunk_start,
+        int window,int heads,int dim){
+    const int HPB=4;
+    int h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
+    int wo=meta[0],wn=meta[1],cn=meta[2],total=wn+cn;
+    const int*ts=IDX?sel:nullptr;
+    extern __shared__ float score[];   /* [HPB][total] */
+    __shared__ float red[HPB][32];
+    __shared__ float den[HPB];
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,nw=blockDim.x>>5;
+    #pragma unroll
+    for(int k=0;k<HPB;k++)if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)score[k*total+i]=gsc[(long long)(h0+k)*total+i];
+    __syncthreads();
+    float m[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++){float lm=-INFINITY;
+        if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)lm=fmaxf(lm,score[k*total+i]);
+        for(int n=16;n;n>>=1)lm=fmaxf(lm,__shfl_xor_sync(0xffffffff,lm,n));
+        if(!lane)red[k][warp]=lm;}
+    __syncthreads();
+    #pragma unroll
+    for(int k=0;k<HPB;k++){float mm=red[k][0];for(int w=1;w<nw;w++)mm=fmaxf(mm,red[k][w]);m[k]=mm;}
+    #pragma unroll
+    for(int k=0;k<HPB;k++)if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)score[k*total+i]=expf(score[k*total+i]-m[k]);
+    __syncthreads();
+    if(threadIdx.x<HPB){int k=threadIdx.x;if(k<nh){float d0=expf(sink[h0+k]-m[k]);const float*sc=score+k*total;for(int i=0;i<total;i++)d0+=sc[i];den[k]=d0;}}
+    __syncthreads();
+    #pragma unroll
+    for(int k=0;k<HPB;k++)if(k<nh)for(int i=threadIdx.x;i<total;i+=blockDim.x)score[k*total+i]=__bfloat162float(__float2bfloat16(score[k*total+i]));
+    __syncthreads();
+    float dn[HPB];
+    #pragma unroll
+    for(int k=0;k<HPB;k++)dn[k]=den[k];
+    int d=blockIdx.y*blockDim.x+threadIdx.x;
+    if(d<dim){
+        float sum[HPB];
+        #pragma unroll
+        for(int k=0;k<HPB;k++)sum[k]=0.f;
+        int i=0;
+        for(;i+16<=wn;i+=16){float v[16];
+            #pragma unroll
+            for(int j=0;j<16;j++)v[j]=cached_row(win,chunk,abs_base+wo+i+j,chunk_start,window,dim)[d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++){
+                #pragma unroll
+                for(int j=0;j<16;j++)sum[k]+=score[k*total+i+j]*v[j];}}
+        for(;i<wn;i++){float vv=cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++)sum[k]+=score[k*total+i]*vv;}
+        i=0;
+        for(;i+16<=cn;i+=16){int ix[16];float v[16];
+            #pragma unroll
+            for(int j=0;j<16;j++)ix[j]=IDX?ts[i+j]:i+j;
+            #pragma unroll
+            for(int j=0;j<16;j++)v[j]=comp[(long long)ix[j]*dim+d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++){
+                #pragma unroll
+                for(int j=0;j<16;j++)sum[k]+=score[k*total+wn+i+j]*v[j];}}
+        for(;i<cn;i++){int ix=IDX?ts[i]:i;float vv=comp[(long long)ix*dim+d];
+            #pragma unroll
+            for(int k=0;k<HPB;k++)sum[k]+=score[k*total+wn+i]*vv;}
+        #pragma unroll
+        for(int k=0;k<HPB;k++)if(k<nh)out[(long long)(h0+k)*dim+d]=__bfloat162float(__float2bfloat16(sum[k]/dn[k]));
+    }
+}
+template<int IDX> static void launch_sattn_split(float*gsc,int heads,size_t sm1,cudaStream_t st,float*out,const float*q,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int abs_base,
+        int chunk_start,int window,int dim,float scale,int total){
+    int ds=sattn_split_ds();
+    sattn_split_score<IDX><<<dim3((heads+3)/4,(total+63)/64),512,0,st>>>(gsc,q,win,chunk,comp,meta,sel,abs_base,chunk_start,window,heads,dim,scale);
+    sattn_split_value<IDX><<<dim3((heads+3)/4,(dim+ds-1)/ds),ds,sm1*4,st>>>(out,gsc,win,chunk,comp,sink,meta,sel,abs_base,chunk_start,window,heads,dim);
+}
 /* DSV4_SATTN_HPB (4): heads per block; sm1 = the one-head score row bytes
  * (max_total * 4). Four heads when their score rows fit the 48 KB default,
  * else one. */
@@ -2291,7 +2419,16 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
               !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))))return 0;
     if(kprof)cudaEventRecord(ex[2],c->stream);
-    if(sel&&sattn_v2_on())
+    int split=sattn_split_on()&&sm*4<=48*1024&&buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm);
+    if(split&&sel)
+        launch_sattn_split<1>(c->ssc,heads,sm,c->stream,
+            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+            abs_base,chunk_start,window,dim,scale,total);
+    else if(split)
+        launch_sattn_split<0>(c->ssc,heads,sm,c->stream,
+            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,
+            abs_base,chunk_start,window,dim,scale,total);
+    else if(sel&&sattn_v2_on())
         launch_sattn_v2<1>(heads,1,sm,c->stream,
             c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
             cn,abs_base,chunk_start,window,dim,scale);
