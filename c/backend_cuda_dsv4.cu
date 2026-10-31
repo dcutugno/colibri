@@ -57,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -3095,6 +3095,13 @@ extern "C" int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor*const*ts,int n,const f
     }
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"decode proj upload"))return 0;
+    /* DSV4_PROJ_ONEDL (1): the outputs come back as one download of the
+     * contiguous dy into a host block and are scattered after the sync; a
+     * pageable download per output waits for its kernel on the host each
+     * time (n stalls in a row where one serves). 0 = a download per output. */
+    static int onedl=-1;
+    if(onedl<0){const char*e=getenv("DSV4_PROJ_ONEDL");onedl=!(e&&*e=='0');}
+    if(onedl&&c->pjhcap<yb){free(c->pjh);c->pjh=malloc(yb);c->pjhcap=c->pjh?yb:0;if(!c->pjh)onedl=0;}
     static int kprof=-1;
     if(kprof<0){const char*e=getenv("DSV4_PROJ_KPROF");kprof=e&&*e&&*e!='0';}
     cudaEvent_t ev[9];
@@ -3107,10 +3114,12 @@ extern "C" int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor*const*ts,int n,const f
         else run_mv<9>((uint8_t*)ts[i]->w,ts[i]->scale,c->dx,dy,ts[i]->O,ts[i]->I,1,c->stream);
         if(kprof)cudaEventRecord(ev[i+1],c->stream);
         if(!ok(cudaGetLastError(),"decode proj launch")||
-           !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"decode proj download"))return 0;
+           (!onedl&&!ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"decode proj download")))return 0;
         off+=ob;
     }
+    if(onedl&&!ok(cudaMemcpyAsync(c->pjh,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"decode proj download"))return 0;
     int done=ok(cudaStreamSynchronize(c->stream),"decode proj sync");
+    if(done&&onedl){size_t o=0;for(int i=0;i<n;i++){size_t ob=(size_t)ts[i]->O*4;memcpy(ys[i],(char*)c->pjh+o,ob);o+=ob;}}
     if(kprof){
         fprintf(stderr,"projkprof n=%d",n);
         for(int i=0;i<n;i++){float ms=0;cudaEventElapsedTime(&ms,ev[i],ev[i+1]);fprintf(stderr," [%d]%s%dx%d=%.3f",i,ts[i]->fmt==16?"bf16":"fp8",ts[i]->O,ts[i]->I,ms);}

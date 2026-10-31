@@ -1015,6 +1015,26 @@ kernels; the select phase's rest is host. Also tried: `restrict` on
 the hyper-connection pre/post pointers (no change: post stays 3.0 ms,
 so its time is not the loop), kept as documentation of the contract.
 
+Twenty-ninth measurement (2026-10-31): the decode token's projections of
+the attention input in one round trip for every layer, on by default.
+`V4_DECODE_PROJ6` (1): the round trip of the twenty-third measurement
+took only the indexer layers (20 of 43: those were the ones with all
+four bf16 pairs); the 19 layers compressing at ratio 128 paid the qa and
+kv matvecs on the CPU (`coli_fp8_matvec_pre`, an OpenMP region each) and
+the compressor pair its own round trip, and the four plain layers the two
+matvecs. Now every layer sends the input once and runs wq_a, wkv, the
+compressor's pair where the layer compresses and the indexer-compressor's
+where it indexes (two, four or six launches). `DSV4_PROJ_ONEDL` (1): the
+outputs come back as one download of the contiguous device block,
+scattered on the host after the sync, where a pageable download per
+output made the host wait for each kernel in turn (six stalls per call).
+Measured (3.3k prompt, 36 tokens, one card, per token): qa + compressor +
+kv 4 + 7 + 2 = 13 ms (the old default) and 8 + 3 + 2 (the old PROJ6
+alone, equal again) -> 7 + 1 + 0 = 8 (one download) or 12 + 1 + 0 (a
+download per output); attention 34 -> 30 ms, after the first token 11.35
+-> 11.20 s, md5 85d209f4e138 on all. The ~160 us per call left is the
+round trip (upload, launches, one sync) over ~30 us of kernels.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1172,7 +1192,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_HC_PROF` (off) | the pre's parts timed per call, printed every 1000 calls (`hcprof`) |
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
-| `V4_DECODE_PROJ6` (0) | `1` = a decode token's wq_a, wkv and compressor projections in one device round trip instead of three (bitwise; measured equal) |
+| `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `DSV4_PROJ_ONEDL` (1) | that round trip's outputs as one download scattered on the host; `0` = a pageable download per output (bitwise, +5 ms per token) |
 | `V4_PREFETCH_NEXT` (off) | `=N` lanes reading the next layer's experts as the previous token routed them into the RAM cache while this layer runs; measured useless here: those repeats (41 % of a layer's experts) are already VRAM-resident or RAM-cached, so nothing is ever queued |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
