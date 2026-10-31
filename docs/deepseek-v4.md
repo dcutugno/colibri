@@ -1163,6 +1163,28 @@ different speed (the partial sums add by residence, documented as an
 order-of-addition class), which the head verify there confirmed is not
 the head.
 
+Thirty-fifth measurement (2026-10-31): the MoE floor, looked at once
+more with the attention and the head out of the way. Without the
+profile line a token is 276 ms (9.65 s after the first token): hc 10,
+attention 23, head 4.5, the rest 10, and the MoE ~218 (shared 7, loads
+~120, compute ~70: the group kernels are 12 of that, the rest the fence
+on the lanes' uploads). `V4_EXPERT_TRACE`: at routing time 44 % of the
+258 routed experts are VRAM-resident, 67 % RAM-cached, 33 % in neither,
+so ~85 experts (1 GiB) come from the drives per token and ~100 go over
+PCIe; the drives are busy about 35 % of the token. Tried, each equal or
+worse, the text bitwise throughout: `V4_LOADER_LANES=4/6`, `V4_PRED_NEXT=3/4`
+(9.67-9.91 s), `--memory-gb 22` (9.67 s: a RAM hit still rides the PCIe
+link, which is the binding floor at ~90 ms per token of uploads);
+`V4_PRED_DEPTH=2` again (10.52 s) and `V4_PRED2_RAM` (1), the
+layer-after-next prediction reading into RAM only, no mirror pieces
+(10.52 s too: loads 121 -> 133 ms; its 34 % wrong guesses, ~1 GiB per
+token, compete with the layer's own reads on the same drives, so the
+window is not the limit, the link traffic is). What would move it:
+experts resident on more VRAM, fewer bytes per expert, or a decode that
+batches several tokens per expert load. The `decprof` line gained a
+`[block: alloc free total pre marks tail]` tail (the block function's
+time around its stage marks; `pre` was the print itself, now ~0.2 ms).
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1321,6 +1343,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `V4_PRED2_RAM` (1) | with `V4_PRED_DEPTH=2`: the layer-after-next prediction reads into RAM only, the mirror upload waits for the layer's routing (measured equal to the pieces: the drives are the limit) |
 | `DSV4_STEP_PROF` (off) | per-token step prints beside `decprof`: `headprof`, `finalprof`, `tokprof` (the whole step and the layer loop), `loopprof` (the loop's loads, predictor, block, tap); each line costs a stderr write |
 | `V4_LAYER_FUSED_EMIT` (1) | the tokens that emit a compressed row through the fused layer too, the row pooled on the device (bitwise); `0` = those tokens take the three trips |
 | `DSV4_CS_POOL_FMA` (1) | the device pooling's weighted accumulate fused, as the build contracts the host loop |

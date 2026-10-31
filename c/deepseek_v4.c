@@ -6529,10 +6529,24 @@ static struct {
     ColiExpertStore *store;
     ColiExpertKey queue[128];
     ColiExpertKey busy[8];   /* each lane's key in hand (expert -1: none) */
-} g_v4_pf = { {0}, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0, NULL, {{0, 0}}, {{0, -1}} };
+    unsigned char ram_only[128];   /* V4_PRED2_RAM: the read fills RAM, no mirror pieces */
+} g_v4_pf = { {0}, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, 0, NULL, {{0, 0}}, {{0, -1}}, {0} };
+/* V4_PRED2_RAM (1): the layer-after-next prediction (V4_PRED_DEPTH=2) reads
+ * into RAM only; the mirror upload waits for the layer's own routing (a
+ * confirmed expert is uploaded by its decode lane). The guess two layers
+ * ahead hits 63-72 %: with mirror pieces its misses cost PCIe bandwidth
+ * and VRAM slots, which is what made V4_PRED_DEPTH=2 slower; RAM only, a
+ * miss costs the NVMe read in a window the disk would otherwise idle. */
+static int v4_pred2_ram(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_PRED2_RAM"); on = !(e && *e == '0'); }
+    return on;
+}
 unsigned long long g_v4_pf_enqueued, g_v4_pf_dropped, g_v4_pf_read, g_v4_pf_dup;
 
 static int v4_prefetch_next_lanes(void);
+static void v4_pf_enqueue_mode(ColiExpertStore *store, const int *ids, int n,
+                               int layer, int ram_only);
 /* V4_PRED_NEXT=N (2): the next layer's experts predicted by its gate on
  * this layer's FFN input (router layers) or by the token id (hash layers),
  * read ahead by N lanes of the pool above (0 = off; 3 and 4 measured no
@@ -6652,7 +6666,7 @@ static void v4_pred_publish(ColiExpertStore *store, int layer, const int *ids, i
         wanted[count++] = ids[i];
     }
     __atomic_fetch_add(&g_v4_pred_queued, (unsigned long long)count, __ATOMIC_RELAXED);
-    if (count) v4_pf_enqueue(store, wanted, count, layer);
+    if (count) v4_pf_enqueue_mode(store, wanted, count, layer, deep && v4_pred2_ram());
 }
 static void *v4_pred_worker(void *arg) {
     (void)arg;
@@ -6767,16 +6781,20 @@ static void *v4_pf_worker(void *arg) {
         while (g_v4_pf.head == g_v4_pf.tail)
             pthread_cond_wait(&g_v4_pf.ready, &g_v4_pf.mutex);
         ColiExpertKey key = g_v4_pf.queue[g_v4_pf.head % 128];
+        int ram_only = g_v4_pf.ram_only[g_v4_pf.head % 128];
         g_v4_pf.head++;
         g_v4_pf.busy[lane] = key;
         ColiExpertStore *store = g_v4_pf.store;
         pthread_mutex_unlock(&g_v4_pf.mutex);
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
+        int pieces_off = g_v4_pc_thread_off;
+        if (ram_only) g_v4_pc_thread_off = 1;
         if (coli_expert_lookup(store, key, &view) == 0) {
             __atomic_fetch_add(&g_v4_pf_read, 1, __ATOMIC_RELAXED);
             coli_expert_release(store, &view);
         }
+        g_v4_pc_thread_off = pieces_off;
         pthread_mutex_lock(&g_v4_pf.mutex);
         g_v4_pf.busy[lane].expert = -1;
         pthread_mutex_unlock(&g_v4_pf.mutex);
@@ -6786,6 +6804,10 @@ static void *v4_pf_worker(void *arg) {
 
 static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n,
                           int layer) {
+    v4_pf_enqueue_mode(store, ids, n, layer, 0);
+}
+static void v4_pf_enqueue_mode(ColiExpertStore *store, const int *ids, int n,
+                               int layer, int ram_only) {
     int lanes = v4_pf_lanes();
     if (!lanes || !store) return;
     pthread_mutex_lock(&g_v4_pf.mutex);
@@ -6814,6 +6836,7 @@ static void v4_pf_enqueue(ColiExpertStore *store, const int *ids, int n,
         if (dup) { g_v4_pf_dup++; continue; }
         if (g_v4_pf.tail - g_v4_pf.head >= 128) { g_v4_pf_dropped++; continue; }
         g_v4_pf.queue[g_v4_pf.tail % 128] = key;
+        g_v4_pf.ram_only[g_v4_pf.tail % 128] = (unsigned char)ram_only;
         g_v4_pf.tail++;
         g_v4_pf_enqueued++;
     }
@@ -7921,15 +7944,15 @@ static int block_token_pipeline(float *output_hc,
         /* formatted once and written once: the unbuffered stderr behind a
          * redirect wrote this line in dozens of small writes, 37 ms per token */
         char dpline[4096];
-        int dpn = snprintf(dpline, sizeof dpline, "decprof position=%d layers=%d hc=%.0f (pre=%.0f post=%.0f) attn=%.0f moe=%.0f ms [alloc=%.1f free=%.1f total=%.1f pre=%.1f marks=%.1f tail=%.1f] "
+        int dpn = snprintf(dpline, sizeof dpline, "decprof position=%d layers=%d hc=%.0f (pre=%.0f post=%.0f) attn=%.0f moe=%.0f ms "
                         "(moe: shared=%.0f loads=%.0f of which attach=%.0f compute=%.0f second=%.0f; "
                         "lane lookups=%llu sum=%.0f ms avg=%.2f ms; "
                         "pread=%.0f ms memmove=%.0f ms/%.0f MB per-matrix bounces=%llu "
                         "pair ok=%llu fail=%llu lasterr=%llu; "
                         "token-overlap=%.1f%% prefetch queued=%llu read=%llu dropped=%llu pred-hit=%.1f%% of %llu queued=%llu pred2-hit=%.1f%% of %llu dup=%llu rank-hit=%s; "
-                        "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms)\n",
+                        "attn: qa=%.0f comp=%.0f (compressor=%.0f indexer-advance=%.0f select=rest) qb=%.0f kv=%.0f sattn=%.0f wo=%.0f ms) "
+                        "[block: alloc=%.1f free=%.1f total=%.1f pre=%.1f marks=%.1f tail=%.1f ms]\n",
                 position - 1, dp_layers, dp_hc * 1e3, dp_hc_pre * 1e3, dp_hc_post * 1e3, dp_attn * 1e3, dp_moe * 1e3,
-                g_v4_dp_alloc * 1e3, g_v4_dp_free * 1e3, g_v4_dp_total * 1e3, g_v4_dp_print * 1e3, g_v4_dp_marks * 1e3, g_v4_dp_tail * 1e3,
                 g_v4_dp_shared * 1e3, g_v4_dp_loads * 1e3, g_v4_dp_attach * 1e3,
                 g_v4_dp_compute * 1e3, g_v4_dp_second * 1e3,
                 (unsigned long long)g_v4_dp_read_n,
@@ -7947,7 +7970,8 @@ static int block_token_pipeline(float *output_hc,
                 g_v4_pred2_total, g_v4_pf_dup, rank_hit,
                 g_v4_ap_qa * 1e3, (g_v4_ap_comp + g_v4_ap_comp_c + g_v4_ap_comp_a) * 1e3,
                 g_v4_ap_comp_c * 1e3, g_v4_ap_comp_a * 1e3, g_v4_ap_qb * 1e3,
-                g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3);
+                g_v4_ap_kv * 1e3, g_v4_ap_sattn * 1e3, g_v4_ap_wo * 1e3,
+                g_v4_dp_alloc * 1e3, g_v4_dp_free * 1e3, g_v4_dp_total * 1e3, g_v4_dp_print * 1e3, g_v4_dp_marks * 1e3, g_v4_dp_tail * 1e3);
         if (dpn > 0) fwrite(dpline, 1, dpn < (int)sizeof dpline ? (size_t)dpn : sizeof dpline - 1, stderr);
         g_v4_ap_qa = g_v4_ap_comp = g_v4_ap_qb = g_v4_ap_kv = g_v4_ap_sattn = g_v4_ap_wo = 0;
         g_v4_ap_comp_c = g_v4_ap_comp_a = 0;
