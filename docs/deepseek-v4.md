@@ -1073,6 +1073,49 @@ over 16,380 calls. The chain's device time per layer: upload gap 0.02,
 q 0.06, attention 0.05, wo_a 0.05, wo_b 0.05, small kernels and the
 download 0.04 ms.
 
+Thirty-second measurement (2026-10-31): a decode token's attention layer
+as one device round trip. `V4_LAYER_FUSED` (1): on the tokens that emit
+no compressed row (three of four on the ratio-4 layers, all but one in
+128 on the others, every token on the plain layers) the layer's three
+trips (the input's projections; the indexer's selection; the chain) and
+the host work between them run on the stream from one upload (x, the
+RoPE tables, the sinks, meta, the two norm weights) to one download (the
+output, the kv row, qa and the compressor projections the host's
+canonical state advances with). New on the device, each the host
+routine's arithmetic in its order: the qa and kv norms (`vec_norm`: the
+sequential mean square, `DSV4_VNORM_FMA` as `DSV4_Q_NORM_FMA`), the kv's
+fp8 round trip and the query ranks' (`fp8_qdq`, the reference's e8m0
+scale and e4m3 round-to-nearest-even on the binary32 bits), the
+selection's rank (`idx_topk`: a bitonic sort of the host's composite key,
+score then index, one block, up to 4096 candidates; past that the token
+takes the old path), the ring write. The emit tokens keep the old path
+(the host's compressor state produces the row). `V4_LAYER_FUSED_VERIFY=1`
+runs the fused layer into side buffers beside the usual path: 1,316
+layer calls over the 3.3k prompt's 36 tokens, no differing word in the
+output, the kv row, qa, q, the projections or the selected ordinals;
+md5 85d209f4e138 throughout. `DSV4_LF_GRAPH` (1): the layer's ~20
+launches captured once per layer into a CUDA graph (the token's scalars
+in the uploaded meta block, the grids sized for the layer's most rows,
+the buffers at the layer's maxima, a pinned host block; recaptured when
+a baked pointer or shape changes) and replayed per token; measured equal
+to the direct launches, kept for the one submission. `DSV4_LF_GPROF=1`:
+the graph's device time, 0.38 ms per layer call; `DSV4_LF_KPROF=1`: the
+phases with direct launches (its gaps inflate them). Measured: attention
+27 -> 23 ms per token (a fused token 21, an emit token 27), after the
+first token 11.15 -> 11.03-11.06 s. Of the ~0.5 ms a fused layer costs
+the host, 0.38 is the kernels (the three 32 MB matrices ~0.2, the
+indexer ~0.1 on its layers, the attention 0.05, the rest small) and
+~0.1 the launch, the sync and the host's own work around the call; the
+launch count was not it (the graph changed nothing). Tried on the
+kernels, each bitwise and each slower on the graph's device time:
+`DSV4_MV_WARP_LUT=0` (the e4m3 decode as bit arithmetic instead of the
+shared table: +0.025 ms per layer), `DSV4_IDX_PROJ_WARP=1` (the indexer's
+projection as a warp per eight-row tile with the bytes shuffled to the
+chain lanes: +0.011), `DSV4_MV_WARP_UNROLL=2/4` (equal). What remains:
+the emit tokens (the compressor's pooling on the device would fuse them
+too), the host's ~0.1 ms per layer around the call, and the matrices at
+~640 GB/s.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1231,6 +1274,14 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `V4_LAYER_FUSED` (1) | a decode token's attention layer as one device round trip on the tokens that emit no compressed row (bitwise); `0` = the three trips |
+| `V4_LAYER_FUSED_VERIFY` (off) | the fused layer beside the usual path, differing words counted (`lfverify`) |
+| `DSV4_LF_GRAPH` (1) | the fused layer's launches as a CUDA graph per layer, replayed per token; `0` = direct launches (equal) |
+| `DSV4_LF_GPROF` (off) | the fused layer's graph device time per call (`lfgprof`, every 1000 calls) |
+| `DSV4_LF_KPROF` (off) | the fused layer's phases with direct launches (`lfkprof`; the gaps between the events inflate them) |
+| `DSV4_VNORM_FMA` (1) | the qa and kv norms' mean square with the accumulate fused, as the build contracts coli_v4_rmsnorm |
+| `DSV4_MV_WARP_LUT` (1) | the warp matvec's e4m3 decode from the shared table; `0` = bit arithmetic (bitwise; +0.025 ms per fused layer) |
+| `DSV4_IDX_PROJ_WARP` (0) | the indexer projection as a warp per eight-row tile (bitwise; +0.011 ms per fused layer) |
 | `DSV4_CHAIN_PACK` (1) | the decode chain's seven inputs as one host block and one upload (bitwise); `0` = a pageable copy per input |
 | `DSV4_MV_WARP_UNROLL` (1) | chunks of 256 columns loaded ahead of their FMAs in the warp matvec (1, 2 or 4; bitwise; measured equal) |
 | `DSV4_SATTN_SPLIT` (1) | the decode token's cached sparse attention as a score kernel over row tiles and a value kernel over column slices (bitwise); `0` = the one v2 launch |

@@ -57,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap; void *lfh; size_t lfhcap; void *lfd; size_t lfdcap;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap; void *lfh; size_t lfhcap; void *lfd; size_t lfdcap; void *lfhp; size_t lfhpcap;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -117,6 +117,12 @@ __device__ float e4m3(uint8_t b){int sign=b>>7,e=(b>>3)&15,m=b&7;float v;
     if(!e)v=ldexpf((float)m,-9);else if(e==15)v=m==7?NAN:ldexpf(1.f+m/8.f,8);else v=ldexpf(1.f+m/8.f,e-7);
     return sign?-v:v;}
 __device__ float e8(uint8_t b){return e8_table[b];}
+__device__ __forceinline__ float e4m3_exact(unsigned b){
+    unsigned sg=b>>7,e=(b>>3)&15u,m=b&7u;float v;
+    if(e==0)v=(float)m*0.001953125f;
+    else if(e==15u&&m==7u)v=NAN;
+    else v=__uint_as_float(((e+120u)<<23)|(m<<20));
+    return sg?-v:v;}
 __device__ float f4(uint8_t q){const float a[8]={0,.5f,1,1.5f,2,3,4,6};return q&8?-a[q&7]:a[q];}
 __global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,int I,int T);
 template<int F> __global__ void mv(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
@@ -163,9 +169,9 @@ template<int F,int R> __global__ void mv_rows(const uint8_t *w,const uint8_t *sc
  * at 355 GB/s where wo_a's 4096-wide ran 680). The partials' order is
  * unchanged (chunk c, then c+256, ...): bitwise. 1 = a chunk per step. */
 __device__ __forceinline__ float bf16_round_dev(float v);
-template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,int rnd){
+template<int F,int U,bool BITS> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,int rnd){
     __shared__ float lut[256];
-    lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();
+    if(!BITS){lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();}
     int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
     const float *xi=x+(long long)(o/(O/groups))*I;
     const uint8_t *wr=w+(long long)o*I;
@@ -185,7 +191,7 @@ template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8
                 unsigned b[8]={wv[u].x&255u,(wv[u].x>>8)&255u,(wv[u].x>>16)&255u,wv[u].x>>24,wv[u].y&255u,(wv[u].y>>8)&255u,(wv[u].y>>16)&255u,wv[u].y>>24};
                 float xs[8]={xa[u].x,xa[u].y,xa[u].z,xa[u].w,xb[u].x,xb[u].y,xb[u].z,xb[u].w};
                 #pragma unroll
-                for(int k=0;k<8;k++){float v=lut[b[k]]*es[u];if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
+                for(int k=0;k<8;k++){float v=(BITS?e4m3_exact(b[k]):lut[b[k]])*es[u];if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
             }
         }
     }
@@ -197,7 +203,7 @@ template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8
         unsigned b[8]={wv.x&255u,(wv.x>>8)&255u,(wv.x>>16)&255u,wv.x>>24,wv.y&255u,(wv.y>>8)&255u,(wv.y>>16)&255u,wv.y>>24};
         float xs[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
         #pragma unroll
-        for(int k=0;k<8;k++){float v=lut[b[k]]*es;if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
+        for(int k=0;k<8;k++){float v=(BITS?e4m3_exact(b[k]):lut[b[k]])*es;if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
     }
     #pragma unroll
     for(int k=0;k<8;k++){
@@ -211,13 +217,29 @@ template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8
 }
 /* The bf16 one (mm_bf16_batch with a batch of one, mv_bf16: the same
  * partials and tree): lane l's eight bf16 as one 16-byte load. */
-__global__ void __launch_bounds__(256) mv_bf16_warp(const __nv_bfloat16 *w,const float *x,float *y,int O,int I){
+template<int U> __global__ void __launch_bounds__(256) mv_bf16_warp(const __nv_bfloat16 *w,const float *x,float *y,int O,int I){
     int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
     const __nv_bfloat16 *wr=w+(long long)o*I;
     float p[8];
     #pragma unroll
     for(int k=0;k<8;k++)p[k]=0.f;
-    for(int c=0;c<I;c+=256){
+    int c=0;
+    if constexpr(U>1){
+        for(;c+U*256<=I;c+=U*256){
+            uint4 wv[U];float4 xa[U],xb[U];
+            #pragma unroll
+            for(int u=0;u<U;u++){int i0=c+u*256+8*lane;
+                wv[u]=*(const uint4*)(wr+i0);xa[u]=*(const float4*)(x+i0);xb[u]=*(const float4*)(x+i0+4);}
+            #pragma unroll
+            for(int u=0;u<U;u++){
+                unsigned uu[4]={wv[u].x,wv[u].y,wv[u].z,wv[u].w};
+                float xs[8]={xa[u].x,xa[u].y,xa[u].z,xa[u].w,xb[u].x,xb[u].y,xb[u].z,xb[u].w};
+                #pragma unroll
+                for(int k=0;k<8;k++){float v=__uint_as_float((k&1)?(uu[k>>1]&0xffff0000u):(uu[k>>1]<<16));p[k]+=xs[k]*v;}
+            }
+        }
+    }
+    for(;c<I;c+=256){
         int i0=c+8*lane;
         uint4 wv=*(const uint4*)(wr+i0);
         float4 xa=*(const float4*)(x+i0),xb=*(const float4*)(x+i0+4);
@@ -239,11 +261,22 @@ __global__ void __launch_bounds__(256) mv_bf16_warp(const __nv_bfloat16 *w,const
 static int mv_warp_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP");on=!(e&&*e=='0');}return on;}
 static int mv_warp_verify(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP_VERIFY");on=e&&*e&&*e!='0';}return on;}
 static int mv_warp_unroll(void){static int u=-1;if(u<0){const char*e=getenv("DSV4_MV_WARP_UNROLL");u=e&&*e?atoi(e):1;if(u!=1&&u!=2&&u!=4)u=4;}return u;}
+static int mv_warp_lut(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP_LUT");on=!(e&&*e=='0');}return on;}   /* 1: the table; 0 = e4m3_exact, measured +0.025 ms per fused layer */
+template<int F,int U> static void launch_mv_warp_u(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,int rnd,cudaStream_t st){
+    if(mv_warp_lut())mv_warp<F,U,false><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,rnd);
+    else mv_warp<F,U,true><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,rnd);
+}
+static void launch_mv_bf16_warp(const __nv_bfloat16 *w,const float *x,float *y,int O,int I,cudaStream_t st){
+    int u=mv_warp_unroll();
+    if(u==4)mv_bf16_warp<4><<<(O+7)/8,256,0,st>>>(w,x,y,O,I);
+    else if(u==2)mv_bf16_warp<2><<<(O+7)/8,256,0,st>>>(w,x,y,O,I);
+    else mv_bf16_warp<1><<<(O+7)/8,256,0,st>>>(w,x,y,O,I);
+}
 template<int F> static void launch_mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,cudaStream_t st){
     int u=mv_warp_unroll();
-    if(u==4)mv_warp<F,4><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
-    else if(u==2)mv_warp<F,2><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
-    else mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
+    if(u==4)launch_mv_warp_u<F,4>(w,sc,x,y,O,I,groups,0,st);
+    else if(u==2)launch_mv_warp_u<F,2>(w,sc,x,y,O,I,groups,0,st);
+    else launch_mv_warp_u<F,1>(w,sc,x,y,O,I,groups,0,st);
 }
 static bool mv_warp_fits(const void*w,const float*x,int I,int walign){return I>0&&I%256==0&&!((uintptr_t)x&15)&&!((uintptr_t)w&(walign-1));}
 __global__ void mv_warp_diff_kernel(const float*a,const float*b,int n,unsigned*cnt){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(cnt,1u);}
@@ -266,9 +299,9 @@ static void launch_bf16_one(const __nv_bfloat16*w,const float*x,float*y,int O,in
     if(mv_warp_on()&&mv_warp_fits(w,x,I,16)){
         if(mv_warp_verify()){float*t=mv_warp_scratch((size_t)O);if(t){
             mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
-            mv_bf16_warp<<<(O+7)/8,256,0,st>>>(w,x,t,O,I);
+            launch_mv_bf16_warp(w,x,t,O,I,st);
             mv_warp_report("bf16",y,t,O,I,st);return;}}
-        mv_bf16_warp<<<(O+7)/8,256,0,st>>>(w,x,y,O,I);
+        launch_mv_bf16_warp(w,x,y,O,I,st);
     }else mm_bf16_batch<<<dim3(O,1),256,0,st>>>(w,x,y,O,I,1);
 }
 template<int R> __global__ void mv_fp4_grouped(const MvDesc *desc,int count,int O,int I){
@@ -1225,10 +1258,11 @@ static int sattn_split_on(void){static int on=-1;if(on<0){const char*e=getenv("D
 static int sattn_split_ds(void){static int n=-1;if(n<0){const char*e=getenv("DSV4_SATTN_SPLIT_DS");n=e&&*e?atoi(e):128;if(n<32)n=32;if(n>512)n=512;n&=~31;}return n;}
 template<int IDX> __global__ void __launch_bounds__(512) sattn_split_score(float*gsc,const float*q,const float*win,
         const float*chunk,const float*comp,const int*meta,const int*sel,int abs_base,int chunk_start,int window,
-        int heads,int dim,float scale){
+        int heads,int dim,float scale,int dynab){
     const int HPB=4;
     int h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
     int wo=meta[0],wn=meta[1],cn=meta[2],total=wn+cn;
+    if(dynab){abs_base=meta[4];chunk_start=meta[5];}
     const int*ts=IDX?sel:nullptr;
     const float*qb=q+(long long)h0*dim;
     int qo[HPB];
@@ -1264,10 +1298,11 @@ template<int IDX> __global__ void __launch_bounds__(512) sattn_split_score(float
 }
 template<int IDX> __global__ void sattn_split_value(float*out,const float*gsc,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int abs_base,int chunk_start,
-        int window,int heads,int dim){
+        int window,int heads,int dim,int dynab){
     const int HPB=4;
     int h0=blockIdx.x*HPB,nh=heads-h0;if(nh>HPB)nh=HPB;
     int wo=meta[0],wn=meta[1],cn=meta[2],total=wn+cn;
+    if(dynab){abs_base=meta[4];chunk_start=meta[5];}
     const int*ts=IDX?sel:nullptr;
     extern __shared__ float score[];   /* [HPB][total] */
     __shared__ float red[HPB][32];
@@ -1331,10 +1366,10 @@ template<int IDX> __global__ void sattn_split_value(float*out,const float*gsc,co
 }
 template<int IDX> static void launch_sattn_split(float*gsc,int heads,size_t sm1,cudaStream_t st,float*out,const float*q,const float*win,
         const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,int abs_base,
-        int chunk_start,int window,int dim,float scale,int total){
+        int chunk_start,int window,int dim,float scale,int total,int dynab){
     int ds=sattn_split_ds();
-    sattn_split_score<IDX><<<dim3((heads+3)/4,(total+63)/64),512,0,st>>>(gsc,q,win,chunk,comp,meta,sel,abs_base,chunk_start,window,heads,dim,scale);
-    sattn_split_value<IDX><<<dim3((heads+3)/4,(dim+ds-1)/ds),ds,sm1*4,st>>>(out,gsc,win,chunk,comp,sink,meta,sel,abs_base,chunk_start,window,heads,dim);
+    sattn_split_score<IDX><<<dim3((heads+3)/4,(total+63)/64),512,0,st>>>(gsc,q,win,chunk,comp,meta,sel,abs_base,chunk_start,window,heads,dim,scale,dynab);
+    sattn_split_value<IDX><<<dim3((heads+3)/4,(dim+ds-1)/ds),ds,sm1*4,st>>>(out,gsc,win,chunk,comp,sink,meta,sel,abs_base,chunk_start,window,heads,dim,dynab);
 }
 /* DSV4_SATTN_HPB (4): heads per block; sm1 = the one-head score row bytes
  * (max_total * 4). Four heads when their score rows fit the 48 KB default,
@@ -1971,6 +2006,38 @@ __global__ void fp8_ref_matmul_rows8_t1_kernel(float*y,const uint8_t*w,const flo
     }
     y[o]=sum;
 }
+/* DSV4_IDX_PROJ_WARP (0, tried): the rows8 projection as a warp per tile of eight
+ * rows. Lane l loads the tile's eight bytes of column c+l (one uint2: 256
+ * contiguous bytes per chunk of 32 columns, the next chunk's load in
+ * flight), and lanes 0..7 run row r's chain over the columns in order with
+ * each column's bytes shuffled from the lane that holds them: the same
+ * (x*v)*scale, fadd sequence as the thread-per-row kernel above, whose
+ * stride-8 byte loads and three warps per SM made the 8 MB layer 0.09 ms.
+ * The decode is the bit form (e4m3_bits). */
+__global__ void __launch_bounds__(32) fp8_ref_rows8_warp_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
+    int tile=blockIdx.x,lane=threadIdx.x,r=lane&7;
+    if(tile*8>=rows)return;
+    int nblk=cols/128;
+    const float*scl=bscale+(long long)((tile*8)/128)*nblk;
+    const uint2*wt=(const uint2*)(w+(long long)tile*cols*8);
+    uint2 cur=wt[lane];
+    float sum=0.f;
+    for(int c=0;c<cols;c+=32){
+        uint2 nxt=make_uint2(0u,0u);
+        if(c+32<cols)nxt=wt[c+32+lane];
+        float sc=scl[c>>7];
+        #pragma unroll 8
+        for(int i=0;i<32;i++){
+            unsigned lo=__shfl_sync(0xffffffffu,cur.x,i),hi=__shfl_sync(0xffffffffu,cur.y,i);
+            unsigned word=r<4?lo:hi;unsigned b=(word>>((r&3)*8))&255u;
+            float v=e4m3_exact(b);
+            sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(x[c+i],v),sc));
+        }
+        cur=nxt;
+    }
+    if(lane<8)y[tile*8+r]=sum;
+}
+static int idx_proj_warp(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_IDX_PROJ_WARP");on=e&&*e&&*e!='0';}return on;}   /* measured +0.011 ms per fused layer: off */
 __global__ void fp8_ref_matmul_t1_kernel(float*y,const uint8_t*w,const float*bscale,const float*x,int rows,int cols){
     __shared__ float tab[256];
     for(int i=threadIdx.x;i<256;i+=blockDim.x)tab[i]=e4m3_dev((uint8_t)i);
@@ -2041,6 +2108,7 @@ __global__ void indexer_score_multi_kernel(float*scores,const float*queries,cons
     for(int i=h;i<qn;i+=blockDim.x){int hh=i/dim,d=i-hh*dim;qs[hh*(dim+1)+d]=queries[(long long)t*qn+i];}
     const float*q=qs+h*(dim+1);
     int cn=counts[t];
+    if(count>cn)count=cn;   /* a grid sized for the most candidates (the fused layer's graph) stops at the token's */
     for(int k=0;k<K;k++){
         int c=c0+k;if(c>=count)break;
         __syncthreads();
@@ -2137,7 +2205,9 @@ static int idx_select_launch(Dev*c,int layer,float*dq,float*dhw,float*dsc,const 
     if(tokens==1){
         /* 64-thread blocks: 8192 rows as 128 blocks over the card's SMs
          * instead of 32 (each thread's serial chain is unchanged) */
-        if(g_idx_packed[layer])
+        if(g_idx_packed[layer]&&idx_proj_warp()&&cols%128==0&&rows%8==0)
+            fp8_ref_rows8_warp_kernel<<<rows/8,32,0,c->stream>>>(dq,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+        else if(g_idx_packed[layer])
             fp8_ref_matmul_rows8_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(dq,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
         else
             fp8_ref_matmul_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(dq,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
@@ -2410,14 +2480,15 @@ extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,
  * sinks, meta {wo, wn, cn}, sel (the selected ordinals, or NULL for the
  * first cn comp rows). */
 static int attn_one_launch(Dev*c,int layer,size_t sm,float*out,const float*q,const float*chunk,const float*sink,const int*meta,
-        const int*sel,int cn,int abs_base,int chunk_start,int window,int heads,int dim,float scale,int total){
+        const int*sel,int cn,int abs_base,int chunk_start,int window,int heads,int dim,float scale,int total,int dynab){
     int split=sattn_split_on()&&sm*4<=48*1024&&buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm);
+    if(dynab&&!split)return 0;   /* the graph path: the split kernels only (their shapes are the token-free ones) */
     if(split&&sel)
         launch_sattn_split<1>(c->ssc,heads,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,sel,
-            abs_base,chunk_start,window,dim,scale,total);
+            abs_base,chunk_start,window,dim,scale,total,dynab);
     else if(split)
         launch_sattn_split<0>(c->ssc,heads,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,nullptr,
-            abs_base,chunk_start,window,dim,scale,total);
+            abs_base,chunk_start,window,dim,scale,total,dynab);
     else if(sel&&sattn_v2_on())
         launch_sattn_v2<1>(heads,1,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,sel,
             cn,abs_base,chunk_start,window,dim,scale);
@@ -2522,7 +2593,7 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
               !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload")))))return 0;
     if(kprof)cudaEventRecord(ex[2],c->stream);
-    if(!attn_one_launch(c,layer,sm,c->p4,dq,dchunk,dsink,dmeta,dsel,cn,abs_base,chunk_start,window,heads,dim,scale,total))return 0;
+    if(!attn_one_launch(c,layer,sm,c->p4,dq,dchunk,dsink,dmeta,dsel,cn,abs_base,chunk_start,window,heads,dim,scale,total,0))return 0;
     if(kprof)cudaEventRecord(ev[0],c->stream);
     attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
@@ -2630,8 +2701,9 @@ __device__ __forceinline__ void rope_pair(float*v,const float*cosv,const float*s
  * copy into its ring slot (the slot of position-window, which no row of
  * this token's window reads). */
 __global__ void lf_prep_kernel(float*qa,const uint16_t*qnw,int q_rank,float*xq,int xq_on,float*kv,const uint16_t*kvw,int dim,
-        float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma,float*ring_row){
+        float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma,float*ring,const int*mp){
     extern __shared__ float sv[];__shared__ float sc;
+    float*ring_row=ring+(size_t)mp[6]*dim;
     if(blockIdx.x==0){
         norm_block(qa,qnw,q_rank,eps,fma_on,sv,&sc);
         __syncthreads();
@@ -2666,7 +2738,7 @@ __global__ void q_norm_rope_kernel(float*q,int dim,float eps,int fma_on,const fl
  * into the store (the warp kernel's rnd); the block kernel plus a round
  * pass where the warp kernel does not fit. */
 template<int F> static void run_mv_fused(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,int groups,int rnd,cudaStream_t st){
-    if(mv_warp_on()&&mv_warp_fits(w,x,I,8)){mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,rnd);return;}
+    if(mv_warp_on()&&mv_warp_fits(w,x,I,8)){launch_mv_warp_u<F,1>(w,sc,x,y,O,I,groups,rnd,st);return;}
     run_mv<F>(w,sc,x,y,O,I,groups,st);
     if(rnd)bf16_round_ref_kernel<<<(O+255)/256,256,0,st>>>(y,O);
 }
@@ -2695,8 +2767,9 @@ __global__ void vec_norm_kernel(float*v,const uint16_t*w,int n,float eps,int fma
  * memory, one block, n <= IDX_SORT_MAX; sel[k] = the k-th ranked index for
  * k < min(n, topk): what the host's ranked list gives element for element. */
 #define IDX_SORT_MAX 4096
-__global__ void __launch_bounds__(1024) idx_topk_kernel(int*sel,const float*scores,int n,int topk){
+__global__ void __launch_bounds__(1024) idx_topk_kernel(int*sel,const float*scores,int n,int topk,const int*mp){
     __shared__ unsigned long long k[IDX_SORT_MAX];
+    if(mp){n=mp[3];topk=mp[2];}
     int N=1;while(N<n)N<<=1;
     for(int i=threadIdx.x;i<N;i+=blockDim.x){
         unsigned long long v=~0ull;
@@ -2712,6 +2785,22 @@ __global__ void __launch_bounds__(1024) idx_topk_kernel(int*sel,const float*scor
     for(int i=threadIdx.x;i<m;i+=blockDim.x)sel[i]=(int)(k[i]&0xffffffffu);
 }
 static inline size_t lf_al(size_t v){return (v+255)/256*256;}
+/* DSV4_LF_GRAPH (1): the fused layer's launches captured once per layer
+ * into a CUDA graph and replayed per token (one submission where ~20
+ * launches each paid the WDDM launch gap). Everything the captured nodes
+ * bake in is token-free: the buffers (a per-device block laid out at the
+ * layer's maxima, the pinned host block), the grids (sized for the most
+ * rows: the kernels stop at the token's counts), the weights and caches
+ * (their pointers); the token's scalars travel in the uploaded meta block
+ * (meta[4] abs_base, [5] chunk_start, [6] the ring slot, [2] cn, [3] the
+ * candidate count). A graph is recaptured when any baked pointer or shape
+ * changed (a grown cache, a grown block). 0 = the launches issued directly. */
+static int lf_graph_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_LF_GRAPH");on=!(e&&*e=='0');}return on;}
+struct LfSig{const void*lfd,*lfh,*ssc,*ring,*comp,*keys,*wqa,*wkv,*wqb,*wa,*wb,*cwkv,*cwg,*iwkv,*iwg,*iw,*is,*ihw;
+    int hidden,q_rank,dim,heads,groups,waO,idx_score,idx_heads,idx_dim,window,max_total,cn_max,rope_dim,ncomp,nidx,cO,gO,ikO,igO,
+        vnorm_fma,rope_fma,idx_rope_fma,hw_fma,norm_fma,ds,K,headw,unroll;float eps,scale,had_scale,wscale;};
+struct LfGraph{cudaGraphExec_t exec;cudaGraph_t graph;int valid;LfSig sig;};
+static LfGraph g_lf[16][DSV4_KV_CACHE_LAYERS];
 extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,int hidden,
         Dsv4CudaTensor*wqa,Dsv4CudaTensor*wkv,Dsv4CudaTensor*cwkv,Dsv4CudaTensor*cwg,Dsv4CudaTensor*iwkv,Dsv4CudaTensor*iwg,
         const uint16_t*qnw,int q_rank,const uint16_t*kvw,int dim,float eps,int vnorm_fma,
@@ -2743,88 +2832,144 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
            g_idx_hidden[layer]!=hidden||g_idx_cols[layer]!=q_rank||idx_heads<1||idx_heads>1024||idx_dim<32||idx_dim>1024||
            (idx_dim&(idx_dim-1))||cn>idx_count||cn<1)return 0;
     }
-    int total=wn+cn,pairs=rope_dim/2,nope=dim-rope_dim;size_t sm=(size_t)total*4;
-    if(sm>96*1024||!ok(cudaSetDevice(device),"select fused layer device"))return 0;
+    int pairs=rope_dim/2;
+    /* the token-free shapes: the most selected rows a token of this layer
+     * can have, the most candidates, hence the attention's rows */
+    int cn_max=nidx?(cn>512?cn:512):g_kv_comp_cap[layer];
+    if(cn_max<cn)cn_max=cn;
+    int max_total=window+cn_max;size_t sm_max=(size_t)max_total*4;
+    int K=idx_score_k();size_t sm_small=((size_t)idx_heads*(idx_dim+1)+idx_dim+idx_heads)*4;
+    int graph=lf_graph_on()&&!q_out&&sm_max*4<=48*1024&&sattn_split_on()&&!mv_warp_verify()&&
+              (!idx_score||(K>1&&sm_small<=48*1024&&idx_dim<=1024));
+    if(sm_max>96*1024||!ok(cudaSetDevice(device),"select fused layer device"))return 0;
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_LF_KPROF");kprof=e&&*e&&*e!='0';}
+    static cudaEvent_t kev[16][8];static int kev_made[16];
+    int di=(int)(c-g);
+    if(kprof&&!kev_made[di]){for(int i=0;i<8;i++)cudaEventCreate(&kev[di][i]);kev_made[di]=1;}
+    if(kprof)graph=0;   /* event records captured into the graph changed the output (md5) and timed nothing: direct launches only */
     /* layout: the upload block, the download block, the scratch */
     size_t o=0;
     size_t ox=o;o+=lf_al((size_t)hidden*4);size_t ocos=o;o+=lf_al((size_t)pairs*4);size_t osin=o;o+=lf_al((size_t)pairs*4);
-    size_t osink=o;o+=lf_al((size_t)heads*4);size_t ometa=o;o+=lf_al(4*sizeof(int));
+    size_t osink=o;o+=lf_al((size_t)heads*4);size_t ometa=o;o+=lf_al(8*sizeof(int));
     size_t oqnw=o;o+=lf_al((size_t)q_rank*2);size_t okvw=o;o+=lf_al((size_t)dim*2);
     size_t upb=o;
     size_t oout=o;o+=lf_al((size_t)hidden*4);size_t okv=o;o+=lf_al((size_t)dim*4);size_t oqa=o;o+=lf_al((size_t)q_rank*4);
     size_t ockv=o;o+=lf_al(ncomp?(size_t)cwkv->O*4:0);size_t ocg=o;o+=lf_al(ncomp?(size_t)cwg->O*4:0);
     size_t oikv=o;o+=lf_al(nidx?(size_t)iwkv->O*4:0);size_t oig=o;o+=lf_al(nidx?(size_t)iwg->O*4:0);
-    size_t osel=o;o+=lf_al(idx_score?(size_t)cn*4:0);
+    size_t osel=o;o+=lf_al(nidx?(size_t)cn_max*4:0);
     size_t dlb=o-upb;
-    size_t oxq=o;o+=lf_al((size_t)q_rank*4);size_t oiq=o;o+=lf_al(idx_score?(size_t)g_idx_rows[layer]*4:0);
-    size_t oihw=o;o+=lf_al(idx_score?(size_t)idx_heads*4:0);size_t osc=o;o+=lf_al(idx_score?(size_t)idx_count*4:0);
+    size_t oxq=o;o+=lf_al((size_t)q_rank*4);size_t oiq=o;o+=lf_al(nidx?(size_t)idx_heads*idx_dim*4:0);
+    size_t oihw=o;o+=lf_al(nidx?(size_t)idx_heads*4:0);size_t osc=o;o+=lf_al(nidx?(size_t)IDX_SORT_MAX*4:0);
     size_t oq=o;o+=lf_al((size_t)heads*dim*4);size_t oatt=o;o+=lf_al((size_t)heads*dim*4);size_t ooa=o;o+=lf_al((size_t)wa->O*4);
     size_t tot=o,hostb=upb+dlb;
-    if(c->lfhcap<hostb){free(c->lfh);c->lfh=malloc(hostb);c->lfhcap=c->lfh?hostb:0;if(!c->lfh)return 0;}
+    char*h;
+    if(graph){
+        if(c->lfhpcap<hostb){if(c->lfhp)cudaFreeHost(c->lfhp);c->lfhp=nullptr;c->lfhpcap=0;
+            void*pm=nullptr;if(!alloc_ok(cudaHostAlloc(&pm,hostb,cudaHostAllocPortable),"fused layer pinned block"))return 0;
+            c->lfhp=pm;c->lfhpcap=hostb;}
+        h=(char*)c->lfhp;
+    }else{
+        if(c->lfhcap<hostb){free(c->lfh);c->lfh=malloc(hostb);c->lfhcap=c->lfh?hostb:0;if(!c->lfh)return 0;}
+        h=(char*)c->lfh;
+    }
     if(!buf((void**)&c->lfd,&c->lfdcap,tot))return 0;
-    char*h=(char*)c->lfh,*d=(char*)c->lfd;
+    if(!buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm_max))return 0;
+    char*d=(char*)c->lfd;
     memcpy(h+ox,x,(size_t)hidden*4);memcpy(h+ocos,icos,(size_t)pairs*4);memcpy(h+osin,isin,(size_t)pairs*4);
     memcpy(h+osink,sinks,(size_t)heads*4);
-    int meta[4]={0,wn,cn,idx_count};memcpy(h+ometa,meta,sizeof(meta));
+    int meta[8]={0,wn,cn,idx_count,first,position,position%window,0};memcpy(h+ometa,meta,sizeof(meta));
     memcpy(h+oqnw,qnw,(size_t)q_rank*2);memcpy(h+okvw,kvw,(size_t)dim*2);
-    static int kprof=-1;
-    if(kprof<0){const char*e=getenv("DSV4_LF_KPROF");kprof=e&&*e&&*e!='0';}
-    cudaEvent_t ev[8];
-    if(kprof){for(int i=0;i<8;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
-    if(!ok(cudaMemcpyAsync(d,h,upb,cudaMemcpyHostToDevice,c->stream),"fused layer upload"))return 0;
     const float*dx=(const float*)(d+ox),*dcos=(const float*)(d+ocos),*dsin=(const float*)(d+osin),*dsink=(const float*)(d+osink);
     const int*dmeta=(const int*)(d+ometa);const uint16_t*dqnw=(const uint16_t*)(d+oqnw),*dkvw=(const uint16_t*)(d+okvw);
     float*dout=(float*)(d+oout),*dkv=(float*)(d+okv),*dqa=(float*)(d+oqa),*dckv=(float*)(d+ockv),*dcg=(float*)(d+ocg),
          *dikv=(float*)(d+oikv),*dig=(float*)(d+oig),*dxq=(float*)(d+oxq),*diq=(float*)(d+oiq),*dihw=(float*)(d+oihw),
          *dsc=(float*)(d+osc),*dq=(float*)(d+oq),*datt=(float*)(d+oatt),*doa=(float*)(d+ooa);
     int*dsel=(int*)(d+osel);
-    /* 1. the input's projections (the PROJ6 round trip's kernels) */
-    if(kprof)cudaEventRecord(ev[1],c->stream);
-    run_mv_fused_fmt(wqa,dx,dqa,1,0,c->stream);
-    run_mv_fused_fmt(wkv,dx,dkv,1,0,c->stream);
-    if(ncomp){launch_bf16_one((__nv_bfloat16*)cwkv->w,dx,dckv,cwkv->O,cwkv->I,c->stream);
-              launch_bf16_one((__nv_bfloat16*)cwg->w,dx,dcg,cwg->O,cwg->I,c->stream);}
-    if(nidx){launch_bf16_one((__nv_bfloat16*)iwkv->w,dx,dikv,iwkv->O,iwkv->I,c->stream);
-             launch_bf16_one((__nv_bfloat16*)iwg->w,dx,dig,iwg->O,iwg->I,c->stream);}
-    if(!ok(cudaGetLastError(),"fused layer projection launch"))return 0;
-    /* 2. the host's qa norm (and the query ranks' fp8 round trip); the kv
-     *    norm, RoPE, fp8 round trip and ring write: one launch */
-    if(kprof)cudaEventRecord(ev[2],c->stream);
-    {int nt=q_rank>dim?q_rank:dim;if(nt>1024)nt=1024;
-     lf_prep_kernel<<<2,nt,(size_t)(q_rank>dim?q_rank:dim)*4,c->stream>>>(dqa,dqnw,q_rank,dxq,idx_score,dkv,dkvw,dim,eps,vnorm_fma,
-        dcos,dsin,rope_dim,rope_fma,g_kv_ring[layer]+(size_t)(position%window)*dim);}
-    if(!ok(cudaGetLastError(),"fused layer prep launch"))return 0;
-    (void)nope;(void)pairs;
-    /* 3. the indexer's selection: the fused selection's launches, the rank */
-    if(kprof)cudaEventRecord(ev[3],c->stream);
-    if(idx_score){
-        if(!idx_select_launch(c,layer,diq,dihw,dsc,dxq,dx,dcos,dsin,dmeta+3,1,idx_heads,idx_dim,rope_dim,hidden,idx_count,
-                              had_scale,wscale,idx_rope_fma,hw_fma,nullptr))return 0;
-        idx_topk_kernel<<<1,1024,0,c->stream>>>(dsel,dsc,idx_count,cn);
-        if(!ok(cudaGetLastError(),"fused layer rank launch"))return 0;
-    }
-    /* 4. the chain: q (the wq_b store rounded, the norm and RoPE in one
-     *    launch), the attention, the tail with the rounds in the stores */
-    if(kprof)cudaEventRecord(ev[4],c->stream);
-    run_mv_fused_fmt(wqb,dqa,dq,1,1,c->stream);
-    q_norm_rope_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(dq,dim,eps,norm_fma,dcos,dsin,rope_dim,rope_fma);
-    if(!ok(cudaGetLastError(),"fused layer q launch"))return 0;
-    if(kprof)cudaEventRecord(ev[5],c->stream);
-    if(!attn_one_launch(c,layer,sm,datt,dq,dkv,dsink,dmeta,idx_score?dsel:nullptr,cn,first,position,window,heads,dim,scale,total))return 0;
-    if(kprof)cudaEventRecord(ev[6],c->stream);
-    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(datt,dcos,dsin,dim,rope_dim,rope_fma,1);
-    run_mv_fused_fmt(wa,datt,doa,groups,1,c->stream);
-    run_mv_fused_fmt(wb,doa,dout,1,1,c->stream);
-    if(!ok(cudaGetLastError(),"fused layer tail launch"))return 0;
-    /* 5. one download, the sync, the scatter */
-    if(kprof)cudaEventRecord(ev[7],c->stream);
-    if(!ok(cudaMemcpyAsync(h+oout,d+oout,dlb,cudaMemcpyDeviceToHost,c->stream),"fused layer download"))return 0;
-    if(q_out&&!ok(cudaMemcpyAsync(q_out,dq,(size_t)heads*dim*4,cudaMemcpyDeviceToHost,c->stream),"fused layer q download"))return 0;
-    if(!ok(cudaStreamSynchronize(c->stream),"fused layer sync"))return 0;
+    cudaEvent_t*ev=kev[di];
+    /* the sequence (issued directly, or once into the capture) */
+    auto enqueue=[&]()->int{
+        if(kprof)cudaEventRecord(ev[0],c->stream);
+        if(!ok(cudaMemcpyAsync(d,h,upb,cudaMemcpyHostToDevice,c->stream),"fused layer upload"))return 0;
+        /* 1. the input's projections (the PROJ6 round trip's kernels) */
+        if(kprof)cudaEventRecord(ev[1],c->stream);
+        run_mv_fused_fmt(wqa,dx,dqa,1,0,c->stream);
+        run_mv_fused_fmt(wkv,dx,dkv,1,0,c->stream);
+        if(ncomp){launch_bf16_one((__nv_bfloat16*)cwkv->w,dx,dckv,cwkv->O,cwkv->I,c->stream);
+                  launch_bf16_one((__nv_bfloat16*)cwg->w,dx,dcg,cwg->O,cwg->I,c->stream);}
+        if(nidx){launch_bf16_one((__nv_bfloat16*)iwkv->w,dx,dikv,iwkv->O,iwkv->I,c->stream);
+                 launch_bf16_one((__nv_bfloat16*)iwg->w,dx,dig,iwg->O,iwg->I,c->stream);}
+        if(!ok(cudaGetLastError(),"fused layer projection launch"))return 0;
+        /* 2. the host's qa norm (and the query ranks' fp8 round trip); the kv
+         *    norm, RoPE, fp8 round trip and ring write: one launch */
+        if(kprof)cudaEventRecord(ev[2],c->stream);
+        {int nt=q_rank>dim?q_rank:dim;if(nt>1024)nt=1024;
+         lf_prep_kernel<<<2,nt,(size_t)(q_rank>dim?q_rank:dim)*4,c->stream>>>(dqa,dqnw,q_rank,dxq,idx_score,dkv,dkvw,dim,eps,vnorm_fma,
+            dcos,dsin,rope_dim,rope_fma,g_kv_ring[layer],dmeta);}
+        if(!ok(cudaGetLastError(),"fused layer prep launch"))return 0;
+        /* 3. the indexer's selection: the fused selection's launches (the
+         *    score grid for the most candidates), the rank */
+        if(kprof)cudaEventRecord(ev[3],c->stream);
+        if(idx_score){
+            if(!idx_select_launch(c,layer,diq,dihw,dsc,dxq,dx,dcos,dsin,dmeta+3,1,idx_heads,idx_dim,rope_dim,hidden,
+                                  graph?IDX_SORT_MAX:idx_count,had_scale,wscale,idx_rope_fma,hw_fma,nullptr))return 0;
+            idx_topk_kernel<<<1,1024,0,c->stream>>>(dsel,dsc,idx_count,cn,graph?dmeta:nullptr);
+            if(!ok(cudaGetLastError(),"fused layer rank launch"))return 0;
+        }
+        /* 4. the chain: q (the wq_b store rounded, the norm and RoPE in one
+         *    launch), the attention, the tail with the rounds in the stores */
+        if(kprof)cudaEventRecord(ev[4],c->stream);
+        run_mv_fused_fmt(wqb,dqa,dq,1,1,c->stream);
+        q_norm_rope_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(dq,dim,eps,norm_fma,dcos,dsin,rope_dim,rope_fma);
+        if(!ok(cudaGetLastError(),"fused layer q launch"))return 0;
+        if(kprof)cudaEventRecord(ev[5],c->stream);
+        if(!attn_one_launch(c,layer,graph?sm_max:(size_t)(wn+cn)*4,datt,dq,dkv,dsink,dmeta,idx_score?dsel:nullptr,cn,first,position,
+                            window,heads,dim,scale,graph?max_total:wn+cn,graph))return 0;
+        if(kprof)cudaEventRecord(ev[6],c->stream);
+        attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(datt,dcos,dsin,dim,rope_dim,rope_fma,1);
+        run_mv_fused_fmt(wa,datt,doa,groups,1,c->stream);
+        run_mv_fused_fmt(wb,doa,dout,1,1,c->stream);
+        if(!ok(cudaGetLastError(),"fused layer tail launch"))return 0;
+        /* 5. the download */
+        if(kprof)cudaEventRecord(ev[7],c->stream);
+        if(!ok(cudaMemcpyAsync(h+oout,d+oout,dlb,cudaMemcpyDeviceToHost,c->stream),"fused layer download"))return 0;
+        if(q_out&&!ok(cudaMemcpyAsync(q_out,dq,(size_t)heads*dim*4,cudaMemcpyDeviceToHost,c->stream),"fused layer q download"))return 0;
+        return 1;
+    };
+    int done=0;
+    if(graph){
+        LfGraph*G=&g_lf[di][layer];
+        LfSig S;memset(&S,0,sizeof S);
+        S.lfd=c->lfd;S.lfh=h;S.ssc=c->ssc;S.ring=g_kv_ring[layer];S.comp=g_kv_comp[layer];S.keys=g_idx_keys[layer];
+        S.wqa=wqa->w;S.wkv=wkv->w;S.wqb=wqb->w;S.wa=wa->w;S.wb=wb->w;S.cwkv=cwkv?cwkv->w:nullptr;S.cwg=cwg?cwg->w:nullptr;
+        S.iwkv=iwkv?iwkv->w:nullptr;S.iwg=iwg?iwg->w:nullptr;S.iw=g_idx_w[layer];S.is=g_idx_s[layer];S.ihw=g_idx_hw[layer];
+        S.hidden=hidden;S.q_rank=q_rank;S.dim=dim;S.heads=heads;S.groups=groups;S.waO=wa->O;S.idx_score=idx_score;
+        S.idx_heads=idx_heads;S.idx_dim=idx_dim;S.window=window;S.max_total=max_total;S.cn_max=cn_max;S.rope_dim=rope_dim;
+        S.ncomp=ncomp;S.nidx=nidx;S.cO=cwkv?cwkv->O:0;S.gO=cwg?cwg->O:0;S.ikO=iwkv?iwkv->O:0;S.igO=iwg?iwg->O:0;
+        S.vnorm_fma=vnorm_fma;S.rope_fma=rope_fma;S.idx_rope_fma=idx_rope_fma;S.hw_fma=hw_fma;S.norm_fma=norm_fma;
+        S.ds=sattn_split_ds();S.K=K;S.headw=idx_headw_mode();S.unroll=mv_warp_unroll();
+        S.eps=eps;S.scale=scale;S.had_scale=had_scale;S.wscale=wscale;S.unroll+=(kprof?1000:0)+(mv_warp_lut()?2000:0)+(idx_proj_warp()?4000:0);
+        if(!G->valid||memcmp(&G->sig,&S,sizeof S)!=0){
+            if(G->valid){cudaGraphExecDestroy(G->exec);cudaGraphDestroy(G->graph);G->valid=0;}
+            if(!ok(cudaStreamBeginCapture(c->stream,cudaStreamCaptureModeThreadLocal),"fused layer capture begin"))return 0;
+            int okq=enqueue();
+            cudaGraph_t gr=nullptr;
+            int ended=ok(cudaStreamEndCapture(c->stream,&gr),"fused layer capture end");
+            if(!okq||!ended||!gr){if(gr)cudaGraphDestroy(gr);return 0;}
+            if(!ok(cudaGraphInstantiate(&G->exec,gr,0),"fused layer graph instantiate")){cudaGraphDestroy(gr);return 0;}
+            G->graph=gr;G->sig=S;G->valid=1;
+        }
+        static int gprof=-1;static cudaEvent_t ge[2];static double gsum;static long long gn;
+        if(gprof<0){const char*e=getenv("DSV4_LF_GPROF");gprof=e&&*e&&*e!='0';if(gprof){cudaEventCreate(&ge[0]);cudaEventCreate(&ge[1]);}}
+        if(gprof)cudaEventRecord(ge[0],c->stream);
+        done=ok(cudaGraphLaunch(G->exec,c->stream),"fused layer graph launch");
+        if(gprof){cudaEventRecord(ge[1],c->stream);cudaEventSynchronize(ge[1]);float ms=0;cudaEventElapsedTime(&ms,ge[0],ge[1]);
+            gsum+=ms;gn++;if(gn%1000==0)fprintf(stderr,"lfgprof calls=%lld device=%.3f ms per layer call\n",gn,gsum/gn);}
+    }else done=enqueue();
+    if(!done||!ok(cudaStreamSynchronize(c->stream),"fused layer sync"))return 0;
     if(kprof){float ms[7];for(int i=0;i<7;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
-        fprintf(stderr,"lfkprof layer=%d up=%.3f proj=%.3f prep=%.3f idx=%.3f q=%.3f attn=%.3f tail=%.3f ms cn=%d scored=%d\n",
-                layer,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],cn,idx_score);
-        for(int i=0;i<8;i++)cudaEventDestroy(ev[i]);}
+        fprintf(stderr,"lfkprof layer=%d up=%.3f proj=%.3f prep=%.3f idx=%.3f q=%.3f attn=%.3f tail=%.3f ms cn=%d scored=%d graph=%d\n",
+                layer,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],cn,idx_score,graph);}
     memcpy(out,h+oout,(size_t)hidden*4);memcpy(kv_out,h+okv,(size_t)dim*4);memcpy(qa_out,h+oqa,(size_t)q_rank*4);
     if(ncomp){memcpy(ckv_out,h+ockv,(size_t)cwkv->O*4);memcpy(cg_out,h+ocg,(size_t)cwg->O*4);}
     if(nidx){memcpy(ikv_out,h+oikv,(size_t)iwkv->O*4);memcpy(ig_out,h+oig,(size_t)iwg->O*4);}
