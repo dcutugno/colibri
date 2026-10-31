@@ -57,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -157,7 +157,12 @@ template<int F,int R> __global__ void mv_rows(const uint8_t *w,const uint8_t *sc
  * DSV4_MV_WARP_VERIFY runs both and counts differing words). I % 256 == 0
  * and 8-byte aligned rows. Eight rows per 256-thread block; e4m3 through a
  * shared table of exactly e4m3()'s values. */
-template<int F> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
+/* DSV4_MV_WARP_UNROLL (4): U chunks of 256 columns loaded before their
+ * FMAs (the loop with a runtime trip count issued one chunk's loads per
+ * step, a dependent load-then-add per 256 columns: wq_b's 1024-wide rows
+ * at 355 GB/s where wo_a's 4096-wide ran 680). The partials' order is
+ * unchanged (chunk c, then c+256, ...): bitwise. 1 = a chunk per step. */
+template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
     __shared__ float lut[256];
     lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();
     int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
@@ -167,7 +172,23 @@ template<int F> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,
     float p[8];
     #pragma unroll
     for(int k=0;k<8;k++)p[k]=0.f;
-    for(int c=0;c<I;c+=256){
+    int c=0;
+    if constexpr(U>1){
+        for(;c+U*256<=I;c+=U*256){
+            uint2 wv[U];float4 xa[U],xb[U];float es[U];
+            #pragma unroll
+            for(int u=0;u<U;u++){int i0=c+u*256+8*lane;
+                wv[u]=*(const uint2*)(wr+i0);xa[u]=*(const float4*)(xi+i0);xb[u]=*(const float4*)(xi+i0+4);es[u]=e8(scr[i0/128]);}
+            #pragma unroll
+            for(int u=0;u<U;u++){
+                unsigned b[8]={wv[u].x&255u,(wv[u].x>>8)&255u,(wv[u].x>>16)&255u,wv[u].x>>24,wv[u].y&255u,(wv[u].y>>8)&255u,(wv[u].y>>16)&255u,wv[u].y>>24};
+                float xs[8]={xa[u].x,xa[u].y,xa[u].z,xa[u].w,xb[u].x,xb[u].y,xb[u].z,xb[u].w};
+                #pragma unroll
+                for(int k=0;k<8;k++){float v=lut[b[k]]*es[u];if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));p[k]+=xs[k]*v;}
+            }
+        }
+    }
+    for(;c<I;c+=256){
         int i0=c+8*lane;
         uint2 wv=*(const uint2*)(wr+i0);
         float4 xa=*(const float4*)(xi+i0),xb=*(const float4*)(xi+i0+4);
@@ -216,6 +237,13 @@ __global__ void __launch_bounds__(256) mv_bf16_warp(const __nv_bfloat16 *w,const
 }
 static int mv_warp_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP");on=!(e&&*e=='0');}return on;}
 static int mv_warp_verify(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_MV_WARP_VERIFY");on=e&&*e&&*e!='0';}return on;}
+static int mv_warp_unroll(void){static int u=-1;if(u<0){const char*e=getenv("DSV4_MV_WARP_UNROLL");u=e&&*e?atoi(e):1;if(u!=1&&u!=2&&u!=4)u=4;}return u;}
+template<int F> static void launch_mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,cudaStream_t st){
+    int u=mv_warp_unroll();
+    if(u==4)mv_warp<F,4><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
+    else if(u==2)mv_warp<F,2><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
+    else mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
+}
 static bool mv_warp_fits(const void*w,const float*x,int I,int walign){return I>0&&I%256==0&&!((uintptr_t)x&15)&&!((uintptr_t)w&(walign-1));}
 __global__ void mv_warp_diff_kernel(const float*a,const float*b,int n,unsigned*cnt){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(cnt,1u);}
 /* DSV4_MV_WARP_VERIFY: `got` (the warp kernel's output, O floats) against
@@ -330,9 +358,9 @@ template<int F> static void run_mv(const uint8_t*w,const uint8_t*sc,const float*
             if(mv_warp_on()&&mv_warp_fits(w,x,I,8)){
                 if(mv_warp_verify()){float*t=mv_warp_scratch((size_t)O);if(t){
                     mv<F><<<O,256,0,stream>>>(w,sc,x,y,O,I,groups);
-                    mv_warp<F><<<(O+7)/8,256,0,stream>>>(w,sc,x,t,O,I,groups);
+                    launch_mv_warp<F>(w,sc,x,t,O,I,groups,stream);
                     mv_warp_report(F==9?"fp8b":"fp8",y,t,O,I,stream);return;}}
-                mv_warp<F><<<(O+7)/8,256,0,stream>>>(w,sc,x,y,O,I,groups);return;
+                launch_mv_warp<F>(w,sc,x,y,O,I,groups,stream);return;
             }
         }
         mv<F><<<O,256,0,stream>>>(w,sc,x,y,O,I,groups);
@@ -2386,67 +2414,100 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
        (ib&&!buf((void**)&c->aux3,&c->aux3cap,ib))||!buf((void**)&c->p1,&c->p1cap,2*rb+qab)||
        !buf((void**)&c->dy,&c->ycap,ob)||!buf((void**)&c->dx,&c->xcap,hb))return 0;
+    /* DSV4_CHAIN_PACK (1): the call's inputs (cos, sin, qa or q, the kv
+     * row, the sinks, meta, the selection) as one host block and one
+     * upload. Each pageable cudaMemcpyAsync costs the host ~15 us to
+     * stage, and the three before the wq_b launch left the stream idle
+     * for 0.047 ms per layer (DSV4_WO_KPROF qup=; the four after it hid
+     * behind the kernel). The device block's regions stand in for the
+     * separate buffers; the kernels see the same bytes. 0 = a copy per
+     * input. */
+    static int pack=-1;
+    if(pack<0){const char*e=getenv("DSV4_CHAIN_PACK");pack=!(e&&*e=='0');}
+    int pk=pack;
+    const float*dcos=c->p1,*dsin=(const float*)((char*)c->p1+rb),*dqa=qa?(const float*)((char*)c->p1+2*rb):nullptr,
+               *dchunk=c->p3,*dsink=c->aux1,*dq=c->p2;
+    const int*dmeta=(const int*)c->aux2,*dsel=sel?(const int*)c->aux3:nullptr;
+    if(pk){
+        const size_t A=256;
+        size_t o=0,ocos=o;o+=(rb+A-1)/A*A;size_t osin=o;o+=(rb+A-1)/A*A;size_t oqa=o;o+=qa?(qab+A-1)/A*A:(qb+A-1)/A*A;
+        size_t ochunk=o;o+=(cb+A-1)/A*A;size_t osink=o;o+=(sb+A-1)/A*A;size_t ometa=o;o+=(mb+A-1)/A*A;size_t osel=o;o+=(ib+A-1)/A*A;
+        if(c->chpcap<o){free(c->chp);c->chp=malloc(o);c->chpcap=c->chp?o:0;}
+        if(!c->chp||!buf((void**)&c->dchp,&c->dchpcap,o))pk=0;
+        else{
+            char*h=(char*)c->chp;
+            memcpy(h+ocos,icos,rb);memcpy(h+osin,isin,rb);
+            if(qa)memcpy(h+oqa,qa,qab);else memcpy(h+oqa,q,qb);
+            memcpy(h+ochunk,chunk,cb);memcpy(h+osink,sinks,sb);memcpy(h+ometa,meta,mb);if(ib)memcpy(h+osel,sel,ib);
+            if(!ok(cudaMemcpyAsync(c->dchp,h,o,cudaMemcpyHostToDevice,c->stream),"decode chain packed upload"))return 0;
+            const char*d=(const char*)c->dchp;
+            dcos=(const float*)(d+ocos);dsin=(const float*)(d+osin);
+            if(qa)dqa=(const float*)(d+oqa);else dq=(const float*)(d+oqa);
+            dchunk=(const float*)(d+ochunk);dsink=(const float*)(d+osink);dmeta=(const int*)(d+ometa);if(ib)dsel=(const int*)(d+osel);
+        }
+    }
     static int kprof=-1;
     if(kprof<0){const char*e=getenv("DSV4_WO_KPROF");kprof=e&&*e&&*e!='0';}
-    cudaEvent_t ev[7],ex[3];
-    if(kprof){for(int i=0;i<7;i++)cudaEventCreate(&ev[i]);for(int i=0;i<3;i++)cudaEventCreate(&ex[i]);cudaEventRecord(ex[0],c->stream);}
+    cudaEvent_t ev[7],ex[5];
+    if(kprof){for(int i=0;i<7;i++)cudaEventCreate(&ev[i]);for(int i=0;i<5;i++)cudaEventCreate(&ex[i]);cudaEventRecord(ex[0],c->stream);cudaEventRecord(ex[3],c->stream);cudaEventRecord(ex[4],c->stream);}
     if(qa){
         /* q from qa on the card: the wq_b mv kernel (what coli_fp8_matvec_ref
          * dispatches to over the mirror), bf16 round, per-head rmsnorm,
          * forward RoPE + bf16 round — the host's q, never crossing. */
-        const float*dqa=(const float*)((char*)c->p1+2*rb);
-        if(!ok(cudaMemcpyAsync((void*)dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"decode chain qa upload")||
+        if(!pk&&(!ok(cudaMemcpyAsync((void*)dqa,qa,qab,cudaMemcpyHostToDevice,c->stream),"decode chain qa upload")||
            !ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
-           !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))return 0;
+           !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload")))return 0;
+        if(kprof)cudaEventRecord(ex[3],c->stream);
         if(!run_fp8_attn(wqb,dqa,c->p2,1,c->stream)){
         if(wqb->fmt==9)run_mv<9>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);
         else run_mv<8>((uint8_t*)wqb->w,wqb->scale,dqa,c->p2,wqb->O,wqb->I,1,c->stream);}
         if(!ok(cudaGetLastError(),"decode chain wq_b launch"))return 0;
+        if(kprof)cudaEventRecord(ex[4],c->stream);
         bf16_round_ref_kernel<<<(heads*dim+255)/256,256,0,c->stream>>>(c->p2,heads*dim);
         head_rmsnorm_ref_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
         if(!ok(cudaGetLastError(),"decode chain q norm launch"))return 0;
-        attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p2,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,0);
+        attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p2,dcos,dsin,dim,rope_dim,rope_fma,0);
         if(!ok(cudaGetLastError(),"decode chain q rope launch"))return 0;
         if(q_out&&!ok(cudaMemcpyAsync(q_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"decode chain q download"))return 0;
     }
     if(kprof)cudaEventRecord(ex[1],c->stream);
-    if(!qa&&!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"decode chain query upload"))return 0;
-    if(
+    if(!pk&&!qa&&!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"decode chain query upload"))return 0;
+    if(!pk&&(
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"decode chain kv upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"decode chain sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"decode chain meta upload")||
        (ib&&!ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"decode chain index upload"))||
        (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
-              !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload"))))return 0;
+              !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload")))))return 0;
     if(kprof)cudaEventRecord(ex[2],c->stream);
     int split=sattn_split_on()&&sm*4<=48*1024&&buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm);
     if(split&&sel)
         launch_sattn_split<1>(c->ssc,heads,sm,c->stream,
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
             abs_base,chunk_start,window,dim,scale,total);
     else if(split)
         launch_sattn_split<0>(c->ssc,heads,sm,c->stream,
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,
             abs_base,chunk_start,window,dim,scale,total);
     else if(sel&&sattn_v2_on())
         launch_sattn_v2<1>(heads,1,sm,c->stream,
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
             cn,abs_base,chunk_start,window,dim,scale);
     else if(sel)
         sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
             cn,abs_base,chunk_start,window,heads,dim,scale);
     else if(sattn_v2_on())
         launch_sattn_v2<0>(heads,1,sm,c->stream,
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,0,
             abs_base,chunk_start,window,dim,scale);
     else
         sparse_attn_batch_cached_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
-            c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
+            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,
             abs_base,chunk_start,window,heads,dim,scale);
     if(!ok(cudaGetLastError(),"decode chain attention launch"))return 0;
     if(kprof)cudaEventRecord(ev[0],c->stream);
-    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,c->p1,(const float*)((char*)c->p1+rb),dim,rope_dim,rope_fma,1);
+    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
     if(kprof)cudaEventRecord(ev[1],c->stream);
     if(!run_fp8_attn(wa,c->p4,c->dy,groups,c->stream)){
@@ -2468,11 +2529,12 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
     if(kprof)cudaEventRecord(ev[5],c->stream);
     int done=ok(cudaStreamSynchronize(c->stream),"decode chain sync");
     if(kprof){
-        float ms[5],mq=0,mu=0,ma=0;
+        float ms[5],mq=0,mu=0,ma=0,mqu=0,mqm=0;
         for(int i=0;i<5;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
         cudaEventElapsedTime(&mq,ex[0],ex[1]);cudaEventElapsedTime(&mu,ex[1],ex[2]);cudaEventElapsedTime(&ma,ex[2],ev[0]);
-        fprintf(stderr,"wokprof layer=%d q=%.3f up=%.3f attn=%.3f rope=%.3f wo_a=%.3f round=%.3f wo_b=%.3f down=%.3f ms rows=%d\n",layer,mq,mu,ma,ms[0],ms[1],ms[2],ms[3],ms[4],total);
-        for(int i=0;i<7;i++)cudaEventDestroy(ev[i]);for(int i=0;i<3;i++)cudaEventDestroy(ex[i]);
+        if(qa){cudaEventElapsedTime(&mqu,ex[0],ex[3]);cudaEventElapsedTime(&mqm,ex[3],ex[4]);}
+        fprintf(stderr,"wokprof layer=%d q=%.3f (qup=%.3f qmv=%.3f) up=%.3f attn=%.3f rope=%.3f wo_a=%.3f round=%.3f wo_b=%.3f down=%.3f ms rows=%d\n",layer,mq,mqu,mqm,mu,ma,ms[0],ms[1],ms[2],ms[3],ms[4],total);
+        for(int i=0;i<7;i++)cudaEventDestroy(ev[i]);for(int i=0;i<5;i++)cudaEventDestroy(ex[i]);
     }
     return done;
 }

@@ -1054,6 +1054,25 @@ per layer is now q 0.10 (the wq_b matvec with its uploads, round, norm,
 RoPE), attention 0.05, wo_a 0.05, wo_b 0.05 ms (the three 32 MB matrices
 at ~650 GB/s).
 
+Thirty-first measurement (2026-10-31): the chain's q span taken apart
+(`DSV4_WO_KPROF` now prints `qup=` and `qmv=`): of its 0.10 ms per layer
+the wq_b matvec is 0.056 (32 MB at 570 GB/s) and 0.047 is the stream
+idle before it while the host stages three pageable uploads (qa, cos,
+sin; ~15 us each; the four uploads after the launch hide behind the
+kernel). `DSV4_CHAIN_PACK` (1): the call's seven inputs as one host block
+and one upload, the device block's regions standing in for the separate
+buffers: the gap 0.047 -> 0.024 ms per layer, `sattn` 13 -> 12 ms per
+token, after the first token 11.16 -> 11.15 s (within noise); bitwise
+(md5 85d209f4e138, `DSV4_WO_VERIFY` clean). The pinned block of the
+twenty-fourth measurement lost where this pageable one gains: the loss
+there was the pinned DMA per copy, not the packing. `DSV4_MV_WARP_UNROLL`
+(1): the warp matvec's loop with U chunks' loads issued before their
+FMAs (the partials' order unchanged), tried at 2 and 4 and kept off:
+within noise end to end (11.14-11.17 s), `DSV4_MV_WARP_VERIFY` clean
+over 16,380 calls. The chain's device time per layer: upload gap 0.02,
+q 0.06, attention 0.05, wo_a 0.05, wo_b 0.05, small kernels and the
+download 0.04 ms.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1212,6 +1231,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `DSV4_CHAIN_PACK` (1) | the decode chain's seven inputs as one host block and one upload (bitwise); `0` = a pageable copy per input |
+| `DSV4_MV_WARP_UNROLL` (1) | chunks of 256 columns loaded ahead of their FMAs in the warp matvec (1, 2 or 4; bitwise; measured equal) |
 | `DSV4_SATTN_SPLIT` (1) | the decode token's cached sparse attention as a score kernel over row tiles and a value kernel over column slices (bitwise); `0` = the one v2 launch |
 | `DSV4_SATTN_SPLIT_DS` (128) | columns per value-kernel block (32..512) |
 | `DSV4_PROJ_ONEDL` (1) | that round trip's outputs as one download scattered on the host; `0` = a pageable download per output (bitwise, +5 ms per token) |
