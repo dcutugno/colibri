@@ -1080,6 +1080,20 @@ void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, i
  * (q NULL) the query is made on the card from the wq_b mirror (bf16 round,
  * per-head rmsnorm with eps, forward RoPE). attended_out / oa_out / q_out:
  * verify downloads (DSV4_WO_VERIFY). */
+void coli_v4_gpu_kv_cache_mark(const ColiDeepSeekV4LayerWeights *weights,
+                               int position, int window, int comp_total);
+int coli_v4_gpu_attention_decode_fused(
+    const ColiDeepSeekV4LayerWeights *weights, const float *input, int hidden,
+    int position, const ColiTensorView *wq_a, const ColiTensorView *wkv,
+    const ColiTensorView *wq_b, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, int has_comp, int has_idx, const void *q_norm_raw,
+    int q_rank, const void *kv_norm_raw, int head_dim, float eps,
+    const float *cosines, const float *sines, int rope_dim, const float *sinks,
+    int first, int comp_total, int heads, ColiDeepSeekV4Indexer *indexer,
+    int idx_count, int topk, const ColiTensorView *iwq, const uint16_t *ihw,
+    int idx_heads, int idx_dim, float *output, float *kv_out, float *qa_out,
+    float *ckv_out, float *cg_out, float *ikv_out, float *ig_out, int *sel_out,
+    int *sel_count, float *q_out);
 int coli_v4_gpu_attention_decode_chain(
     const ColiDeepSeekV4LayerWeights *weights, const float *q, const float *kv,
     int position, const float *sinks, const int *meta, const int *sel, int selstride,

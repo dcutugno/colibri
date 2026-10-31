@@ -2286,6 +2286,22 @@ static int v4_decode_q_project(float *q, const ColiTensorView *wq_b, const float
     return result;
 }
 
+/* V4_LAYER_FUSED (1): a decode token's attention layer as one device
+ * round trip (coli_v4_gpu_attention_decode_fused) on the tokens that emit
+ * no compressed row; 0 = the three trips. V4_LAYER_FUSED_VERIFY=1 runs it
+ * into side buffers beside the usual path and counts differing words
+ * (`lfverify`). */
+static int v4_layer_fused_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_LAYER_FUSED"); on = !(e && *e == '0'); }
+    return on;
+}
+static int v4_layer_fused_verify_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_LAYER_FUSED_VERIFY"); on = e && *e && *e != '0'; }
+    return on;
+}
+
 static int v4_wo_verify_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -2365,12 +2381,86 @@ static int attention_token_impl(float *output,
     if (aprof) clock_gettime(CLOCK_MONOTONIC, &ap0);
 #define AP_MARK(acc) do { if (aprof) { clock_gettime(CLOCK_MONOTONIC, &ap1); acc += (ap1.tv_sec - ap0.tv_sec) + (ap1.tv_nsec - ap0.tv_nsec) * 1e-9; ap0 = ap1; } } while (0)
     int gpu_proj = 0, qa_done = 0, kv_done = 0;
+    int fused_done = 0, fused_checked = 0, lf_sel_n = 0;
+    float *lf_out = NULL, *lf_kv = NULL, *lf_qa = NULL, *lf_q = NULL;
+    int *lf_sel = NULL;
+    float lf_ckv[1024], lf_cg[1024], lf_ikv[256], lf_ig[256];
 #ifdef COLI_V4_GPU_TIER
     float comp_kv[1024], comp_gate[1024];
     float idx_kv[256], idx_gate[256];
     int idx_proj = 0;
     int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
     int idx_rows = 2 * config->index_head_dim;
+    /* V4_LAYER_FUSED: the whole layer in one round trip when the token
+     * emits no compressed row (the host's compressor state makes those),
+     * the layer's state is prepared, every matrix has its mirror and the
+     * chain would take the token. The host's canonical state is kept from
+     * the download: the compressor advances (no emit), the kv ring write,
+     * the cache marks. The fused call's time lands in `qa` (DSV4_DECODE_PROF). */
+    if (!result && v4_layer_fused_on() && state && state->window_size > 0 &&
+        (weights->plan.compression_ratio == 0 || state->layer == weights->plan.layer) &&
+        (weights->plan.compression_ratio == 0 ||
+         (position + 1) % weights->plan.compression_ratio != 0) &&
+        (!weights->plan.has_indexer || state->indexer) &&
+        wq_a.gpu && wkv.gpu && wq_b.gpu && wo_a.gpu && wo_b.gpu &&
+        v4_wo_chain_on() && !v4_wo_verify_on() && v4_decode_gpu_proj_on() &&
+        coli_v4_gpu_attn_batch_wanted() && state->compressed_count <= 8192 &&
+        comp_rows <= 1024 && idx_rows <= 256) {
+        const float *lf_sinks = layer_data(weights, "attn.attn_sink", NULL);
+        const void *lf_qn = layer_data(weights, "attn.q_norm.weight", NULL);
+        const void *lf_kn = layer_data(weights, "attn.kv_norm.weight", NULL);
+        int has_comp = weights->plan.compression_ratio != 0;
+        int has_idx = state->indexer != NULL;
+        int idx_count = has_idx ? coli_v4_indexer_compressed_count(state->indexer) : 0;
+        int window = state->window_size;
+        int first = position - window + 1;
+        if (first < 0) first = 0;
+        int comp_total = state->compressed_count;
+        ColiTensorView iwq;
+        const uint16_t *ihw = NULL;
+        int idx_ok = !has_idx ||
+                     (!fp8_view(&iwq, weights, "attn.indexer.wq_b") &&
+                      (ihw = layer_data(weights, "attn.indexer.weights_proj.weight", NULL)) != NULL);
+        int verify = v4_layer_fused_verify_on();
+        if (verify) {
+            lf_out = malloc((size_t)hidden * sizeof(*lf_out));
+            lf_kv = malloc((size_t)head_dim * sizeof(*lf_kv));
+            lf_qa = malloc((size_t)q_rank * sizeof(*lf_qa));
+            lf_q = malloc((size_t)heads * head_dim * sizeof(*lf_q));
+            lf_sel = malloc((size_t)(config->index_topk > 0 ? config->index_topk : 1) * sizeof(*lf_sel));
+        }
+        if (lf_sinks && lf_qn && lf_kn && idx_ok &&
+            (!verify || (lf_out && lf_kv && lf_qa && lf_q && lf_sel)) &&
+            !coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
+                has_comp ? config->original_max_position_embeddings : 0,
+                has_comp ? config->compress_rope_theta : config->rope_theta,
+                config->rope_factor, config->rope_beta_fast, config->rope_beta_slow) &&
+            coli_v4_gpu_kv_cache_sync(weights, state->kv, window, head_dim, position,
+                                      state->compressed, comp_total)) {
+            int sel_n = 0;
+            int rc = coli_v4_gpu_attention_decode_fused(
+                weights, input, hidden, position, &wq_a, &wkv, &wq_b, &wo_a, groups, &wo_b,
+                has_comp, has_idx, lf_qn, q_rank, lf_kn, head_dim, config->rms_norm_eps,
+                cosines, sines, rope_dim, lf_sinks, first, comp_total, heads,
+                state->indexer, idx_count, config->index_topk, has_idx ? &iwq : NULL, ihw,
+                config->index_n_heads, config->index_head_dim,
+                verify ? lf_out : output, verify ? lf_kv : kv, verify ? lf_qa : qa,
+                has_comp ? (verify ? lf_ckv : comp_kv) : NULL,
+                has_comp ? (verify ? lf_cg : comp_gate) : NULL,
+                has_idx ? (verify ? lf_ikv : idx_kv) : NULL,
+                has_idx ? (verify ? lf_ig : idx_gate) : NULL,
+                verify ? lf_sel : NULL, &sel_n, verify ? lf_q : NULL);
+            if (rc == 0 && verify) { fused_checked = 1; lf_sel_n = sel_n; }
+            else if (rc == 0) {
+                fused_done = 1;
+                gpu_proj = qa_done = kv_done = 1;
+                idx_proj = has_idx;
+                compressed_selected = sel_n;
+                coli_v4_gpu_kv_cache_mark(weights, position, window, comp_total);
+            }
+        }
+    }
     /* V4_DECODE_PROJ6 (1): the token's projections of the attention input
      * in one round trip (one upload, one sync): wq_a and wkv for every
      * layer, the compressor's pair where the layer compresses, the
@@ -2382,7 +2472,7 @@ static int attention_token_impl(float *output,
      * independent of the state, so the compressor and indexer objects the
      * first token creates below can use them. */
     int nk = !weights->plan.compression_ratio ? 0 : weights->plan.has_indexer ? 4 : 2;
-    if (!result && v4_decode_gpu_proj_on() && wq_a.gpu && wkv.gpu &&
+    if (!result && !fused_done && v4_decode_gpu_proj_on() && wq_a.gpu && wkv.gpu &&
         (nk == 0 || (state && comp_rows <= 1024)) && (nk < 4 || idx_rows <= 256)) {
         static const char *const keys4[4] = {
             "attn.compressor.wkv", "attn.compressor.wgate",
@@ -2397,12 +2487,13 @@ static int attention_token_impl(float *output,
     }
 #endif
     if (!result && !qa_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
-    coli_bf16_round_array(qa, (size_t)q_rank);
+    if (!fused_done) coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
-    if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
-                    coli_v4_rmsnorm(qa, qa, norm_weight, q_rank,
-                                    config->rms_norm_eps))) result = -1;
-    if (!result) coli_bf16_round_array(qa, (size_t)q_rank);
+    if (!result && !fused_done &&
+        (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
+         coli_v4_rmsnorm(qa, qa, norm_weight, q_rank,
+                         config->rms_norm_eps))) result = -1;
+    if (!result && !fused_done) coli_bf16_round_array(qa, (size_t)q_rank);
     AP_MARK(g_v4_ap_qa);
     if (!result && state && weights->plan.compression_ratio) {
         result = prepare_compressed_state(state, weights, config,
@@ -2471,7 +2562,7 @@ static int attention_token_impl(float *output,
                     error, error_size);
                 AP_MARK(g_v4_ap_comp_a);
                 if (visible < 0) result = -1;
-                else if (coli_v4_indexer_select_batch(
+                else if (!fused_done && coli_v4_indexer_select_batch(
                              state->indexer, compressed_indices,
                              config->index_topk, qa, input, position, 1,
                              &visible, &compressed_selected, error,
@@ -2493,6 +2584,7 @@ static int attention_token_impl(float *output,
               (!state->indexer || compressed_indices);
 #endif
     AP_MARK(g_v4_ap_qb);
+    if (!fused_done) {
     if (!result && !kv_done) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
@@ -2528,10 +2620,11 @@ static int attention_token_impl(float *output,
         }
         free(scales); free(qdq);
     }
+    }   /* !fused_done */
 
     AP_MARK(g_v4_ap_kv);
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
-    int gpu_attn_done = 0, chain_done = 0, chain_checked = 0;
+    int gpu_attn_done = fused_done, chain_done = fused_done, chain_checked = 0;
     float *chain_out = NULL, *chain_att = NULL, *chain_oa = NULL, *chain_q = NULL;
 #ifdef COLI_V4_GPU_TIER
     /* DECODE on the persistent device KV (same ring/compressed buffers the
@@ -2541,7 +2634,7 @@ static int attention_token_impl(float *output,
      * enters the ring after the kernel; the CPU state stays canonical (the
      * ring write below still happens), so any refusal here just falls
      * through to the reference loop. */
-    if (!result && state && sinks && coli_v4_gpu_attn_batch_wanted() &&
+    if (!result && !fused_done && state && sinks && coli_v4_gpu_attn_batch_wanted() &&
         state->compressed_count <= 8192 &&
         (!state->indexer || compressed_indices)) {
         int window = state->window_size;
@@ -2745,6 +2838,51 @@ static int attention_token_impl(float *output,
                 weights->plan.layer, position, bq, wq_, ba, wa_, bo, wo_, bh, wh);
     }
     free(chain_out); free(chain_att); free(chain_oa); free(chain_q);
+    if (!result && fused_checked) {
+        /* V4_LAYER_FUSED_VERIFY: the fused layer's output, kv row, qa, q
+         * (when the host made one), compressor projections and selection
+         * against the path above, bitwise. */
+        long long bo = 0, bk = 0, bq = 0, bqq = 0, bc = 0, bs = 0;
+        double wo_ = 0, wk = 0, wq_ = 0;
+        for (int i = 0; i < hidden; i++) {
+            double d = fabs((double)lf_out[i] - output[i]);
+            if (lf_out[i] != output[i]) bo++;
+            if (d > wo_) wo_ = d;
+        }
+        for (int i = 0; i < head_dim; i++) {
+            double d = fabs((double)lf_kv[i] - kv[i]);
+            if (lf_kv[i] != kv[i]) bk++;
+            if (d > wk) wk = d;
+        }
+        for (int i = 0; i < q_rank; i++) {
+            double d = fabs((double)lf_qa[i] - qa[i]);
+            if (lf_qa[i] != qa[i]) bq++;
+            if (d > wq_) wq_ = d;
+        }
+        if (!q_defer)
+            for (size_t i = 0; i < (size_t)heads * head_dim; i++)
+                if (lf_q[i] != q[i]) bqq++;
+#ifdef COLI_V4_GPU_TIER
+        if (gpu_proj && weights->plan.compression_ratio) {
+            for (int i = 0; i < comp_rows; i++)
+                if (lf_ckv[i] != comp_kv[i] || lf_cg[i] != comp_gate[i]) bc++;
+            if (idx_proj)
+                for (int i = 0; i < idx_rows; i++)
+                    if (lf_ikv[i] != idx_kv[i] || lf_ig[i] != idx_gate[i]) bc++;
+        }
+#endif
+        int sel_cmp = state && state->indexer && compressed_indices ? compressed_selected : -1;
+        if (sel_cmp >= 0) {
+            if (lf_sel_n != sel_cmp) bs = -1;
+            else for (int i = 0; i < sel_cmp; i++) if (lf_sel[i] != compressed_indices[i]) bs++;
+        }
+        fprintf(stderr, "lfverify layer=%d position=%d out_mismatch=%lld (max %g) "
+                "kv_mismatch=%lld (max %g) qa_mismatch=%lld (max %g) q_mismatch=%lld "
+                "proj_mismatch=%lld sel_mismatch=%lld (n=%d/%d)\n",
+                weights->plan.layer, position, bo, wo_, bk, wk, bq, wq_, bqq, bc, bs,
+                lf_sel_n, sel_cmp);
+    }
+    free(lf_out); free(lf_kv); free(lf_qa); free(lf_q); free(lf_sel);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -16528,6 +16666,101 @@ int coli_v4_gpu_indexer_select_fused(
                v4_idx_env_int("DSV4_IDX_HW_FMA", 1), scores, queries_out,
                head_w_out)
         ? 0 : -1;
+}
+
+/* After the fused layer entered the token's kv row into the device ring:
+ * the continuity mark coli_v4_gpu_kv_cache_advance would have set. */
+void coli_v4_gpu_kv_cache_mark(const ColiDeepSeekV4LayerWeights *weights,
+                               int position, int window, int comp_total) {
+    int layer = weights ? weights->plan.layer : -1;
+    if (layer < 0 || layer >= V4_KV_CACHE_MAX_LAYERS) return;
+    v4_kv_upto[layer] = position + 1;
+    v4_kv_comp[layer] = comp_total;
+    v4_kv_window[layer] = window;
+}
+
+/* V4_LAYER_FUSED: the decode token's attention layer in one device round
+ * trip (dsv4_cuda_attn_decode_fused). The indexer's weights and keys are
+ * made resident as the fused selection does; the scoring and rank run on
+ * the device when the host would score (V4_IDX_IDENTITY as the indexer
+ * reads it), the identity selection is the comp cache's first rows.
+ * Fills output, kv (the row the ring took), qa (normalized), the
+ * compressor projections (for the host's advance), *sel_count. -1 =
+ * refused (nothing changed on the device). */
+int coli_v4_gpu_attention_decode_fused(
+    const ColiDeepSeekV4LayerWeights *weights, const float *input, int hidden,
+    int position, const ColiTensorView *wq_a, const ColiTensorView *wkv,
+    const ColiTensorView *wq_b, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, int has_comp, int has_idx, const void *q_norm_raw,
+    int q_rank, const void *kv_norm_raw, int head_dim, float eps,
+    const float *cosines, const float *sines, int rope_dim, const float *sinks,
+    int first, int comp_total, int heads, ColiDeepSeekV4Indexer *indexer,
+    int idx_count, int topk, const ColiTensorView *iwq, const uint16_t *ihw,
+    int idx_heads, int idx_dim, float *output, float *kv_out, float *qa_out,
+    float *ckv_out, float *cg_out, float *ikv_out, float *ig_out, int *sel_out,
+    int *sel_count, float *q_out) {
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !input || !wq_a || !wkv ||
+        !wq_b || !wo_a || !wo_b || !wq_a->gpu || !wkv->gpu || !wq_b->gpu || !wo_a->gpu ||
+        !wo_b->gpu || !q_norm_raw || !kv_norm_raw || !cosines || !sines || !sinks ||
+        !output || !kv_out || !qa_out || !sel_count || position < 0 || first < 0)
+        return -1;
+    int device = v4_gpu_layer_device(weights);
+    if (device < 0) return -1;
+    Dsv4CudaTensor *cwkv = NULL, *cwg = NULL, *iwkv = NULL, *iwg = NULL;
+    if (has_comp) {
+        cwkv = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.compressor.wkv");
+        cwg = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.compressor.wgate");
+        if (!cwkv || !cwg || !ckv_out || !cg_out) return -1;
+    }
+    if (has_idx) {
+        iwkv = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.indexer.compressor.wkv");
+        iwg = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.indexer.compressor.wgate");
+        if (!iwkv || !iwg || !ikv_out || !ig_out || !indexer) return -1;
+    }
+    /* the selection: the host scores unless the identity rule takes the token */
+    static int identity = -1;
+    if (identity < 0) { const char *e = getenv("V4_IDX_IDENTITY"); identity = e && *e == '1'; }
+    int idx_score = 0, idx_sel;
+    if (has_idx) {
+        if (idx_count < 0 || idx_count > comp_total) return -1;
+        idx_sel = idx_count < topk ? idx_count : topk;
+        idx_score = idx_count > 0 && !(identity && idx_count <= topk);
+    } else idx_sel = comp_total;
+    float had_scale = 0.f, weight_scale = 0.f;
+    if (idx_score) {
+        if (!coli_v4_gpu_indexer_fused_wanted() || !iwq || !ihw ||
+            iwq->format != COLI_TENSOR_FP8_E4M3_BLOCK || iwq->scale_format != COLI_SCALE_F32 ||
+            (iwq->block_rows != 128 && iwq->block_rows != 8) || iwq->block_columns != 128 ||
+            iwq->columns % 128 || (size_t)iwq->rows != (size_t)idx_heads * idx_dim ||
+            (int)iwq->columns != q_rank) return -1;
+        if (!dsv4_cuda_indexer_resident(device, weights->plan.layer, (const uint8_t *)iwq->data,
+                                        (const float *)iwq->scales, (int)iwq->rows,
+                                        (int)iwq->columns, iwq->block_rows == 8,
+                                        ihw, idx_heads, hidden)) return -1;
+        if (!dsv4_cuda_indexer_keys_sync(device, weights->plan.layer,
+                                         (unsigned long long)(uintptr_t)indexer,
+                                         coli_v4_indexer_compressed_values(indexer),
+                                         idx_count, idx_dim)) return -1;
+        had_scale = 1.0f / sqrtf((float)idx_dim);
+        weight_scale = 1.0f / sqrtf((float)(idx_dim * idx_heads));
+    }
+    int rc = dsv4_cuda_attn_decode_fused(
+        device, weights->plan.layer, input, hidden, (Dsv4CudaTensor *)wq_a->gpu,
+        (Dsv4CudaTensor *)wkv->gpu, cwkv, cwg, iwkv, iwg, (const uint16_t *)q_norm_raw,
+        q_rank, (const uint16_t *)kv_norm_raw, head_dim, eps,
+        v4_idx_env_int("DSV4_VNORM_FMA", 1), cosines, sines, rope_dim,
+        v4_idx_env_int("DSV4_WO_ROPE_FMA", 1), position, sinks, first, comp_total, heads,
+        1.0f / sqrtf((float)head_dim), idx_score, idx_count, idx_sel, idx_heads, idx_dim,
+        had_scale, weight_scale, v4_idx_env_int("DSV4_IDX_ROPE_FMA", 1),
+        v4_idx_env_int("DSV4_IDX_HW_FMA", 1), (Dsv4CudaTensor *)wq_b->gpu,
+        v4_idx_env_int("DSV4_Q_NORM_FMA", 1), (Dsv4CudaTensor *)wo_a->gpu, groups,
+        (Dsv4CudaTensor *)wo_b->gpu, output, kv_out, qa_out, ckv_out, cg_out, ikv_out,
+        ig_out, sel_out, q_out);
+    if (!rc) return -1;
+    *sel_count = idx_sel;
+    if (!idx_score && has_idx && sel_out)
+        for (int i = 0; i < idx_sel; i++) sel_out[i] = i;
+    return 0;
 }
 
 int coli_v4_gpu_attention_decode_chain(

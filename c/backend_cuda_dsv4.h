@@ -81,6 +81,19 @@ int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
  * out[wb->O]. att_out / oa_out: verify downloads. With qa (q NULL) the query
  * is made on the card first: wq_b mv kernel, bf16 round, per-head rmsnorm
  * (eps, norm_fma), forward RoPE; q_out: its verify download. */
+/* V4_LAYER_FUSED: a decode token's attention layer in one round trip (the
+ * projections, the norms, the indexer's selection and rank, the chain, the
+ * ring append); 1 = done (out, the kv row, qa, the compressor projections
+ * and the selected ordinals filled), 0 = refused or failed. */
+int dsv4_cuda_attn_decode_fused(int device,int layer,const float *x,int hidden,
+        Dsv4CudaTensor *wqa,Dsv4CudaTensor *wkv,Dsv4CudaTensor *cwkv,Dsv4CudaTensor *cwg,
+        Dsv4CudaTensor *iwkv,Dsv4CudaTensor *iwg,const uint16_t *qnw,int q_rank,
+        const uint16_t *kvw,int dim,float eps,int vnorm_fma,const float *icos,const float *isin,
+        int rope_dim,int rope_fma,int position,const float *sinks,int first,int comp_total,
+        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,
+        float had_scale,float wscale,int idx_rope_fma,int hw_fma,Dsv4CudaTensor *wqb,int norm_fma,
+        Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out,float *kv_out,float *qa_out,
+        float *ckv_out,float *cg_out,float *ikv_out,float *ig_out,int *sel_out,float *q_out);
 int dsv4_cuda_attn_decode_chain(int device,int layer,const float *q,const float *chunk,
                                 int chunk_start,const float *sinks,const int *meta,
                                 const int *sel,int selstride,int abs_base,int comp_limit,

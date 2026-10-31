@@ -57,7 +57,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap;
+struct Dev { void *stg;size_t stgcap; int id,sms; cudaStream_t stream,aux,pre; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap; void *lfh; size_t lfhcap; void *lfd; size_t lfdcap;
     /* decode expert group: the upload fence event, pinned staging for its
      * small copies (x, descriptors + weights, y), DSV4_MOE_KPROF sums */
     cudaEvent_t upfence; void *grp_hparams,*grp_params; float *hx_pin,*hy_pin; size_t grp_paramscap,grp_hcap; int grp_pinned;
@@ -162,7 +162,8 @@ template<int F,int R> __global__ void mv_rows(const uint8_t *w,const uint8_t *sc
  * step, a dependent load-then-add per 256 columns: wq_b's 1024-wide rows
  * at 355 GB/s where wo_a's 4096-wide ran 680). The partials' order is
  * unchanged (chunk c, then c+256, ...): bitwise. 1 = a chunk per step. */
-template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
+__device__ __forceinline__ float bf16_round_dev(float v);
+template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,int rnd){
     __shared__ float lut[256];
     lut[threadIdx.x]=e4m3((uint8_t)threadIdx.x);__syncthreads();
     int lane=threadIdx.x&31,o=blockIdx.x*8+(threadIdx.x>>5);if(o>=O)return;
@@ -206,7 +207,7 @@ template<int F,int U> __global__ void __launch_bounds__(256) mv_warp(const uint8
         p[k]+=__shfl_down_sync(0xffffffffu,p[k],2);
         p[k]+=__shfl_down_sync(0xffffffffu,p[k],1);
     }
-    if(!lane){float v0=p[0]+p[4],v1=p[1]+p[5],v2=p[2]+p[6],v3=p[3]+p[7];v0=v0+v2;v1=v1+v3;y[o]=v0+v1;}
+    if(!lane){float v0=p[0]+p[4],v1=p[1]+p[5],v2=p[2]+p[6],v3=p[3]+p[7];v0=v0+v2;v1=v1+v3;float r=v0+v1;y[o]=rnd?bf16_round_dev(r):r;}
 }
 /* The bf16 one (mm_bf16_batch with a batch of one, mv_bf16: the same
  * partials and tree): lane l's eight bf16 as one 16-byte load. */
@@ -240,9 +241,9 @@ static int mv_warp_verify(void){static int on=-1;if(on<0){const char*e=getenv("D
 static int mv_warp_unroll(void){static int u=-1;if(u<0){const char*e=getenv("DSV4_MV_WARP_UNROLL");u=e&&*e?atoi(e):1;if(u!=1&&u!=2&&u!=4)u=4;}return u;}
 template<int F> static void launch_mv_warp(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups,cudaStream_t st){
     int u=mv_warp_unroll();
-    if(u==4)mv_warp<F,4><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
-    else if(u==2)mv_warp<F,2><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
-    else mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups);
+    if(u==4)mv_warp<F,4><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
+    else if(u==2)mv_warp<F,2><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
+    else mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,0);
 }
 static bool mv_warp_fits(const void*w,const float*x,int I,int walign){return I>0&&I%256==0&&!((uintptr_t)x&15)&&!((uintptr_t)w&(walign-1));}
 __global__ void mv_warp_diff_kernel(const float*a,const float*b,int n,unsigned*cnt){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&__float_as_uint(a[i])!=__float_as_uint(b[i]))atomicAdd(cnt,1u);}
@@ -2125,6 +2126,56 @@ extern "C" int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long lo
     return 1;
 }
 
+/* The fused selection's launches over device pointers (the resident weights
+ * and keys of `layer`): the query projection into dq [tokens][rows], the prep
+ * in place, the head weights into dhw [tokens][heads], the scores into dsc
+ * [tokens][count]. ev (optional): the DSV4_IDX_KPROF events 1..3 between. */
+static int idx_select_launch(Dev*c,int layer,float*dq,float*dhw,float*dsc,const float*dx,const float*din,const float*dcos,
+        const float*dsin,const int*dcnt,int tokens,int heads,int dim,int rope_dim,int hidden,int count,float had_scale,
+        float wscale,int rope_fma,int hw_fma,cudaEvent_t*ev){
+    int cols=g_idx_cols[layer],rows=g_idx_rows[layer];size_t sm=(size_t)rows*4,xb=(size_t)tokens*cols*4;
+    if(tokens==1){
+        /* 64-thread blocks: 8192 rows as 128 blocks over the card's SMs
+         * instead of 32 (each thread's serial chain is unchanged) */
+        if(g_idx_packed[layer])
+            fp8_ref_matmul_rows8_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(dq,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+        else
+            fp8_ref_matmul_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(dq,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
+        if(!ok(cudaGetLastError(),"fused indexer projection launch"))return 0;
+    }else{
+        float*xt=(idx_coal_on()&&buf((void**)&c->p3,&c->p3cap,xb))?c->p3:nullptr;
+        if(!fp8_ref_matmul_launch(c,dq,g_idx_w[layer],g_idx_s[layer],dx,xt,rows,cols,g_idx_packed[layer],tokens))return 0;
+    }
+    if(ev)cudaEventRecord(ev[1],c->stream);
+    indexer_prep_kernel<<<dim3(heads,tokens),dim,(size_t)dim*4,c->stream>>>(dq,dcos,dsin,heads,dim,rope_dim,had_scale,rope_fma);
+    if(!ok(cudaGetLastError(),"fused indexer prep launch"))return 0;
+    if(ev)cudaEventRecord(ev[2],c->stream);
+    size_t wsh=2*32*sizeof(uint4)+(size_t)hidden*sizeof(float);
+    if(idx_headw_mode()==2&&hidden%HEADW_WCHUNK==0&&wsh<=48*1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
+        indexer_headw_warp_kernel<<<dim3(heads,tokens),32,wsh,c->stream>>>(dhw,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    else if(idx_headw_mode()==1&&tokens==1&&hidden%HEADW_CHUNK==0&&heads*HEADW_LANES<=1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
+        indexer_headw_lanes_kernel<<<1,heads*HEADW_LANES,(size_t)heads*HEADW_PAD,c->stream>>>(dhw,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    else
+        indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(dhw,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
+    if(!ok(cudaGetLastError(),"fused indexer head-weight launch"))return 0;
+    if(ev)cudaEventRecord(ev[3],c->stream);
+    size_t sm_small=((size_t)heads*(dim+1)+dim+heads)*4;
+    if(tokens<=4&&sm_small<=48*1024){
+        int K=idx_score_k();
+        if(K>1)indexer_score_multi_kernel<<<dim3((count+K-1)/K,tokens),heads,sm_small,c->stream>>>(dsc,dq,g_idx_keys[layer],dhw,dcnt,heads,dim,count,K);
+        else indexer_score_small_kernel<<<dim3(count,tokens),heads,sm_small,c->stream>>>(dsc,dq,g_idx_keys[layer],dhw,dcnt,heads,dim,count);
+    }else{
+        if(idx_coal_on()&&g_idx_keys_t[layer]){
+            if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_coal_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+            indexer_score_coal_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(dsc,dq,g_idx_keys_t[layer],g_idx_keys_cap[layer],dhw,dcnt,heads,dim,count);
+        }else{
+            if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+            indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(dsc,dq,g_idx_keys[layer],dhw,dcnt,heads,dim,count);
+        }
+    }
+    return ok(cudaGetLastError(),"fused indexer score launch");
+}
+
 /* x [tokens][cols] fp8-qdq'd query ranks, inputs [tokens][hidden], cosv/sinv
  * [tokens][rope_dim/2], counts[tokens]; scores [tokens][count]. One staged
  * upload, four launches, one download, one sync. */
@@ -2141,6 +2192,7 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     size_t xb=(size_t)tokens*cols*4,ib=(size_t)tokens*hidden*4,rb=(size_t)tokens*pairs*4,cb=(size_t)tokens*sizeof(int);
     size_t stage=xb+ib+2*rb+cb,qb=(size_t)tokens*rows*4,sb=(size_t)tokens*count*4,hb=(size_t)tokens*heads*4,sm=(size_t)rows*4;
     if(sm>96*1024||!ok(cudaSetDevice(device),"select fused indexer device"))return 0;
+    (void)xb;
     if(g_idx_stage_cap<stage){
         if(g_idx_stage)cudaFreeHost(g_idx_stage);
         g_idx_stage=NULL;g_idx_stage_cap=0;
@@ -2160,46 +2212,8 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
     cudaEvent_t ev[6];
     if(g_idx_kprof)for(int i=0;i<6;i++)cudaEventCreate(&ev[i]);
     if(g_idx_kprof)cudaEventRecord(ev[0],c->stream);
-    if(tokens==1){
-        /* 64-thread blocks: 8192 rows as 128 blocks over the card's SMs
-         * instead of 32 (each thread's serial chain is unchanged) */
-        if(g_idx_packed[layer])
-            fp8_ref_matmul_rows8_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
-        else
-            fp8_ref_matmul_t1_kernel<<<(rows+63)/64,64,0,c->stream>>>(c->p2,g_idx_w[layer],g_idx_s[layer],dx,rows,cols);
-        if(!ok(cudaGetLastError(),"fused indexer projection launch"))return 0;
-    }else{
-        float*xt=(idx_coal_on()&&buf((void**)&c->p3,&c->p3cap,xb))?c->p3:nullptr;
-        if(!fp8_ref_matmul_launch(c,c->p2,g_idx_w[layer],g_idx_s[layer],dx,xt,rows,cols,g_idx_packed[layer],tokens))return 0;
-    }
-    if(g_idx_kprof)cudaEventRecord(ev[1],c->stream);
-    indexer_prep_kernel<<<dim3(heads,tokens),dim,(size_t)dim*4,c->stream>>>(c->p2,dcos,dsin,heads,dim,rope_dim,had_scale,rope_fma);
-    if(!ok(cudaGetLastError(),"fused indexer prep launch"))return 0;
-    if(g_idx_kprof)cudaEventRecord(ev[2],c->stream);
-    size_t wsh=2*32*sizeof(uint4)+(size_t)hidden*sizeof(float);
-    if(idx_headw_mode()==2&&hidden%HEADW_WCHUNK==0&&wsh<=48*1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
-        indexer_headw_warp_kernel<<<dim3(heads,tokens),32,wsh,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
-    else if(idx_headw_mode()==1&&tokens==1&&hidden%HEADW_CHUNK==0&&heads*HEADW_LANES<=1024&&!((uintptr_t)g_idx_hw[layer]&15)&&!((uintptr_t)din&15))
-        indexer_headw_lanes_kernel<<<1,heads*HEADW_LANES,(size_t)heads*HEADW_PAD,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
-    else
-        indexer_headw_kernel<<<tokens,heads,0,c->stream>>>(c->aux3,g_idx_hw[layer],din,heads,hidden,wscale,hw_fma);
-    if(!ok(cudaGetLastError(),"fused indexer head-weight launch"))return 0;
-    if(g_idx_kprof)cudaEventRecord(ev[3],c->stream);
-    size_t sm_small=((size_t)heads*(dim+1)+dim+heads)*4;
-    if(tokens<=4&&sm_small<=48*1024){
-        int K=idx_score_k();
-        if(K>1)indexer_score_multi_kernel<<<dim3((count+K-1)/K,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count,K);
-        else indexer_score_small_kernel<<<dim3(count,tokens),heads,sm_small,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
-    }else{
-        if(idx_coal_on()&&g_idx_keys_t[layer]){
-            if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_coal_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
-            indexer_score_coal_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(c->p4,c->p2,g_idx_keys_t[layer],g_idx_keys_cap[layer],c->aux3,dcnt,heads,dim,count);
-        }else{
-            if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
-            indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(c->p4,c->p2,g_idx_keys[layer],c->aux3,dcnt,heads,dim,count);
-        }
-    }
-    if(!ok(cudaGetLastError(),"fused indexer score launch"))return 0;
+    if(!idx_select_launch(c,layer,c->p2,c->aux3,c->p4,dx,din,dcos,dsin,dcnt,tokens,heads,dim,rope_dim,hidden,count,
+                          had_scale,wscale,rope_fma,hw_fma,g_idx_kprof?ev:nullptr))return 0;
     if(g_idx_kprof)cudaEventRecord(ev[4],c->stream);
     if(!ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"fused indexer score download"))return 0;
     if(queries_out&&!ok(cudaMemcpyAsync(queries_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"fused indexer query download"))return 0;
@@ -2390,6 +2404,34 @@ extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,
     }
     return done;
 }
+/* The one-token cached sparse attention launch over device pointers (the
+ * split kernels, else v2, else the first kernels): out [heads][dim] from
+ * q, the ring and comp cache of `layer`, chunk (the token's kv row), the
+ * sinks, meta {wo, wn, cn}, sel (the selected ordinals, or NULL for the
+ * first cn comp rows). */
+static int attn_one_launch(Dev*c,int layer,size_t sm,float*out,const float*q,const float*chunk,const float*sink,const int*meta,
+        const int*sel,int cn,int abs_base,int chunk_start,int window,int heads,int dim,float scale,int total){
+    int split=sattn_split_on()&&sm*4<=48*1024&&buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm);
+    if(split&&sel)
+        launch_sattn_split<1>(c->ssc,heads,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,sel,
+            abs_base,chunk_start,window,dim,scale,total);
+    else if(split)
+        launch_sattn_split<0>(c->ssc,heads,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,nullptr,
+            abs_base,chunk_start,window,dim,scale,total);
+    else if(sel&&sattn_v2_on())
+        launch_sattn_v2<1>(heads,1,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,sel,
+            cn,abs_base,chunk_start,window,dim,scale);
+    else if(sel)
+        sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
+            out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,sel,cn,abs_base,chunk_start,window,heads,dim,scale);
+    else if(sattn_v2_on())
+        launch_sattn_v2<0>(heads,1,sm,c->stream,out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,nullptr,0,
+            abs_base,chunk_start,window,dim,scale);
+    else
+        sparse_attn_batch_cached_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
+            out,q,g_kv_ring[layer],chunk,g_kv_comp[layer],sink,meta,abs_base,chunk_start,window,heads,dim,scale);
+    return ok(cudaGetLastError(),"decode chain attention launch");
+}
 extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,const float*chunk,int chunk_start,
         const float*sinks,const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,
         float scale,const float*icos,const float*isin,int rope_dim,int rope_fma,Dsv4CudaTensor*wa,int groups,
@@ -2480,32 +2522,7 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
        (!qa&&(!ok(cudaMemcpyAsync(c->p1,icos,rb,cudaMemcpyHostToDevice,c->stream),"decode chain cos upload")||
               !ok(cudaMemcpyAsync((char*)c->p1+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"decode chain sin upload")))))return 0;
     if(kprof)cudaEventRecord(ex[2],c->stream);
-    int split=sattn_split_on()&&sm*4<=48*1024&&buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm);
-    if(split&&sel)
-        launch_sattn_split<1>(c->ssc,heads,sm,c->stream,
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
-            abs_base,chunk_start,window,dim,scale,total);
-    else if(split)
-        launch_sattn_split<0>(c->ssc,heads,sm,c->stream,
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,
-            abs_base,chunk_start,window,dim,scale,total);
-    else if(sel&&sattn_v2_on())
-        launch_sattn_v2<1>(heads,1,sm,c->stream,
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
-            cn,abs_base,chunk_start,window,dim,scale);
-    else if(sel)
-        sparse_attn_batch_cached_idx_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,
-            cn,abs_base,chunk_start,window,heads,dim,scale);
-    else if(sattn_v2_on())
-        launch_sattn_v2<0>(heads,1,sm,c->stream,
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,0,
-            abs_base,chunk_start,window,dim,scale);
-    else
-        sparse_attn_batch_cached_kernel<<<dim3(heads,1),256,sm,c->stream>>>(
-            c->p4,dq,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,
-            abs_base,chunk_start,window,heads,dim,scale);
-    if(!ok(cudaGetLastError(),"decode chain attention launch"))return 0;
+    if(!attn_one_launch(c,layer,sm,c->p4,dq,dchunk,dsink,dmeta,dsel,cn,abs_base,chunk_start,window,heads,dim,scale,total))return 0;
     if(kprof)cudaEventRecord(ev[0],c->stream);
     attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1);
     if(!ok(cudaGetLastError(),"decode chain rope launch"))return 0;
@@ -2537,6 +2554,282 @@ extern "C" int dsv4_cuda_attn_decode_chain(int device,int layer,const float*q,co
         for(int i=0;i<7;i++)cudaEventDestroy(ev[i]);for(int i=0;i<5;i++)cudaEventDestroy(ex[i]);
     }
     return done;
+}
+
+/* ---- V4_LAYER_FUSED: a decode token's attention layer in one round trip ----
+ * The three trips a layer took (the input's projections; the indexer's
+ * selection; the chain) and the host work between them (the qa and kv
+ * norms, the kv's RoPE and fp8 round trip, the query ranks' fp8 round
+ * trip for the indexer, the selection's rank) run on the stream from one
+ * upload (x, cos/sin, the sinks, meta, the two norm weights) to one
+ * download (out, the kv row, qa and the compressor projections the host's
+ * canonical state still needs). The token's kv row enters the ring on the
+ * device after the attention. Every kernel is the separate path's, or the
+ * host routine's arithmetic in its order: bitwise (V4_LAYER_FUSED_VERIFY).
+ * Not taken on a token that emits a compressed row (the host's compressor
+ * state produces it) nor on a layer's first token. */
+__device__ __forceinline__ float e4m3fn_rt_dev(float v){
+    /* coli_e4m3fn_decode(coli_e4m3fn_encode(v)): round to nearest even on
+     * the binary32 bits, subnormals multiples of 2^-9, saturation at 448 */
+    if(isnan(v))return NAN;
+    unsigned b=__float_as_uint(v);int neg=b>>31;float m=fabsf(v),num;
+    if(m==0.f)num=0.f;
+    else if(m>=448.f)num=448.f;
+    else if(m<0.015625f){float sc=__fmul_rn(m,512.f);unsigned r=(unsigned)sc;float fr=__fsub_rn(sc,(float)r);
+        if(fr>0.5f||(fr==0.5f&&(r&1u)))r++;num=ldexpf((float)r,-9);}
+    else{unsigned bits=__float_as_uint(m);int ex=(int)((bits>>23)&0xffu)-127;unsigned sig=0x800000u|(bits&0x7fffffu);
+        unsigned r=sig>>20,rem=sig&0xfffffu;if(rem>0x80000u||(rem==0x80000u&&(r&1u)))r++;if(r==16u){r=8u;ex++;}
+        num=ldexpf(1.0f+(float)(r-8u)*0.125f,ex);}
+    return neg?-num:num;
+}
+/* coli_fp8_activation_qdq_ref: per block of `block` values one thread runs
+ * the sequential max, the e8m0 scale (ceil log2 of max/448 by frexpf) and
+ * each value's clamp, e4m3 round trip and rescale; round = the bf16 round
+ * the kv and compressor paths apply after. out may alias in. */
+__device__ __forceinline__ void fp8_qdq_block(float*out,const float*in,int n,int block,int b,int round){
+    int base=b*block;if(base>=n)return;
+    int count=n-base<block?n-base:block;
+    float mx=0.f;for(int i=0;i<count;i++)mx=fmaxf(mx,fabsf(in[base+i]));
+    mx=fmaxf(mx,1e-4f);
+    int e;float fr=frexpf(__fdiv_rn(mx,448.f),&e);int ex=(fr==0.5f)?e-1:e;if(ex<-127)ex=-127;if(ex>127)ex=127;
+    float sc=ldexpf(1.0f,ex);
+    for(int i=0;i<count;i++){float nz=fmaxf(-448.f,fminf(448.f,__fdiv_rn(in[base+i],sc)));
+        float q=__fmul_rn(e4m3fn_rt_dev(nz),sc);out[base+i]=round?bf16_round_dev(q):q;}
+}
+__global__ void fp8_qdq_kernel(float*out,const float*in,int n,int block,int round){
+    fp8_qdq_block(out,in,n,block,blockIdx.x*blockDim.x+threadIdx.x,round);
+}
+/* one block's rmsnorm of v (bf16 round, the sequential mean square, the
+ * scale, (x * inverse_rms) * w, bf16 round), sv the block's shared copy */
+__device__ __forceinline__ void norm_block(float*v,const uint16_t*w,int n,float eps,int fma_on,float*sv,float*sc){
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)sv[i]=bf16_round_dev(v[i]);
+    __syncthreads();
+    if(!threadIdx.x){float ms=0.f;
+        if(fma_on)for(int i=0;i<n;i++)ms=fmaf(sv[i],sv[i],ms);
+        else for(int i=0;i<n;i++)ms=__fadd_rn(ms,__fmul_rn(sv[i],sv[i]));
+        *sc=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(__fdiv_rn(ms,(float)n),eps)));}
+    __syncthreads();
+    float s=*sc;
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)
+        v[i]=bf16_round_dev(__fmul_rn(__fmul_rn(sv[i],s),__uint_as_float((unsigned)w[i]<<16)));
+}
+/* pair i of the RoPE on the last rope_dim of v (attn_inv_rope_kernel's arithmetic) */
+__device__ __forceinline__ void rope_pair(float*v,const float*cosv,const float*sinv,int dim,int rope_dim,int i,int fma_mode,int inverse){
+    float*p=v+dim-rope_dim+2*i;
+    float re=p[0],im=p[1],c=cosv[i],sn=inverse?-sinv[i]:sinv[i];
+    float a,b;
+    if(fma_mode==1){a=fmaf(re,c,-__fmul_rn(im,sn));b=fmaf(im,c,__fmul_rn(re,sn));}
+    else if(fma_mode==2){a=fmaf(-im,sn,__fmul_rn(re,c));b=fmaf(re,sn,__fmul_rn(im,c));}
+    else{a=__fsub_rn(__fmul_rn(re,c),__fmul_rn(im,sn));b=__fadd_rn(__fmul_rn(re,sn),__fmul_rn(im,c));}
+    p[0]=bf16_round_dev(a);p[1]=bf16_round_dev(b);
+}
+/* The host's work between the projections and the chain in one launch:
+ * block 0 the qa norm (then the query ranks' fp8 round trip into xq for
+ * the indexer when xq_on), block 1 the kv norm, its RoPE, the fp8 round
+ * trip of its first dim-rope_dim values with the bf16 round, and the row's
+ * copy into its ring slot (the slot of position-window, which no row of
+ * this token's window reads). */
+__global__ void lf_prep_kernel(float*qa,const uint16_t*qnw,int q_rank,float*xq,int xq_on,float*kv,const uint16_t*kvw,int dim,
+        float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma,float*ring_row){
+    extern __shared__ float sv[];__shared__ float sc;
+    if(blockIdx.x==0){
+        norm_block(qa,qnw,q_rank,eps,fma_on,sv,&sc);
+        __syncthreads();
+        if(xq_on)fp8_qdq_block(xq,qa,q_rank,128,threadIdx.x,0);
+    }else{
+        norm_block(kv,kvw,dim,eps,fma_on,sv,&sc);
+        __syncthreads();
+        if(threadIdx.x<rope_dim/2)rope_pair(kv,cosv,sinv,dim,rope_dim,threadIdx.x,rope_fma,0);
+        __syncthreads();
+        fp8_qdq_block(kv,kv,dim-rope_dim,64,threadIdx.x,1);
+        __syncthreads();
+        for(int i=threadIdx.x;i<dim;i+=blockDim.x)ring_row[i]=kv[i];
+    }
+}
+/* The query's per-head rmsnorm (head_rmsnorm_ref_kernel) and forward RoPE
+ * in one launch; the bf16 round before them is the wq_b store's. */
+__global__ void q_norm_rope_kernel(float*q,int dim,float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma){
+    int h=blockIdx.x;float*v=q+(long long)h*dim;
+    extern __shared__ float sv[];__shared__ float sc;
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x)sv[i]=v[i];
+    __syncthreads();
+    if(!threadIdx.x){float ms=0.f;
+        if(fma_on)for(int i=0;i<dim;i++)ms=fmaf(sv[i],sv[i],ms);
+        else for(int i=0;i<dim;i++)ms=__fadd_rn(ms,__fmul_rn(sv[i],sv[i]));
+        sc=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(__fdiv_rn(ms,(float)dim),eps)));}
+    __syncthreads();
+    for(int i=threadIdx.x;i<dim;i+=blockDim.x)v[i]=bf16_round_dev(__fmul_rn(sv[i],sc));
+    __syncthreads();
+    if(threadIdx.x<rope_dim/2)rope_pair(v,cosv,sinv,dim,rope_dim,threadIdx.x,rope_fma,0);
+}
+/* The decode matvec over an fp8 mirror with the output's bf16 round folded
+ * into the store (the warp kernel's rnd); the block kernel plus a round
+ * pass where the warp kernel does not fit. */
+template<int F> static void run_mv_fused(const uint8_t*w,const uint8_t*sc,const float*x,float*y,int O,int I,int groups,int rnd,cudaStream_t st){
+    if(mv_warp_on()&&mv_warp_fits(w,x,I,8)){mv_warp<F,1><<<(O+7)/8,256,0,st>>>(w,sc,x,y,O,I,groups,rnd);return;}
+    run_mv<F>(w,sc,x,y,O,I,groups,st);
+    if(rnd)bf16_round_ref_kernel<<<(O+255)/256,256,0,st>>>(y,O);
+}
+static void run_mv_fused_fmt(Dsv4CudaTensor*t,const float*x,float*y,int groups,int rnd,cudaStream_t st){
+    if(t->fmt==9)run_mv_fused<9>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,groups,rnd,st);
+    else run_mv_fused<8>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,groups,rnd,st);
+}
+/* The host's bf16 round, coli_v4_rmsnorm (one sequential mean square,
+ * fma_on as the build contracts it; (x * inverse_rms) * w) and bf16 round:
+ * the qa norm (q_norm, q_rank) and the kv norm (kv_norm, dim). One block. */
+__global__ void vec_norm_kernel(float*v,const uint16_t*w,int n,float eps,int fma_on){
+    extern __shared__ float sv[];__shared__ float sc;
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)sv[i]=bf16_round_dev(v[i]);
+    __syncthreads();
+    if(!threadIdx.x){float ms=0.f;
+        if(fma_on)for(int i=0;i<n;i++)ms=fmaf(sv[i],sv[i],ms);
+        else for(int i=0;i<n;i++)ms=__fadd_rn(ms,__fmul_rn(sv[i],sv[i]));
+        sc=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(__fdiv_rn(ms,(float)n),eps)));}
+    __syncthreads();
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)
+        v[i]=bf16_round_dev(__fmul_rn(__fmul_rn(sv[i],sc),__uint_as_float((unsigned)w[i]<<16)));
+}
+/* The selection's rank (score descending, index ascending: the host's
+ * descending_score order, its radix sort) as a bitonic sort of composite
+ * keys (the host's order-preserving score key above the index) in shared
+ * memory, one block, n <= IDX_SORT_MAX; sel[k] = the k-th ranked index for
+ * k < min(n, topk): what the host's ranked list gives element for element. */
+#define IDX_SORT_MAX 4096
+__global__ void __launch_bounds__(1024) idx_topk_kernel(int*sel,const float*scores,int n,int topk){
+    __shared__ unsigned long long k[IDX_SORT_MAX];
+    int N=1;while(N<n)N<<=1;
+    for(int i=threadIdx.x;i<N;i+=blockDim.x){
+        unsigned long long v=~0ull;
+        if(i<n){unsigned u=__float_as_uint(scores[i]);u=(u&0x80000000u)?~u:(u|0x80000000u);
+            v=((unsigned long long)(~u)<<32)|(unsigned)i;}
+        k[i]=v;}
+    __syncthreads();
+    for(int size=2;size<=N;size<<=1)for(int stride=size>>1;stride>0;stride>>=1){
+        for(int i=threadIdx.x;i<N;i+=blockDim.x){int j=i^stride;
+            if(j>i){bool up=((i&size)==0);unsigned long long a=k[i],b=k[j];if((a>b)==up){k[i]=b;k[j]=a;}}}
+        __syncthreads();}
+    int m=n<topk?n:topk;
+    for(int i=threadIdx.x;i<m;i+=blockDim.x)sel[i]=(int)(k[i]&0xffffffffu);
+}
+static inline size_t lf_al(size_t v){return (v+255)/256*256;}
+extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,int hidden,
+        Dsv4CudaTensor*wqa,Dsv4CudaTensor*wkv,Dsv4CudaTensor*cwkv,Dsv4CudaTensor*cwg,Dsv4CudaTensor*iwkv,Dsv4CudaTensor*iwg,
+        const uint16_t*qnw,int q_rank,const uint16_t*kvw,int dim,float eps,int vnorm_fma,
+        const float*icos,const float*isin,int rope_dim,int rope_fma,int position,const float*sinks,int first,int comp_total,
+        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,float had_scale,float wscale,
+        int idx_rope_fma,int hw_fma,Dsv4CudaTensor*wqb,int norm_fma,Dsv4CudaTensor*wa,int groups,Dsv4CudaTensor*wb,
+        float*out,float*kv_out,float*qa_out,float*ckv_out,float*cg_out,float*ikv_out,float*ig_out,int*sel_out,float*q_out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!x||hidden<1||!wqa||!wkv||!qnw||!kvw||!icos||!isin||!sinks||!wqb||!wa||!wb||
+       !out||!kv_out||!qa_out||q_rank<1||q_rank>1024||dim<1||dim>1024||rope_dim<2||rope_dim>dim||(rope_dim&1)||position<0||
+       first<0||first>position||heads<1||groups<1||!(scale>0.f)||!g_kv_ring[layer])return 0;
+    if(wqa->device!=device||wkv->device!=device||wqb->device!=device||wa->device!=device||wb->device!=device)return 0;
+    if((wqa->fmt!=8&&wqa->fmt!=9)||wqa->I!=hidden||wqa->O!=q_rank||(wkv->fmt!=8&&wkv->fmt!=9)||wkv->I!=hidden||wkv->O!=dim)return 0;
+    if((wqb->fmt!=8&&wqb->fmt!=9)||wqb->I!=q_rank||(long long)wqb->O!=(long long)heads*dim)return 0;
+    if((wa->fmt!=8&&wa->fmt!=9)||wa->O%groups||(long long)wa->I*groups!=(long long)heads*dim||
+       (wb->fmt!=8&&wb->fmt!=9)||wb->I!=wa->O||wb->O!=hidden)return 0;
+    int ncomp=(cwkv&&cwg)?2:0,nidx=(iwkv&&iwg)?2:0;
+    if(ncomp&&(!ckv_out||!cg_out||cwkv->fmt!=16||cwg->fmt!=16||cwkv->I!=hidden||cwg->I!=hidden||cwkv->O>1024||cwg->O>1024||
+              cwkv->device!=device||cwg->device!=device))return 0;
+    if(nidx&&(!ikv_out||!ig_out||iwkv->fmt!=16||iwg->fmt!=16||iwkv->I!=hidden||iwg->I!=hidden||iwkv->O>1024||iwg->O>1024||
+             iwkv->device!=device||iwg->device!=device))return 0;
+    int window=g_kv_ring_rows[layer],wn=position-first+1;
+    if(wn<1||wn>window||comp_total<0||(comp_total&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_total)))return 0;
+    int cn=idx_sel;
+    if(cn<0||cn>comp_total)return 0;
+    if(idx_score){
+        if(!g_idx_w[layer]||!g_idx_keys[layer]||idx_count<1||idx_count>IDX_SORT_MAX||idx_count>g_idx_keys_n[layer]||
+           g_idx_keys_dim[layer]!=idx_dim||g_idx_rows[layer]!=idx_heads*idx_dim||g_idx_heads[layer]!=idx_heads||
+           g_idx_hidden[layer]!=hidden||g_idx_cols[layer]!=q_rank||idx_heads<1||idx_heads>1024||idx_dim<32||idx_dim>1024||
+           (idx_dim&(idx_dim-1))||cn>idx_count||cn<1)return 0;
+    }
+    int total=wn+cn,pairs=rope_dim/2,nope=dim-rope_dim;size_t sm=(size_t)total*4;
+    if(sm>96*1024||!ok(cudaSetDevice(device),"select fused layer device"))return 0;
+    /* layout: the upload block, the download block, the scratch */
+    size_t o=0;
+    size_t ox=o;o+=lf_al((size_t)hidden*4);size_t ocos=o;o+=lf_al((size_t)pairs*4);size_t osin=o;o+=lf_al((size_t)pairs*4);
+    size_t osink=o;o+=lf_al((size_t)heads*4);size_t ometa=o;o+=lf_al(4*sizeof(int));
+    size_t oqnw=o;o+=lf_al((size_t)q_rank*2);size_t okvw=o;o+=lf_al((size_t)dim*2);
+    size_t upb=o;
+    size_t oout=o;o+=lf_al((size_t)hidden*4);size_t okv=o;o+=lf_al((size_t)dim*4);size_t oqa=o;o+=lf_al((size_t)q_rank*4);
+    size_t ockv=o;o+=lf_al(ncomp?(size_t)cwkv->O*4:0);size_t ocg=o;o+=lf_al(ncomp?(size_t)cwg->O*4:0);
+    size_t oikv=o;o+=lf_al(nidx?(size_t)iwkv->O*4:0);size_t oig=o;o+=lf_al(nidx?(size_t)iwg->O*4:0);
+    size_t osel=o;o+=lf_al(idx_score?(size_t)cn*4:0);
+    size_t dlb=o-upb;
+    size_t oxq=o;o+=lf_al((size_t)q_rank*4);size_t oiq=o;o+=lf_al(idx_score?(size_t)g_idx_rows[layer]*4:0);
+    size_t oihw=o;o+=lf_al(idx_score?(size_t)idx_heads*4:0);size_t osc=o;o+=lf_al(idx_score?(size_t)idx_count*4:0);
+    size_t oq=o;o+=lf_al((size_t)heads*dim*4);size_t oatt=o;o+=lf_al((size_t)heads*dim*4);size_t ooa=o;o+=lf_al((size_t)wa->O*4);
+    size_t tot=o,hostb=upb+dlb;
+    if(c->lfhcap<hostb){free(c->lfh);c->lfh=malloc(hostb);c->lfhcap=c->lfh?hostb:0;if(!c->lfh)return 0;}
+    if(!buf((void**)&c->lfd,&c->lfdcap,tot))return 0;
+    char*h=(char*)c->lfh,*d=(char*)c->lfd;
+    memcpy(h+ox,x,(size_t)hidden*4);memcpy(h+ocos,icos,(size_t)pairs*4);memcpy(h+osin,isin,(size_t)pairs*4);
+    memcpy(h+osink,sinks,(size_t)heads*4);
+    int meta[4]={0,wn,cn,idx_count};memcpy(h+ometa,meta,sizeof(meta));
+    memcpy(h+oqnw,qnw,(size_t)q_rank*2);memcpy(h+okvw,kvw,(size_t)dim*2);
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_LF_KPROF");kprof=e&&*e&&*e!='0';}
+    cudaEvent_t ev[8];
+    if(kprof){for(int i=0;i<8;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
+    if(!ok(cudaMemcpyAsync(d,h,upb,cudaMemcpyHostToDevice,c->stream),"fused layer upload"))return 0;
+    const float*dx=(const float*)(d+ox),*dcos=(const float*)(d+ocos),*dsin=(const float*)(d+osin),*dsink=(const float*)(d+osink);
+    const int*dmeta=(const int*)(d+ometa);const uint16_t*dqnw=(const uint16_t*)(d+oqnw),*dkvw=(const uint16_t*)(d+okvw);
+    float*dout=(float*)(d+oout),*dkv=(float*)(d+okv),*dqa=(float*)(d+oqa),*dckv=(float*)(d+ockv),*dcg=(float*)(d+ocg),
+         *dikv=(float*)(d+oikv),*dig=(float*)(d+oig),*dxq=(float*)(d+oxq),*diq=(float*)(d+oiq),*dihw=(float*)(d+oihw),
+         *dsc=(float*)(d+osc),*dq=(float*)(d+oq),*datt=(float*)(d+oatt),*doa=(float*)(d+ooa);
+    int*dsel=(int*)(d+osel);
+    /* 1. the input's projections (the PROJ6 round trip's kernels) */
+    if(kprof)cudaEventRecord(ev[1],c->stream);
+    run_mv_fused_fmt(wqa,dx,dqa,1,0,c->stream);
+    run_mv_fused_fmt(wkv,dx,dkv,1,0,c->stream);
+    if(ncomp){launch_bf16_one((__nv_bfloat16*)cwkv->w,dx,dckv,cwkv->O,cwkv->I,c->stream);
+              launch_bf16_one((__nv_bfloat16*)cwg->w,dx,dcg,cwg->O,cwg->I,c->stream);}
+    if(nidx){launch_bf16_one((__nv_bfloat16*)iwkv->w,dx,dikv,iwkv->O,iwkv->I,c->stream);
+             launch_bf16_one((__nv_bfloat16*)iwg->w,dx,dig,iwg->O,iwg->I,c->stream);}
+    if(!ok(cudaGetLastError(),"fused layer projection launch"))return 0;
+    /* 2. the host's qa norm (and the query ranks' fp8 round trip); the kv
+     *    norm, RoPE, fp8 round trip and ring write: one launch */
+    if(kprof)cudaEventRecord(ev[2],c->stream);
+    {int nt=q_rank>dim?q_rank:dim;if(nt>1024)nt=1024;
+     lf_prep_kernel<<<2,nt,(size_t)(q_rank>dim?q_rank:dim)*4,c->stream>>>(dqa,dqnw,q_rank,dxq,idx_score,dkv,dkvw,dim,eps,vnorm_fma,
+        dcos,dsin,rope_dim,rope_fma,g_kv_ring[layer]+(size_t)(position%window)*dim);}
+    if(!ok(cudaGetLastError(),"fused layer prep launch"))return 0;
+    (void)nope;(void)pairs;
+    /* 3. the indexer's selection: the fused selection's launches, the rank */
+    if(kprof)cudaEventRecord(ev[3],c->stream);
+    if(idx_score){
+        if(!idx_select_launch(c,layer,diq,dihw,dsc,dxq,dx,dcos,dsin,dmeta+3,1,idx_heads,idx_dim,rope_dim,hidden,idx_count,
+                              had_scale,wscale,idx_rope_fma,hw_fma,nullptr))return 0;
+        idx_topk_kernel<<<1,1024,0,c->stream>>>(dsel,dsc,idx_count,cn);
+        if(!ok(cudaGetLastError(),"fused layer rank launch"))return 0;
+    }
+    /* 4. the chain: q (the wq_b store rounded, the norm and RoPE in one
+     *    launch), the attention, the tail with the rounds in the stores */
+    if(kprof)cudaEventRecord(ev[4],c->stream);
+    run_mv_fused_fmt(wqb,dqa,dq,1,1,c->stream);
+    q_norm_rope_kernel<<<heads,256,(size_t)dim*4,c->stream>>>(dq,dim,eps,norm_fma,dcos,dsin,rope_dim,rope_fma);
+    if(!ok(cudaGetLastError(),"fused layer q launch"))return 0;
+    if(kprof)cudaEventRecord(ev[5],c->stream);
+    if(!attn_one_launch(c,layer,sm,datt,dq,dkv,dsink,dmeta,idx_score?dsel:nullptr,cn,first,position,window,heads,dim,scale,total))return 0;
+    if(kprof)cudaEventRecord(ev[6],c->stream);
+    attn_inv_rope_kernel<<<heads,pairs,0,c->stream>>>(datt,dcos,dsin,dim,rope_dim,rope_fma,1);
+    run_mv_fused_fmt(wa,datt,doa,groups,1,c->stream);
+    run_mv_fused_fmt(wb,doa,dout,1,1,c->stream);
+    if(!ok(cudaGetLastError(),"fused layer tail launch"))return 0;
+    /* 5. one download, the sync, the scatter */
+    if(kprof)cudaEventRecord(ev[7],c->stream);
+    if(!ok(cudaMemcpyAsync(h+oout,d+oout,dlb,cudaMemcpyDeviceToHost,c->stream),"fused layer download"))return 0;
+    if(q_out&&!ok(cudaMemcpyAsync(q_out,dq,(size_t)heads*dim*4,cudaMemcpyDeviceToHost,c->stream),"fused layer q download"))return 0;
+    if(!ok(cudaStreamSynchronize(c->stream),"fused layer sync"))return 0;
+    if(kprof){float ms[7];for(int i=0;i<7;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
+        fprintf(stderr,"lfkprof layer=%d up=%.3f proj=%.3f prep=%.3f idx=%.3f q=%.3f attn=%.3f tail=%.3f ms cn=%d scored=%d\n",
+                layer,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],cn,idx_score);
+        for(int i=0;i<8;i++)cudaEventDestroy(ev[i]);}
+    memcpy(out,h+oout,(size_t)hidden*4);memcpy(kv_out,h+okv,(size_t)dim*4);memcpy(qa_out,h+oqa,(size_t)q_rank*4);
+    if(ncomp){memcpy(ckv_out,h+ockv,(size_t)cwkv->O*4);memcpy(cg_out,h+ocg,(size_t)cwg->O*4);}
+    if(nidx){memcpy(ikv_out,h+oikv,(size_t)iwkv->O*4);memcpy(ig_out,h+oig,(size_t)iwg->O*4);}
+    if(idx_score&&sel_out)memcpy(sel_out,h+osel,(size_t)cn*4);
+    return 1;
 }
 
 __global__ void sparse_attn_batch_kernel(float*out,const float*q,const float*vals,const float*sink,
