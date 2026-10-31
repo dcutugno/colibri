@@ -182,15 +182,8 @@ typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n
                                                 int tokens, float *const *ys);
 typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
                                                 float *const *ys);
-typedef int             (*fn_attn_decode_fused)(int device,int layer,const float *x,int hidden,
-        Dsv4CudaTensor *wqa,Dsv4CudaTensor *wkv,Dsv4CudaTensor *cwkv,Dsv4CudaTensor *cwg,
-        Dsv4CudaTensor *iwkv,Dsv4CudaTensor *iwg,const uint16_t *qnw,int q_rank,
-        const uint16_t *kvw,int dim,float eps,int vnorm_fma,const float *icos,const float *isin,
-        int rope_dim,int rope_fma,int position,const float *sinks,int first,int comp_total,
-        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,
-        float had_scale,float wscale,int idx_rope_fma,int hw_fma,Dsv4CudaTensor *wqb,int norm_fma,
-        Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out,float *kv_out,float *qa_out,
-        float *ckv_out,float *cg_out,float *ikv_out,float *ig_out,int *sel_out,float *q_out);
+typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_head_argmax_ref)(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
                                                 int chunk_start, const float *sinks, const int *meta,
                                                 const int *sel, int selstride, int abs_base, int comp_limit,
@@ -361,6 +354,7 @@ static struct {
     fn_indexer_select_fused indexer_select_fused;
     fn_attn_decode_chain attn_decode_chain;
     fn_attn_decode_fused attn_decode_fused;   /* optional: the layer in one round trip (V4_LAYER_FUSED) */
+    fn_head_argmax_ref head_argmax_ref;       /* optional: the output head on the device (V4_GPU_HEAD) */
     fn_matmul_bf16_multi matmul_bf16_multi;
     fn_decode_proj_multi decode_proj_multi;   /* optional: one-token projections in one round trip */
     fn_tensor_refill_fp4 tensor_refill_fp4;
@@ -619,6 +613,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.mirror_copy = (fn_mirror_copy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_copy");
     g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
     g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
+    g_dsv4.head_argmax_ref = (fn_head_argmax_ref)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_argmax_ref");
     g_dsv4.mirror_point = (fn_mirror_point)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_point");
     g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
     g_dsv4.host_pin = (fn_host_pin)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_pin");
@@ -993,20 +988,13 @@ int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x
     return g_dsv4.decode_proj_multi(ts, n, x, ys);
 }
 
-int dsv4_cuda_attn_decode_fused(int device,int layer,const float *x,int hidden,
-        Dsv4CudaTensor *wqa,Dsv4CudaTensor *wkv,Dsv4CudaTensor *cwkv,Dsv4CudaTensor *cwg,
-        Dsv4CudaTensor *iwkv,Dsv4CudaTensor *iwg,const uint16_t *qnw,int q_rank,
-        const uint16_t *kvw,int dim,float eps,int vnorm_fma,const float *icos,const float *isin,
-        int rope_dim,int rope_fma,int position,const float *sinks,int first,int comp_total,
-        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,
-        float had_scale,float wscale,int idx_rope_fma,int hw_fma,Dsv4CudaTensor *wqb,int norm_fma,
-        Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out,float *kv_out,float *qa_out,
-        float *ckv_out,float *cg_out,float *ikv_out,float *ig_out,int *sel_out,float *q_out){
+int dsv4_cuda_head_argmax_ref(Dsv4CudaTensor *t,const float *x,int *id,float *value){
+    if(!g_dsv4.available||!g_dsv4.head_argmax_ref) return 0;   /* older DLL: the CPU head */
+    return g_dsv4.head_argmax_ref(t,x,id,value);
+}
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){
     if(!g_dsv4.available||!g_dsv4.attn_decode_fused) return 0;   /* older DLL: the three trips */
-    return g_dsv4.attn_decode_fused(device,layer,x,hidden,wqa,wkv,cwkv,cwg,iwkv,iwg,qnw,q_rank,kvw,dim,eps,vnorm_fma,
-        icos,isin,rope_dim,rope_fma,position,sinks,first,comp_total,heads,scale,idx_score,idx_count,idx_sel,idx_heads,
-        idx_dim,had_scale,wscale,idx_rope_fma,hw_fma,wqb,norm_fma,wa,groups,wb,out,kv_out,qa_out,ckv_out,cg_out,
-        ikv_out,ig_out,sel_out,q_out);
+    return g_dsv4.attn_decode_fused(a);
 }
 
 int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,

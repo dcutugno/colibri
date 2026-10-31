@@ -46,6 +46,7 @@ EXPORTS
     dsv4_cuda_matmul_bf16_multi
     dsv4_cuda_decode_proj_multi
     dsv4_cuda_attn_decode_fused
+    dsv4_cuda_head_argmax_ref
     dsv4_cuda_sparse_attn_batch
     dsv4_cuda_sparse_attn_batch_cached
     dsv4_cuda_sparse_attn_batch_cached_idx

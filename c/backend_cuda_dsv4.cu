@@ -1809,6 +1809,7 @@ static int g_idx_rows[DSV4_KV_CACHE_LAYERS],g_idx_cols[DSV4_KV_CACHE_LAYERS],g_i
            g_idx_heads[DSV4_KV_CACHE_LAYERS],g_idx_hidden[DSV4_KV_CACHE_LAYERS],g_idx_dev[DSV4_KV_CACHE_LAYERS];
 static float *g_idx_keys[DSV4_KV_CACHE_LAYERS];
 static float *g_idx_keys_t[DSV4_KV_CACHE_LAYERS];   /* DSV4_IDX_COAL: [dim][cap] copy, refreshed on append */
+static int g_idx_keys_t_n[DSV4_KV_CACHE_LAYERS];     /* rows the transposed copy holds (the fused layer appends without it) */
 static int g_idx_keys_cap[DSV4_KV_CACHE_LAYERS],g_idx_keys_n[DSV4_KV_CACHE_LAYERS],g_idx_keys_dim[DSV4_KV_CACHE_LAYERS];
 static unsigned long long g_idx_keys_owner[DSV4_KV_CACHE_LAYERS];
 static void *g_idx_stage;static size_t g_idx_stage_cap;
@@ -2189,8 +2190,10 @@ extern "C" int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long lo
             if(!g_idx_keys_t[layer]&&
                !alloc_ok(cudaMalloc((void**)&g_idx_keys_t[layer],(size_t)g_idx_keys_cap[layer]*dim*4),"indexer key transpose"))
                 g_idx_keys_t[layer]=nullptr;
-            if(g_idx_keys_t[layer])transpose_f32(g_idx_keys_t[layer],g_idx_keys[layer],count,dim,g_idx_keys_cap[layer],c->stream);
+            if(g_idx_keys_t[layer]){transpose_f32(g_idx_keys_t[layer],g_idx_keys[layer],count,dim,g_idx_keys_cap[layer],c->stream);g_idx_keys_t_n[layer]=count;}
         }}
+    else if(idx_coal_on()&&g_idx_keys_t[layer]&&g_idx_keys_t_n[layer]<count){
+        transpose_f32(g_idx_keys_t[layer],g_idx_keys[layer],count,dim,g_idx_keys_cap[layer],c->stream);g_idx_keys_t_n[layer]=count;}
     return 1;
 }
 
@@ -2700,10 +2703,23 @@ __device__ __forceinline__ void rope_pair(float*v,const float*cosv,const float*s
  * trip of its first dim-rope_dim values with the bf16 round, and the row's
  * copy into its ring slot (the slot of position-window, which no row of
  * this token's window reads). */
+struct LfCs{float*kv,*sc;const float*ape;const uint16_t*norm;const float*proj_kv,*proj_gate;float*cache;int rows,proj,dim,ratio,fp4;};
 __global__ void lf_prep_kernel(float*qa,const uint16_t*qnw,int q_rank,float*xq,int xq_on,float*kv,const uint16_t*kvw,int dim,
-        float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma,float*ring,const int*mp){
+        float eps,int fma_on,const float*cosv,const float*sinv,int rope_dim,int rope_fma,float*ring,const int*mp,LfCs c0,LfCs c1){
     extern __shared__ float sv[];__shared__ float sc;
     float*ring_row=ring+(size_t)mp[6]*dim;
+    if(blockIdx.x>=2){
+        /* the compressor's state row for this token: kv_row = the kv
+         * projection, score_row = the gate projection + ape[slot]
+         * (coli_v4_compressor_advance), slot = position % ratio */
+        LfCs k=blockIdx.x==2?c0:c1;
+        int slot=mp[9],row=k.ratio==4?k.ratio+slot:slot;
+        for(int i=threadIdx.x;i<k.proj;i+=blockDim.x){
+            k.kv[(size_t)row*k.proj+i]=k.proj_kv[i];
+            k.sc[(size_t)row*k.proj+i]=__fadd_rn(k.proj_gate[i],k.ape[(size_t)slot*k.proj+i]);
+        }
+        return;
+    }
     if(blockIdx.x==0){
         norm_block(qa,qnw,q_rank,eps,fma_on,sv,&sc);
         __syncthreads();
@@ -2716,6 +2732,70 @@ __global__ void lf_prep_kernel(float*qa,const uint16_t*qnw,int q_rank,float*xq,i
         fp8_qdq_block(kv,kv,dim-rope_dim,64,threadIdx.x,1);
         __syncthreads();
         for(int i=threadIdx.x;i<dim;i+=blockDim.x)ring_row[i]=kv[i];
+    }
+}
+/* The compressor's emit (compressor_pool_and_emit) for compressor k =
+ * blockIdx.x: per column the max over the pool rows (rows past ratio read
+ * column + dim, the comparison form), the exponentials' total and the
+ * weighted sum in row order (pool_fma: the weighted accumulate fused, as
+ * the build contracts it), weighted / total, bf16 round; the rmsnorm with
+ * the compressor's norm, bf16; the RoPE at position + 1 - ratio (ecos,
+ * esin), bf16; then the fp8 round trip of the first dim - rope_dim values
+ * (block 64) or, rotate_fp4, the hadamard + fp4 round trip of the whole
+ * row (indexer_prep_kernel's), bf16; the row into the cache at its index
+ * (meta[7] the attention's, [8] the indexer's); and, ratio 4, rows 4..7
+ * of the state down to 0..3. */
+__global__ void lf_emit_kernel(LfCs c0,LfCs c1,float eps,int fma_on,int pool_fma,const float*ecos,const float*esin,int rope_dim,int rope_fma,const int*mp){
+    LfCs k=blockIdx.x==0?c0:c1;
+    extern __shared__ float s[];__shared__ float bsc[32];__shared__ float scl;
+    int dim=k.dim,proj=k.proj,ratio=k.ratio,c=threadIdx.x,pool_rows=ratio==4?2*ratio:ratio;
+    if(c<dim){
+        float maximum=-INFINITY;
+        for(int r=0;r<pool_rows;r++){int col=(ratio==4&&r>=ratio)?c+dim:c;float score=k.sc[(size_t)r*proj+col];if(score>maximum)maximum=score;}
+        float total=0.f,weighted=0.f;
+        for(int r=0;r<pool_rows;r++){int col=(ratio==4&&r>=ratio)?c+dim:c;
+            float weight=expf(__fsub_rn(k.sc[(size_t)r*proj+col],maximum));
+            total=__fadd_rn(total,weight);
+            float v=k.kv[(size_t)r*proj+col];
+            weighted=pool_fma?fmaf(v,weight,weighted):__fadd_rn(weighted,__fmul_rn(v,weight));}
+        s[c]=bf16_round_dev(__fdiv_rn(weighted,total));
+    }
+    __syncthreads();
+    if(!c){float ms=0.f;
+        if(fma_on)for(int i=0;i<dim;i++)ms=fmaf(s[i],s[i],ms);
+        else for(int i=0;i<dim;i++)ms=__fadd_rn(ms,__fmul_rn(s[i],s[i]));
+        scl=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(__fdiv_rn(ms,(float)dim),eps)));}
+    __syncthreads();
+    if(c<dim)s[c]=bf16_round_dev(__fmul_rn(__fmul_rn(s[c],scl),__uint_as_float((unsigned)k.norm[c]<<16)));
+    __syncthreads();
+    if(c<rope_dim/2)rope_pair(s,ecos,esin,dim,rope_dim,c,rope_fma,0);
+    __syncthreads();
+    if(k.fp4){
+        for(int width=1;width<dim;width*=2){
+            if(c<dim/2){int base=(c/width)*2*width,j=c-(c/width)*width;float l=s[base+j],r=s[base+width+j];
+                s[base+j]=__fadd_rn(l,r);s[base+width+j]=__fsub_rn(l,r);}
+            __syncthreads();}
+        float had_scale=__fdiv_rn(1.0f,__fsqrt_rn((float)dim));
+        if(c<dim)s[c]=bf16_round_dev(__fmul_rn(s[c],had_scale));
+        __syncthreads();
+        if(c<dim/32){float m=0.f;for(int q=0;q<32;q++)m=fmaxf(m,fabsf(s[c*32+q]));
+            m=fmaxf(m,6.0f*ldexpf(1.0f,-126));int e;float fr=frexpf(__fdiv_rn(m,6.0f),&e);int ex=(fr==0.5f)?e-1:e;
+            if(ex<-127)ex=-127;if(ex>127)ex=127;bsc[c]=ldexpf(1.0f,ex);}
+        __syncthreads();
+        if(c<dim){float sc4=bsc[c>>5];float v=fmaxf(-6.0f,fminf(6.0f,__fdiv_rn(s[c],sc4)));
+            int best=0;float d=fabsf(__fsub_rn(v,c_idx_e2m1[0]));
+            for(int code=1;code<16;code++){float cd=fabsf(__fsub_rn(v,c_idx_e2m1[code]));if(cd<d){d=cd;best=code;}}
+            s[c]=bf16_round_dev(__fmul_rn(c_idx_e2m1[best],sc4));}
+    }else{
+        fp8_qdq_block(s,s,dim-rope_dim,64,c,1);
+    }
+    __syncthreads();
+    int index=blockIdx.x==0?mp[7]:mp[8];
+    if(c<dim)k.cache[(size_t)index*dim+c]=s[c];
+    if(ratio==4&&c<dim){
+        for(int r=0;r<4;r++){
+            k.kv[(size_t)r*proj+c]=k.kv[(size_t)(r+4)*proj+c];k.kv[(size_t)r*proj+c+dim]=k.kv[(size_t)(r+4)*proj+c+dim];
+            k.sc[(size_t)r*proj+c]=k.sc[(size_t)(r+4)*proj+c];k.sc[(size_t)r*proj+c+dim]=k.sc[(size_t)(r+4)*proj+c+dim];}
     }
 }
 /* The query's per-head rmsnorm (head_rmsnorm_ref_kernel) and forward RoPE
@@ -2785,29 +2865,128 @@ __global__ void __launch_bounds__(1024) idx_topk_kernel(int*sel,const float*scor
     for(int i=threadIdx.x;i<m;i+=blockDim.x)sel[i]=(int)(k[i]&0xffffffffu);
 }
 static inline size_t lf_al(size_t v){return (v+255)/256*256;}
+
+/* ---- V4_GPU_HEAD: the output head on the device, the CPU's arithmetic ----
+ * head_bf16_dot sums one row's 4096 products (bf16 weight exact in fp32,
+ * times the fp32 hidden, each product rounded) in column order, one
+ * sequential fp32 chain. A warp per row: lane l holds the eight products
+ * of columns c + 8l .. c + 8l + 7 of each 256-column chunk (one 16-byte
+ * load; the next chunk's load in flight), lane 0 adds them in column order
+ * as the lanes shuffle them over. The argmax is the first maximum in
+ * vocabulary order (head_scores_argmax: strictly greater wins). */
+__global__ void __launch_bounds__(256) head_dot_warp_kernel(float*scores,const __nv_bfloat16*w,const float*x,int vocab,int d){
+    extern __shared__ float xs[];
+    for(int i=threadIdx.x;i<d;i+=blockDim.x)xs[i]=x[i];
+    __syncthreads();
+    int lane=threadIdx.x&31,row=blockIdx.x*8+(threadIdx.x>>5);
+    if(row>=vocab)return;
+    const __nv_bfloat16*wr=w+(long long)row*d;
+    float sum=0.f;
+    uint4 cur=*(const uint4*)(wr+8*lane);
+    for(int c=0;c<d;c+=256){
+        uint4 nxt=make_uint4(0u,0u,0u,0u);
+        if(c+256<d)nxt=*(const uint4*)(wr+c+256+8*lane);
+        unsigned u[4]={cur.x,cur.y,cur.z,cur.w};
+        float p[8];
+        #pragma unroll
+        for(int k=0;k<8;k++){float wv=__uint_as_float((k&1)?(u[k>>1]&0xffff0000u):(u[k>>1]<<16));p[k]=__fmul_rn(wv,xs[c+8*lane+k]);}
+        #pragma unroll
+        for(int j=0;j<32;j++){
+            #pragma unroll
+            for(int k=0;k<8;k++){float v=__shfl_sync(0xffffffffu,p[k],j);sum=__fadd_rn(sum,v);}
+        }
+        cur=nxt;
+    }
+    if(!lane)scores[row]=sum;
+}
+__global__ void __launch_bounds__(1024) head_argmax_first_kernel(const float*scores,int vocab,int*id,float*value){
+    __shared__ float bv[1024];__shared__ int bi[1024];
+    float m=-3.402823466e+38f;int mi=-1;
+    for(int i=threadIdx.x;i<vocab;i+=blockDim.x){float v=scores[i];if(v>m){m=v;mi=i;}}
+    bv[threadIdx.x]=m;bi[threadIdx.x]=mi;
+    __syncthreads();
+    for(int n=512;n;n>>=1){
+        if(threadIdx.x<n){float a=bv[threadIdx.x],b=bv[threadIdx.x+n];int ia=bi[threadIdx.x],ib=bi[threadIdx.x+n];
+            if(b>a||(b==a&&ib>=0&&(ia<0||ib<ia))){bv[threadIdx.x]=b;bi[threadIdx.x]=ib;}}
+        __syncthreads();}
+    if(!threadIdx.x){*id=bi[0];*value=bv[0];}
+}
+extern "C" int dsv4_cuda_head_argmax_ref(Dsv4CudaTensor*t,const float*x,int*id,float*value){
+    Dev*c=t?ctx(t->device):nullptr;
+    if(!c||!x||!id||!value||t->fmt!=16||t->O<1||t->I<256||t->I%256||!ok(cudaSetDevice(t->device),"select head device"))return 0;
+    int O=t->O,I=t->I;
+    if(!buf((void**)&c->dx,&c->xcap,(size_t)I*4)||!buf((void**)&c->dy,&c->ycap,(size_t)O*4)||
+       !buf((void**)&c->expert_ids,&c->expert_idcap,sizeof(int))||!buf((void**)&c->expert_weights,&c->expert_weightscap,sizeof(float)))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,(size_t)I*4,cudaMemcpyHostToDevice,c->stream),"head input upload"))return 0;
+    head_dot_warp_kernel<<<(O+7)/8,256,(size_t)I*4,c->stream>>>(c->dy,(const __nv_bfloat16*)t->w,c->dx,O,I);
+    head_argmax_first_kernel<<<1,1024,0,c->stream>>>(c->dy,O,c->expert_ids,c->expert_weights);
+    if(!ok(cudaGetLastError(),"head launch")||
+       !ok(cudaMemcpyAsync(id,c->expert_ids,sizeof(int),cudaMemcpyDeviceToHost,c->stream),"head id download")||
+       !ok(cudaMemcpyAsync(value,c->expert_weights,sizeof(float),cudaMemcpyDeviceToHost,c->stream),"head logit download"))return 0;
+    return ok(cudaStreamSynchronize(c->stream),"head sync");
+}
 /* DSV4_LF_GRAPH (1): the fused layer's launches captured once per layer
- * into a CUDA graph and replayed per token (one submission where ~20
- * launches each paid the WDDM launch gap). Everything the captured nodes
- * bake in is token-free: the buffers (a per-device block laid out at the
- * layer's maxima, the pinned host block), the grids (sized for the most
- * rows: the kernels stop at the token's counts), the weights and caches
- * (their pointers); the token's scalars travel in the uploaded meta block
- * (meta[4] abs_base, [5] chunk_start, [6] the ring slot, [2] cn, [3] the
- * candidate count). A graph is recaptured when any baked pointer or shape
- * changed (a grown cache, a grown block). 0 = the launches issued directly. */
+ * (and per emit / no-emit) into a CUDA graph and replayed per token (one
+ * submission where ~20 launches each paid the WDDM launch gap). Everything
+ * the captured nodes bake in is token-free: the buffers (a per-device
+ * block laid out at the layer's maxima, the pinned host block), the grids
+ * (sized for the most rows: the kernels stop at the token's counts), the
+ * weights, caches and state mirrors (their pointers); the token's scalars
+ * travel in the uploaded meta block (meta[4] abs_base, [5] chunk_start,
+ * [6] the ring slot, [2] cn, [3] the candidate count, [7]/[8] the emitted
+ * rows' indices, [9] the compressor slot). A graph is recaptured when any
+ * baked pointer or shape changed (a grown cache, a grown block). 0 = the
+ * launches issued directly. */
 static int lf_graph_on(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_LF_GRAPH");on=!(e&&*e=='0');}return on;}
-struct LfSig{const void*lfd,*lfh,*ssc,*ring,*comp,*keys,*wqa,*wkv,*wqb,*wa,*wb,*cwkv,*cwg,*iwkv,*iwg,*iw,*is,*ihw;
+static int lf_pool_fma(void){static int on=-1;if(on<0){const char*e=getenv("DSV4_CS_POOL_FMA");on=!(e&&*e=='0');}return on;}
+struct LfSig{const void*lfd,*lfh,*ssc,*ring,*comp,*keys,*wqa,*wkv,*wqb,*wa,*wb,*cwkv,*cwg,*iwkv,*iwg,*iw,*is,*ihw,*cs[8];
     int hidden,q_rank,dim,heads,groups,waO,idx_score,idx_heads,idx_dim,window,max_total,cn_max,rope_dim,ncomp,nidx,cO,gO,ikO,igO,
-        vnorm_fma,rope_fma,idx_rope_fma,hw_fma,norm_fma,ds,K,headw,unroll;float eps,scale,had_scale,wscale;};
+        vnorm_fma,rope_fma,idx_rope_fma,hw_fma,norm_fma,ds,K,headw,unroll,emit,ratio,pool_fma;float eps,scale,had_scale,wscale;};
 struct LfGraph{cudaGraphExec_t exec;cudaGraph_t graph;int valid;LfSig sig;};
-static LfGraph g_lf[16][DSV4_KV_CACHE_LAYERS];
-extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,int hidden,
-        Dsv4CudaTensor*wqa,Dsv4CudaTensor*wkv,Dsv4CudaTensor*cwkv,Dsv4CudaTensor*cwg,Dsv4CudaTensor*iwkv,Dsv4CudaTensor*iwg,
-        const uint16_t*qnw,int q_rank,const uint16_t*kvw,int dim,float eps,int vnorm_fma,
-        const float*icos,const float*isin,int rope_dim,int rope_fma,int position,const float*sinks,int first,int comp_total,
-        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,float had_scale,float wscale,
-        int idx_rope_fma,int hw_fma,Dsv4CudaTensor*wqb,int norm_fma,Dsv4CudaTensor*wa,int groups,Dsv4CudaTensor*wb,
-        float*out,float*kv_out,float*qa_out,float*ckv_out,float*cg_out,float*ikv_out,float*ig_out,int*sel_out,float*q_out){
+static LfGraph g_lf[16][DSV4_KV_CACHE_LAYERS][2];
+/* the compressors' state mirrors: [0] the attention's, [1] the indexer's */
+static float *g_cs_kv[2][DSV4_KV_CACHE_LAYERS],*g_cs_sc[2][DSV4_KV_CACHE_LAYERS],*g_cs_ape[2][DSV4_KV_CACHE_LAYERS];
+static uint16_t *g_cs_norm[2][DSV4_KV_CACHE_LAYERS];
+static size_t g_cs_cap[2][DSV4_KV_CACHE_LAYERS],g_cs_apecap[2][DSV4_KV_CACHE_LAYERS],g_cs_normcap[2][DSV4_KV_CACHE_LAYERS];
+static int g_cs_upto[DSV4_KV_CACHE_LAYERS];   /* position + 1 of the last state row the device wrote; 0 none */
+static int lf_comp_reserve(Dev*c,int layer,int have,int need,int dim){
+    if(g_kv_comp_cap[layer]>=need)return 1;
+    int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
+    while(cap<need)cap*=2;
+    float*grown=NULL;
+    if(!alloc_ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"kv comp allocation"))return 0;
+    if(g_kv_comp[layer]&&have&&
+       !ok(cudaMemcpyAsync(grown,g_kv_comp[layer],(size_t)have*dim*4,cudaMemcpyDeviceToDevice,c->stream),"kv comp grow copy")){cudaFree(grown);return 0;}
+    if(g_kv_comp[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_kv_comp[layer]);}
+    g_kv_comp[layer]=grown;g_kv_comp_cap[layer]=cap;
+    return 1;
+}
+static int lf_keys_reserve(Dev*c,int layer,int need,int dim){
+    if(g_idx_keys_cap[layer]>=need)return 1;
+    int cap=g_idx_keys_cap[layer]?g_idx_keys_cap[layer]:512;
+    while(cap<need)cap*=2;
+    float*grown=NULL;
+    if(!alloc_ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"indexer key residency"))return 0;
+    int have=g_idx_keys_n[layer];
+    if(g_idx_keys[layer]&&have&&
+       !ok(cudaMemcpyAsync(grown,g_idx_keys[layer],(size_t)have*dim*4,cudaMemcpyDeviceToDevice,c->stream),"indexer key grow copy")){cudaFree(grown);return 0;}
+    if(g_idx_keys[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_idx_keys[layer]);}
+    g_idx_keys[layer]=grown;g_idx_keys_cap[layer]=cap;
+    if(g_idx_keys_t[layer]){cudaFree(g_idx_keys_t[layer]);g_idx_keys_t[layer]=nullptr;g_idx_keys_t_n[layer]=0;}
+    return 1;
+}
+extern "C" int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs*a){
+    if(!a)return 0;
+    int device=a->device,layer=a->layer,hidden=a->hidden,q_rank=a->q_rank,dim=a->dim,rope_dim=a->rope_dim,position=a->position,
+        first=a->first,comp_total=a->comp_total,heads=a->heads,groups=a->groups,idx_score=a->idx_score,idx_count=a->idx_count,
+        idx_sel=a->idx_sel,idx_heads=a->idx_heads,idx_dim=a->idx_dim,vnorm_fma=a->vnorm_fma,rope_fma=a->rope_fma,norm_fma=a->norm_fma,
+        idx_rope_fma=a->idx_rope_fma,hw_fma=a->hw_fma,emit=a->emit,ratio=a->ratio;
+    float eps=a->eps,scale=a->scale,had_scale=a->had_scale,wscale=a->wscale;
+    const float*x=a->x,*icos=a->icos,*isin=a->isin,*sinks=a->sinks;
+    Dsv4CudaTensor*wqa=a->wqa,*wkv=a->wkv,*cwkv=a->cwkv,*cwg=a->cwg,*iwkv=a->iwkv,*iwg=a->iwg,*wqb=a->wqb,*wa=a->wa,*wb=a->wb;
+    const uint16_t*qnw=a->qnw,*kvw=a->kvw;
+    float*out=a->out,*kv_out=a->kv_out,*qa_out=a->qa_out,*ckv_out=a->ckv_out,*cg_out=a->cg_out,*ikv_out=a->ikv_out,*ig_out=a->ig_out,*q_out=a->q_out;
+    int*sel_out=a->sel_out;
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!x||hidden<1||!wqa||!wkv||!qnw||!kvw||!icos||!isin||!sinks||!wqb||!wa||!wb||
        !out||!kv_out||!qa_out||q_rank<1||q_rank>1024||dim<1||dim>1024||rope_dim<2||rope_dim>dim||(rope_dim&1)||position<0||
@@ -2822,20 +3001,32 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
               cwkv->device!=device||cwg->device!=device))return 0;
     if(nidx&&(!ikv_out||!ig_out||iwkv->fmt!=16||iwg->fmt!=16||iwkv->I!=hidden||iwg->I!=hidden||iwkv->O>1024||iwg->O>1024||
              iwkv->device!=device||iwg->device!=device))return 0;
+    /* the compressors on the device: the state mirrors (resynced from the
+     * host's rows when this token does not follow the last one written
+     * here), ape and norm resident */
+    int ncs=0;
+    if(ncomp){
+        if(!a->cs_kv[0]||!a->cs_sc[0]||!a->cs_ape[0]||!a->cs_norm[0]||a->cs_dim[0]!=dim||a->cs_proj[0]!=cwkv->O||a->cs_proj[0]!=cwg->O||
+           a->cs_rows[0]<1||ratio<1||(ratio==4&&a->cs_rows[0]!=8)||(ratio!=4&&a->cs_rows[0]!=ratio))return 0;
+        ncs=1;
+        if(nidx){if(!a->cs_kv[1]||!a->cs_sc[1]||!a->cs_ape[1]||!a->cs_norm[1]||a->cs_dim[1]!=idx_dim||a->cs_proj[1]!=iwkv->O||
+                    a->cs_proj[1]!=iwg->O||ratio!=4||a->cs_rows[1]!=8)return 0;ncs=2;}
+    }else if(emit)return 0;
+    if(emit&&(!a->ecos||!a->esin))return 0;
+    if(emit&&nidx&&!idx_score)return 0;   /* the emitted key must be scored (the selection runs on the device) */
     int window=g_kv_ring_rows[layer],wn=position-first+1;
-    if(wn<1||wn>window||comp_total<0||(comp_total&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_total)))return 0;
+    int comp_after=comp_total+(emit?1:0),idx_after=idx_count+(emit&&nidx?1:0);
+    if(wn<1||wn>window||comp_total<0||(comp_total&&!g_kv_comp[layer])||(!emit&&comp_total&&g_kv_comp_cap[layer]<comp_total))return 0;
     int cn=idx_sel;
-    if(cn<0||cn>comp_total)return 0;
+    if(cn<0||cn>comp_after)return 0;
     if(idx_score){
-        if(!g_idx_w[layer]||!g_idx_keys[layer]||idx_count<1||idx_count>IDX_SORT_MAX||idx_count>g_idx_keys_n[layer]||
+        if(!g_idx_w[layer]||(!emit&&!g_idx_keys[layer])||idx_after<1||idx_after>IDX_SORT_MAX||idx_count>g_idx_keys_n[layer]||
            g_idx_keys_dim[layer]!=idx_dim||g_idx_rows[layer]!=idx_heads*idx_dim||g_idx_heads[layer]!=idx_heads||
            g_idx_hidden[layer]!=hidden||g_idx_cols[layer]!=q_rank||idx_heads<1||idx_heads>1024||idx_dim<32||idx_dim>1024||
-           (idx_dim&(idx_dim-1))||cn>idx_count||cn<1)return 0;
+           (idx_dim&(idx_dim-1))||cn>idx_after||cn<1)return 0;
     }
     int pairs=rope_dim/2;
-    /* the token-free shapes: the most selected rows a token of this layer
-     * can have, the most candidates, hence the attention's rows */
-    int cn_max=nidx?(cn>512?cn:512):g_kv_comp_cap[layer];
+    int cn_max=nidx?(cn>512?cn:512):(g_kv_comp_cap[layer]>comp_after?g_kv_comp_cap[layer]:comp_after);
     if(cn_max<cn)cn_max=cn;
     int max_total=window+cn_max;size_t sm_max=(size_t)max_total*4;
     int K=idx_score_k();size_t sm_small=((size_t)idx_heads*(idx_dim+1)+idx_dim+idx_heads)*4;
@@ -2848,10 +3039,40 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
     int di=(int)(c-g);
     if(kprof&&!kev_made[di]){for(int i=0;i<8;i++)cudaEventCreate(&kev[di][i]);kev_made[di]=1;}
     if(kprof)graph=0;   /* event records captured into the graph changed the output (md5) and timed nothing: direct launches only */
+    /* the caches the emit appends to, grown before anything is captured */
+    if(emit&&!lf_comp_reserve(c,layer,comp_total,comp_after,dim))return 0;
+    if(emit&&nidx&&!lf_keys_reserve(c,layer,idx_after,idx_dim))return 0;
+    if(g_kv_comp_cap[layer]<comp_after)return 0;
+    LfCs cs[2];memset(cs,0,sizeof cs);
+    int resync=g_cs_upto[layer]!=position;
+    for(int k=0;k<ncs;k++){
+        size_t n=(size_t)a->cs_rows[k]*a->cs_proj[k],nb=n*4,ab=(size_t)ratio*a->cs_proj[k]*4,wb_=(size_t)a->cs_dim[k]*2;
+        if(g_cs_cap[k][layer]<nb){
+            if(g_cs_kv[k][layer])cudaFree(g_cs_kv[k][layer]);if(g_cs_sc[k][layer])cudaFree(g_cs_sc[k][layer]);
+            g_cs_kv[k][layer]=g_cs_sc[k][layer]=nullptr;g_cs_cap[k][layer]=0;
+            if(!alloc_ok(cudaMalloc((void**)&g_cs_kv[k][layer],nb),"compressor state mirror")||
+               !alloc_ok(cudaMalloc((void**)&g_cs_sc[k][layer],nb),"compressor score mirror"))return 0;
+            g_cs_cap[k][layer]=nb;resync=1;}
+        if(g_cs_apecap[k][layer]<ab){if(g_cs_ape[k][layer])cudaFree(g_cs_ape[k][layer]);g_cs_ape[k][layer]=nullptr;g_cs_apecap[k][layer]=0;
+            if(!alloc_ok(cudaMalloc((void**)&g_cs_ape[k][layer],ab),"compressor ape mirror"))return 0;g_cs_apecap[k][layer]=ab;resync=1;}
+        if(g_cs_normcap[k][layer]<wb_){if(g_cs_norm[k][layer])cudaFree(g_cs_norm[k][layer]);g_cs_norm[k][layer]=nullptr;g_cs_normcap[k][layer]=0;
+            if(!alloc_ok(cudaMalloc((void**)&g_cs_norm[k][layer],wb_),"compressor norm mirror"))return 0;g_cs_normcap[k][layer]=wb_;resync=1;}
+        if(resync){
+            if(!ok(cudaMemcpyAsync(g_cs_kv[k][layer],a->cs_kv[k],nb,cudaMemcpyHostToDevice,c->stream),"compressor state upload")||
+               !ok(cudaMemcpyAsync(g_cs_sc[k][layer],a->cs_sc[k],nb,cudaMemcpyHostToDevice,c->stream),"compressor score upload")||
+               !ok(cudaMemcpyAsync(g_cs_ape[k][layer],a->cs_ape[k],ab,cudaMemcpyHostToDevice,c->stream),"compressor ape upload")||
+               !ok(cudaMemcpyAsync(g_cs_norm[k][layer],a->cs_norm[k],wb_,cudaMemcpyHostToDevice,c->stream),"compressor norm upload"))return 0;
+        }
+        cs[k].kv=g_cs_kv[k][layer];cs[k].sc=g_cs_sc[k][layer];cs[k].ape=g_cs_ape[k][layer];cs[k].norm=g_cs_norm[k][layer];
+        cs[k].rows=a->cs_rows[k];cs[k].proj=a->cs_proj[k];cs[k].dim=a->cs_dim[k];cs[k].ratio=ratio;cs[k].fp4=a->cs_fp4[k];
+        cs[k].cache=k==0?g_kv_comp[layer]:g_idx_keys[layer];
+    }
+    if(resync&&ncs&&!ok(cudaStreamSynchronize(c->stream),"compressor state resync"))return 0;
     /* layout: the upload block, the download block, the scratch */
     size_t o=0;
     size_t ox=o;o+=lf_al((size_t)hidden*4);size_t ocos=o;o+=lf_al((size_t)pairs*4);size_t osin=o;o+=lf_al((size_t)pairs*4);
-    size_t osink=o;o+=lf_al((size_t)heads*4);size_t ometa=o;o+=lf_al(8*sizeof(int));
+    size_t oecos=o;o+=lf_al((size_t)pairs*4);size_t oesin=o;o+=lf_al((size_t)pairs*4);
+    size_t osink=o;o+=lf_al((size_t)heads*4);size_t ometa=o;o+=lf_al(16*sizeof(int));
     size_t oqnw=o;o+=lf_al((size_t)q_rank*2);size_t okvw=o;o+=lf_al((size_t)dim*2);
     size_t upb=o;
     size_t oout=o;o+=lf_al((size_t)hidden*4);size_t okv=o;o+=lf_al((size_t)dim*4);size_t oqa=o;o+=lf_al((size_t)q_rank*4);
@@ -2877,15 +3098,20 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
     if(!buf((void**)&c->ssc,&c->ssccap,(size_t)heads*sm_max))return 0;
     char*d=(char*)c->lfd;
     memcpy(h+ox,x,(size_t)hidden*4);memcpy(h+ocos,icos,(size_t)pairs*4);memcpy(h+osin,isin,(size_t)pairs*4);
+    if(emit){memcpy(h+oecos,a->ecos,(size_t)pairs*4);memcpy(h+oesin,a->esin,(size_t)pairs*4);}
     memcpy(h+osink,sinks,(size_t)heads*4);
-    int meta[8]={0,wn,cn,idx_count,first,position,position%window,0};memcpy(h+ometa,meta,sizeof(meta));
+    int meta[16]={0,wn,cn,idx_after,first,position,position%window,comp_total,idx_count,ratio?position%ratio:0,0,0,0,0,0,0};
+    memcpy(h+ometa,meta,sizeof(meta));
     memcpy(h+oqnw,qnw,(size_t)q_rank*2);memcpy(h+okvw,kvw,(size_t)dim*2);
     const float*dx=(const float*)(d+ox),*dcos=(const float*)(d+ocos),*dsin=(const float*)(d+osin),*dsink=(const float*)(d+osink);
+    const float*decos=(const float*)(d+oecos),*desin=(const float*)(d+oesin);
     const int*dmeta=(const int*)(d+ometa);const uint16_t*dqnw=(const uint16_t*)(d+oqnw),*dkvw=(const uint16_t*)(d+okvw);
     float*dout=(float*)(d+oout),*dkv=(float*)(d+okv),*dqa=(float*)(d+oqa),*dckv=(float*)(d+ockv),*dcg=(float*)(d+ocg),
          *dikv=(float*)(d+oikv),*dig=(float*)(d+oig),*dxq=(float*)(d+oxq),*diq=(float*)(d+oiq),*dihw=(float*)(d+oihw),
          *dsc=(float*)(d+osc),*dq=(float*)(d+oq),*datt=(float*)(d+oatt),*doa=(float*)(d+ooa);
     int*dsel=(int*)(d+osel);
+    cs[0].proj_kv=dckv;cs[0].proj_gate=dcg;cs[1].proj_kv=dikv;cs[1].proj_gate=dig;
+    int pool_fma=lf_pool_fma();
     cudaEvent_t*ev=kev[di];
     /* the sequence (issued directly, or once into the capture) */
     auto enqueue=[&]()->int{
@@ -2901,19 +3127,26 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
                  launch_bf16_one((__nv_bfloat16*)iwg->w,dx,dig,iwg->O,iwg->I,c->stream);}
         if(!ok(cudaGetLastError(),"fused layer projection launch"))return 0;
         /* 2. the host's qa norm (and the query ranks' fp8 round trip); the kv
-         *    norm, RoPE, fp8 round trip and ring write: one launch */
+         *    norm, RoPE, fp8 round trip and ring write; the compressors'
+         *    state rows: one launch */
         if(kprof)cudaEventRecord(ev[2],c->stream);
-        {int nt=q_rank>dim?q_rank:dim;if(nt>1024)nt=1024;
-         lf_prep_kernel<<<2,nt,(size_t)(q_rank>dim?q_rank:dim)*4,c->stream>>>(dqa,dqnw,q_rank,dxq,idx_score,dkv,dkvw,dim,eps,vnorm_fma,
-            dcos,dsin,rope_dim,rope_fma,g_kv_ring[layer],dmeta);}
+        {int nt=q_rank>dim?q_rank:dim;for(int k=0;k<ncs;k++)if(cs[k].proj>nt)nt=cs[k].proj;if(nt>1024)nt=1024;
+         lf_prep_kernel<<<2+ncs,nt,(size_t)(q_rank>dim?q_rank:dim)*4,c->stream>>>(dqa,dqnw,q_rank,dxq,idx_score,dkv,dkvw,dim,eps,vnorm_fma,
+            dcos,dsin,rope_dim,rope_fma,g_kv_ring[layer],dmeta,cs[0],cs[1]);}
         if(!ok(cudaGetLastError(),"fused layer prep launch"))return 0;
+        /* 2b. the emit: the compressors' rows into their caches */
+        if(emit){
+            int nt=cs[0].dim;if(ncs>1&&cs[1].dim>nt)nt=cs[1].dim;
+            lf_emit_kernel<<<ncs,nt,(size_t)nt*4,c->stream>>>(cs[0],cs[1],eps,vnorm_fma,pool_fma,decos,desin,rope_dim,rope_fma,dmeta);
+            if(!ok(cudaGetLastError(),"fused layer emit launch"))return 0;
+        }
         /* 3. the indexer's selection: the fused selection's launches (the
          *    score grid for the most candidates), the rank */
         if(kprof)cudaEventRecord(ev[3],c->stream);
         if(idx_score){
             if(!idx_select_launch(c,layer,diq,dihw,dsc,dxq,dx,dcos,dsin,dmeta+3,1,idx_heads,idx_dim,rope_dim,hidden,
-                                  graph?IDX_SORT_MAX:idx_count,had_scale,wscale,idx_rope_fma,hw_fma,nullptr))return 0;
-            idx_topk_kernel<<<1,1024,0,c->stream>>>(dsel,dsc,idx_count,cn,graph?dmeta:nullptr);
+                                  graph?IDX_SORT_MAX:idx_after,had_scale,wscale,idx_rope_fma,hw_fma,nullptr))return 0;
+            idx_topk_kernel<<<1,1024,0,c->stream>>>(dsel,dsc,idx_after,cn,graph?dmeta:nullptr);
             if(!ok(cudaGetLastError(),"fused layer rank launch"))return 0;
         }
         /* 4. the chain: q (the wq_b store rounded, the norm and RoPE in one
@@ -2934,21 +3167,25 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
         if(kprof)cudaEventRecord(ev[7],c->stream);
         if(!ok(cudaMemcpyAsync(h+oout,d+oout,dlb,cudaMemcpyDeviceToHost,c->stream),"fused layer download"))return 0;
         if(q_out&&!ok(cudaMemcpyAsync(q_out,dq,(size_t)heads*dim*4,cudaMemcpyDeviceToHost,c->stream),"fused layer q download"))return 0;
+        if(q_out&&emit)for(int k=0;k<ncs;k++)if(a->emit_out[k]&&
+            !ok(cudaMemcpyAsync(a->emit_out[k],cs[k].cache+(size_t)(k==0?comp_total:idx_count)*cs[k].dim,(size_t)cs[k].dim*4,cudaMemcpyDeviceToHost,c->stream),"fused layer emit download"))return 0;
         return 1;
     };
     int done=0;
     if(graph){
-        LfGraph*G=&g_lf[di][layer];
+        LfGraph*G=&g_lf[di][layer][emit?1:0];
         LfSig S;memset(&S,0,sizeof S);
         S.lfd=c->lfd;S.lfh=h;S.ssc=c->ssc;S.ring=g_kv_ring[layer];S.comp=g_kv_comp[layer];S.keys=g_idx_keys[layer];
         S.wqa=wqa->w;S.wkv=wkv->w;S.wqb=wqb->w;S.wa=wa->w;S.wb=wb->w;S.cwkv=cwkv?cwkv->w:nullptr;S.cwg=cwg?cwg->w:nullptr;
         S.iwkv=iwkv?iwkv->w:nullptr;S.iwg=iwg?iwg->w:nullptr;S.iw=g_idx_w[layer];S.is=g_idx_s[layer];S.ihw=g_idx_hw[layer];
+        for(int k=0;k<2;k++){S.cs[k*4]=cs[k].kv;S.cs[k*4+1]=cs[k].sc;S.cs[k*4+2]=cs[k].ape;S.cs[k*4+3]=cs[k].norm;}
         S.hidden=hidden;S.q_rank=q_rank;S.dim=dim;S.heads=heads;S.groups=groups;S.waO=wa->O;S.idx_score=idx_score;
         S.idx_heads=idx_heads;S.idx_dim=idx_dim;S.window=window;S.max_total=max_total;S.cn_max=cn_max;S.rope_dim=rope_dim;
         S.ncomp=ncomp;S.nidx=nidx;S.cO=cwkv?cwkv->O:0;S.gO=cwg?cwg->O:0;S.ikO=iwkv?iwkv->O:0;S.igO=iwg?iwg->O:0;
         S.vnorm_fma=vnorm_fma;S.rope_fma=rope_fma;S.idx_rope_fma=idx_rope_fma;S.hw_fma=hw_fma;S.norm_fma=norm_fma;
         S.ds=sattn_split_ds();S.K=K;S.headw=idx_headw_mode();S.unroll=mv_warp_unroll();
         S.eps=eps;S.scale=scale;S.had_scale=had_scale;S.wscale=wscale;S.unroll+=(kprof?1000:0)+(mv_warp_lut()?2000:0)+(idx_proj_warp()?4000:0);
+        S.emit=emit;S.ratio=ratio;S.pool_fma=pool_fma;
         if(!G->valid||memcmp(&G->sig,&S,sizeof S)!=0){
             if(G->valid){cudaGraphExecDestroy(G->exec);cudaGraphDestroy(G->graph);G->valid=0;}
             if(!ok(cudaStreamBeginCapture(c->stream,cudaStreamCaptureModeThreadLocal),"fused layer capture begin"))return 0;
@@ -2967,9 +3204,11 @@ extern "C" int dsv4_cuda_attn_decode_fused(int device,int layer,const float*x,in
             gsum+=ms;gn++;if(gn%1000==0)fprintf(stderr,"lfgprof calls=%lld device=%.3f ms per layer call\n",gn,gsum/gn);}
     }else done=enqueue();
     if(!done||!ok(cudaStreamSynchronize(c->stream),"fused layer sync"))return 0;
+    g_cs_upto[layer]=position+1;
+    if(emit&&nidx&&!q_out)g_idx_keys_n[layer]=idx_after;   /* the host's keys_sync finds the row here (not under verify: the host's row then overwrites) */
     if(kprof){float ms[7];for(int i=0;i<7;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
-        fprintf(stderr,"lfkprof layer=%d up=%.3f proj=%.3f prep=%.3f idx=%.3f q=%.3f attn=%.3f tail=%.3f ms cn=%d scored=%d graph=%d\n",
-                layer,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],cn,idx_score,graph);}
+        fprintf(stderr,"lfkprof layer=%d up=%.3f proj=%.3f prep=%.3f idx=%.3f q=%.3f attn=%.3f tail=%.3f ms cn=%d scored=%d graph=%d emit=%d\n",
+                layer,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],cn,idx_score,graph,emit);}
     memcpy(out,h+oout,(size_t)hidden*4);memcpy(kv_out,h+okv,(size_t)dim*4);memcpy(qa_out,h+oqa,(size_t)q_rank*4);
     if(ncomp){memcpy(ckv_out,h+ockv,(size_t)cwkv->O*4);memcpy(cg_out,h+ocg,(size_t)cwg->O*4);}
     if(nidx){memcpy(ikv_out,h+oikv,(size_t)iwkv->O*4);memcpy(ig_out,h+oig,(size_t)iwg->O*4);}

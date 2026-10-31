@@ -82,18 +82,33 @@ int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
  * is made on the card first: wq_b mv kernel, bf16 round, per-head rmsnorm
  * (eps, norm_fma), forward RoPE; q_out: its verify download. */
 /* V4_LAYER_FUSED: a decode token's attention layer in one round trip (the
- * projections, the norms, the indexer's selection and rank, the chain, the
- * ring append); 1 = done (out, the kv row, qa, the compressor projections
- * and the selected ordinals filled), 0 = refused or failed. */
-int dsv4_cuda_attn_decode_fused(int device,int layer,const float *x,int hidden,
-        Dsv4CudaTensor *wqa,Dsv4CudaTensor *wkv,Dsv4CudaTensor *cwkv,Dsv4CudaTensor *cwg,
-        Dsv4CudaTensor *iwkv,Dsv4CudaTensor *iwg,const uint16_t *qnw,int q_rank,
-        const uint16_t *kvw,int dim,float eps,int vnorm_fma,const float *icos,const float *isin,
-        int rope_dim,int rope_fma,int position,const float *sinks,int first,int comp_total,
-        int heads,float scale,int idx_score,int idx_count,int idx_sel,int idx_heads,int idx_dim,
-        float had_scale,float wscale,int idx_rope_fma,int hw_fma,Dsv4CudaTensor *wqb,int norm_fma,
-        Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,float *out,float *kv_out,float *qa_out,
-        float *ckv_out,float *cg_out,float *ikv_out,float *ig_out,int *sel_out,float *q_out);
+ * projections, the norms, the compressors' state rows and, emit, their
+ * pooled rows into the caches, the indexer's selection and rank, the
+ * chain, the ring append); 1 = done (the outputs filled), 0 = refused or
+ * failed. cs_*: the compressors ([0] the attention's, [1] the indexer's;
+ * kv NULL = none) for the device's state mirror; ecos/esin the emitted
+ * row's RoPE tables; emit_out: verify downloads of the emitted rows. */
+typedef struct Dsv4FusedArgs {
+    int device, layer, hidden, q_rank, dim, rope_dim, position, first, comp_total, heads, groups;
+    const float *x, *icos, *isin, *sinks;
+    Dsv4CudaTensor *wqa, *wkv, *cwkv, *cwg, *iwkv, *iwg, *wqb, *wa, *wb;
+    const uint16_t *qnw, *kvw;
+    float eps, scale, had_scale, wscale;
+    int vnorm_fma, rope_fma, norm_fma, idx_rope_fma, hw_fma;
+    int idx_score, idx_count, idx_sel, idx_heads, idx_dim;
+    int emit, ratio;
+    const float *cs_kv[2], *cs_sc[2], *cs_ape[2];
+    const uint16_t *cs_norm[2];
+    int cs_rows[2], cs_proj[2], cs_dim[2], cs_fp4[2];
+    const float *ecos, *esin;
+    float *out, *kv_out, *qa_out, *ckv_out, *cg_out, *ikv_out, *ig_out, *q_out, *emit_out[2];
+    int *sel_out;
+} Dsv4FusedArgs;
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a);
+/* V4_GPU_HEAD: the output head's argmax over a bf16 mirror (fmt 16,
+ * [vocab][hidden]), the CPU's sequential row sums and its first-maximum
+ * rule, bitwise; 1 = done, 0 = refused or failed. */
+int dsv4_cuda_head_argmax_ref(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_attn_decode_chain(int device,int layer,const float *q,const float *chunk,
                                 int chunk_start,const float *sinks,const int *meta,
                                 const int *sel,int selstride,int abs_base,int comp_limit,

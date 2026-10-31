@@ -1116,6 +1116,53 @@ the emit tokens (the compressor's pooling on the device would fuse them
 too), the host's ~0.1 ms per layer around the call, and the matrices at
 ~640 GB/s.
 
+Thirty-third measurement (2026-10-31): the compressed row emitted on the
+device, so the fused layer takes every token. `V4_LAYER_FUSED_EMIT` (1):
+the device keeps a mirror of each compressor's state rows (the attention's
+and the indexer's; resynced from the host's rows when a token does not
+follow the last one written there), the prep kernel writes the token's
+row (kv_row = the projection, score_row = the gate + ape[slot]), and on
+an emit token `lf_emit` pools the row as compressor_pool_and_emit does
+(per column the max over the pool rows in the comparison form, the
+exponentials' total and the weighted sum in row order with
+`DSV4_CS_POOL_FMA` (1) as the build contracts it, the division, bf16; the
+norm; the RoPE at position + 1 - ratio; the fp8 round trip of the first
+dim - rope_dim values, or the indexer's hadamard + fp4 round trip),
+appends it to the comp cache and the key cache, and shifts rows 4..7 of
+the state down. The host's advance then finds the row there (the caches'
+counts are marked). `V4_LAYER_FUSED_VERIFY`: 1,505 layer calls, 189 of
+them emits, no differing word in the emitted rows either. An emit token
+27 -> 25 ms of attention (the host still pools its own canonical row,
+~1 ms), the mean 24 -> 23.
+
+Thirty-fourth measurement (2026-10-31): the output head on the device,
+and the bench's own overhead. The CPU head (head_bf16_dot over the
+resident bf16 rows, 1 GiB per token) took 23.4 ms per token.
+`V4_GPU_HEAD` (1): a bf16 mirror of the head (uploaded on the first
+call) and `head_dot_warp_kernel`, a warp per vocabulary row with lane
+0 adding the 4096 products in column order as the CPU does, then the
+first-maximum argmax: 4.5 ms per token, the token and the logit the
+CPU's on every one of 36 tokens (`V4_GPU_HEAD_VERIFY=1`, `headverify`),
+in both the one-card and the `DSV4_CUDA_DEVICE2=auto` configuration.
+The mirror's 1 GiB displaces decode expert mirrors on one card (MoE 204
+-> 212 ms per token there; with the second card none): net a token
+308 -> 297 ms, after the first token 11.35 -> 10.94 s; with the second
+card 10.92 -> 10.27 s. `V4_GPU_HEAD_DEVICE` picks the card (unset: the
+second when the engine opened one with the same DLL flavour, else the
+primary; the other flavour's module is not reached, the primary takes
+it). While looking for the rest of a token's time (the stages summed
+to 238 ms of a 300 ms step): the `decprof` line itself cost 37 ms per
+token (`pre=` in the line, now `[alloc free total pre marks tail]`): an
+unbuffered stderr behind the bench's redirect wrote it in dozens of
+small writes. Every after-first figure in these notes carries that
+~1.5 s (the comparisons between runs stand; the decode without
+`DSV4_DECODE_PROF` is 9.65 s after the first token, 276 ms per token).
+The line is now formatted once and written once. Also noted: with
+`DSV4_CUDA_DEVICE2=auto` the generated text can differ between runs of
+different speed (the partial sums add by residence, documented as an
+order-of-addition class), which the head verify there confirmed is not
+the head.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
@@ -1274,6 +1321,12 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_IDX_HEADW` (2) | the indexer head-weight kernel for a token: `2` = a warp per head, double-buffered chunks; `1` = the lanes-in-one-block kernel; `0` = one thread per head (all bitwise) |
 | `DSV4_IDX_SCORE_K` (8) | candidates scored per block in the few-token indexer scoring kernel (queries staged once per block); `1` = a block per candidate |
 | `V4_DECODE_PROJ6` (1) | a decode token's wq_a, wkv and (where the layer has them) compressor and indexer-compressor projections in one device round trip, every layer (bitwise); `0` = the CPU matvecs and a round trip per pair |
+| `DSV4_STEP_PROF` (off) | per-token step prints beside `decprof`: `headprof`, `finalprof`, `tokprof` (the whole step and the layer loop), `loopprof` (the loop's loads, predictor, block, tap); each line costs a stderr write |
+| `V4_LAYER_FUSED_EMIT` (1) | the tokens that emit a compressed row through the fused layer too, the row pooled on the device (bitwise); `0` = those tokens take the three trips |
+| `DSV4_CS_POOL_FMA` (1) | the device pooling's weighted accumulate fused, as the build contracts the host loop |
+| `V4_GPU_HEAD` (1) | the output head's argmax on the device over a bf16 mirror, the CPU's sums and tie rule (bitwise); `0` = the CPU head |
+| `V4_GPU_HEAD_VERIFY` (off) | the CPU head beside the device head, differing tokens or logits reported (`headverify`) |
+| `V4_GPU_HEAD_DEVICE` (unset) | the head mirror's card ordinal; unset = the second card when it runs the primary's DLL flavour, else the primary |
 | `V4_LAYER_FUSED` (1) | a decode token's attention layer as one device round trip on the tokens that emit no compressed row (bitwise); `0` = the three trips |
 | `V4_LAYER_FUSED_VERIFY` (off) | the fused layer beside the usual path, differing words counted (`lfverify`) |
 | `DSV4_LF_GRAPH` (1) | the fused layer's launches as a CUDA graph per layer, replayed per token; `0` = direct launches (equal) |

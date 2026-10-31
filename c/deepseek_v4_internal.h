@@ -823,6 +823,12 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
 #endif /* COLI_VULKAN || COLI_CUDA */
+/* The compressor's and the indexer's views (the Vulkan dense chain, the
+ * CUDA fused layer's state mirror). */
+typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
+int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state, ColiV4CompressorView *view);
+typedef struct { float *keys; int count, capacity, head_dim; ColiDeepSeekV4CompressorState *compressor; } ColiV4IndexerView;
+int coli_v4_indexer_view(ColiDeepSeekV4Indexer *state, ColiV4IndexerView *view);
 #ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
@@ -845,10 +851,6 @@ typedef struct {
 int coli_v4_attention_view(ColiDeepSeekV4WindowAttentionState *state, ColiV4AttentionView *view);
 int coli_v4_attention_reserve(ColiDeepSeekV4WindowAttentionState *state, int rows);
 int coli_v4_attention_set_count(ColiDeepSeekV4WindowAttentionState *state, int count);
-typedef struct { float *kv, *score; int rows, projection, ratio, head_dim, rotate_fp4; } ColiV4CompressorView;
-int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state, ColiV4CompressorView *view);
-typedef struct { float *keys; int count, capacity, head_dim; ColiDeepSeekV4CompressorState *compressor; } ColiV4IndexerView;
-int coli_v4_indexer_view(ColiDeepSeekV4Indexer *state, ColiV4IndexerView *view);
 int coli_v4_indexer_reserve(ColiDeepSeekV4Indexer *state, int rows);
 int coli_v4_indexer_set_count(ColiDeepSeekV4Indexer *state, int count);
 /* The MoE of `rows` normalized FFN rows without the shared expert: each row's routed
@@ -1080,6 +1082,8 @@ void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, i
  * (q NULL) the query is made on the card from the wq_b mirror (bf16 round,
  * per-head rmsnorm with eps, forward RoPE). attended_out / oa_out / q_out:
  * verify downloads (DSV4_WO_VERIFY). */
+int coli_v4_gpu_head_argmax(const uint16_t *head, int vocab, int d, int second,
+                            const float *hidden, int *token, float *logit);
 void coli_v4_gpu_kv_cache_mark(const ColiDeepSeekV4LayerWeights *weights,
                                int position, int window, int comp_total);
 int coli_v4_gpu_attention_decode_fused(
@@ -1091,9 +1095,11 @@ int coli_v4_gpu_attention_decode_fused(
     const float *cosines, const float *sines, int rope_dim, const float *sinks,
     int first, int comp_total, int heads, ColiDeepSeekV4Indexer *indexer,
     int idx_count, int topk, const ColiTensorView *iwq, const uint16_t *ihw,
-    int idx_heads, int idx_dim, float *output, float *kv_out, float *qa_out,
+    int idx_heads, int idx_dim, int emit, int ratio, const ColiV4CompressorView *cs,
+    const float *const *cs_ape, const void *const *cs_norm, const float *ecos,
+    const float *esin, float *output, float *kv_out, float *qa_out,
     float *ckv_out, float *cg_out, float *ikv_out, float *ig_out, int *sel_out,
-    int *sel_count, float *q_out);
+    int *sel_count, float *q_out, float *const *emit_out);
 int coli_v4_gpu_attention_decode_chain(
     const ColiDeepSeekV4LayerWeights *weights, const float *q, const float *kv,
     int position, const float *sinks, const int *meta, const int *sel, int selstride,
