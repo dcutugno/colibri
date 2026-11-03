@@ -727,7 +727,7 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.s
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
-VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
+VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv shaders/chain_dnconv_rows.spv \
             shaders/chain_dnrec.spv shaders/chain_dnrec_rows.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
             shaders/chain_gemv.spv shaders/chain_attn_dec.spv shaders/chain_mla_dec.spv
 # the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
@@ -754,7 +754,8 @@ VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
-VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_grp_bdcw.spv shaders/qmatmul_grp_gate_up_bdcw.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
 VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 # and on the matrix units (cooperative matrices at subgroups of 64 or 32)
@@ -815,6 +816,9 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/kimi_k3_park_harness.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
@@ -944,7 +948,7 @@ vk_chain.o: vk_chain.c .build-config
 # routed experts; the chain's block GEMV reads the same table
 shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 # the per-type decoders of the chain's block GEMV and of its routed experts
-shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_bdcw.spv: shaders/bdstep.glsl shaders/blockdec_table.h
 shaders/chain_gemv_bd_i8.spv: shaders/chain_gemv_bd.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
@@ -957,6 +961,9 @@ shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.g
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_bdcw.spv: shaders/qmatmul_grp_bdcw.comp shaders/bdstep.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
@@ -1064,7 +1071,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1366,18 +1373,16 @@ fp8-bench: fp8_bench$(EXE)
 tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_cuda_resident_batch.cu -o $@ $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
-# NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
-# hand it a define matching nothing and link a runtime it never calls -- a
-# build whose compile line, libraries and exit status all claim "CUDA" while
-# the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
-# MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
-# asserts this shape.
+# An engine whose CUDA path is the chain alone (olmoe_cuda_chain.h, the decision engines'
+# decide_cuda.h) links the backend and its chain, or the DLL's loader on Windows.
+# tests/test_makefile_cuda_scope.py asserts olmoe gets CUDA=1's flags.
+CHAIN_CUDA_OBJ = $(filter backend_loader.o backend_cuda.o cuda_chain.o,$(CUDA_OBJ))
 ifneq ($(EXE),)
 .PHONY: olmoe
 olmoe: olmoe$(EXE)
 endif
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+olmoe$(EXE): olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o olmoe$(EXE) $(LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1450,8 +1455,8 @@ ifneq ($(EXE),)
 .PHONY: laya
 laya: laya$(EXE)
 endif
-laya$(EXE): laya.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) laya.c $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
+laya$(EXE): laya.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) laya.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o laya$(EXE) $(LDFLAGS)
 
 # GLiNER2.5-Decide (fastino), a decision model: DeBERTa-v3 encoder + GLiNER2's
 # classification head, served on POST /v1/systemone through the DECIDE command
@@ -1461,8 +1466,8 @@ ifneq ($(EXE),)
 .PHONY: gliner_decide
 gliner_decide: gliner_decide$(EXE)
 endif
-gliner_decide$(EXE): gliner_decide.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) gliner_decide.c $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
+gliner_decide$(EXE): gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
@@ -2014,6 +2019,19 @@ tests/test_tok_gpt2$(EXE): tests/test_tok_gpt2.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_tekken$(EXE): tests/test_tok_tekken.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Mistral-Large-4's vision tower (mistral_vision.h) against tools/mistral_vision_ref.py on a tiny mmproj
+tests/mistral_vision_check$(EXE): tests/mistral_vision_check.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: mistral-vision-check
+mistral-vision-check: tests/mistral_vision_check$(EXE)
+	$(PYTHON) tools/make_mistral_vision_tiny.py --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny \
+	  --release $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/release --check ./tests/mistral_vision_check$(EXE)
+	$(PYTHON) tools/ml4_mmproj.py --release $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/release \
+	  --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/from_release
+	$(PYTHON) tools/make_mistral_vision_tiny.py --out $${TMPDIR:-/tmp}/coli_mistral_vision_tiny \
+	  --same-as $${TMPDIR:-/tmp}/coli_mistral_vision_tiny/from_release/mmproj.gguf
 
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2219,6 +2237,10 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
 tests/test_rows_f8$(EXE): tests/test_rows_f8.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A prompt's rows of the types with no R16 form, 16 file rows unpacked once (gq_tile16_rows),
+# against their scalar reference to the bit and the row kernels; `tests/test_tile16 bench` times them.
+tests/test_tile16$(EXE): tests/test_tile16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2302,8 +2324,8 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
-# ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
-# the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
+# ACTIVATIONS rather than an integer reference. NOCUDA_*: these tests read the
+# CPU paths, so olmoe.c compiles without its CUDA chain (olmoe_cuda_chain.h).
 tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2479,6 +2501,10 @@ tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+# the hybrid steps' CPU pairs alone (vkt_host_pairs), no device: ./tests/bench_host_pairs [fmt: 2 int4 rows, 4 int4-g64, 1 int8]
+tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
+	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
 vk-tier-check: tests/test_vk_tier$(EXE)
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
@@ -2574,6 +2600,10 @@ tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c $(VK_OBJ)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# CPU-only state-policy regression; independent of model files and GPU flags.
+tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2981,6 +3011,14 @@ tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier
 
 # qt_chain_promote: the resident set follows the conversation while the chain runs the experts in its frame (fake backend).
 tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_chain_host_follow: after the promotions the host pool is the non-residents again (fake backend).
+tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# qt_chain_hold: no upload, a free slot's included, while a chain's forward holds the tier (fake backend).
+tests/test_qwen36_tier_hold$(EXE): tests/test_qwen36_tier_hold.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)

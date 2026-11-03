@@ -60,10 +60,11 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_WAIT, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts",
+                                          "waiting for the host"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
 enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
@@ -131,7 +132,9 @@ typedef struct {
      * (pass, ggml type), made on first use */
     VkShaderModule mod_rows, mod_grp[2]; VkPipeline rows; VkPipeline grp[2][64]; uint8_t grp_tried[2][64];
     VkShaderModule mod_grpc[2]; VkPipeline grpc[2][64]; uint8_t grpc_tried[2][64];   /* qmatmul_grp*_bdc.comp: the same on the matrix units */
+    VkShaderModule mod_grpw[2]; VkPipeline grpw[2][64]; uint8_t grpw_tried[2][64];   /* qmatmul_grp*_bdcw.comp: their wider item */
     VkShaderModule mod_bdgc; VkPipeline bdgc[64]; uint8_t bdgc_tried[64];             /* qmatmul_gemm_bdc.comp: a GGUF's prompt GEMM on them */
+    VkShaderModule mod_bdgw; VkPipeline bdgw[64]; uint8_t bdgw_tried[64];             /* qmatmul_gemm_bdcw.comp: its 128 tile */
     VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];      /* our formats' (1, 2, 4) in floats: qmatmul_grp_q.comp */
     VkShaderModule mod_grpqc[2]; VkPipeline grpqc[2]; uint8_t grpqc_tried[2];   /* and on the matrix units: qmatmul_grp_qc.comp */
     int rows_tried;
@@ -143,6 +146,7 @@ typedef struct {
     VkShaderModule mod_dnrr; int dnrr_tried;   /* chain_dnrec_rows.spv: a prompt chunk's rows, made on first use */
     VkPipeline dnrr[VKC_DNREC_MAX]; int dnrr_kd[VKC_DNREC_MAX], ndnrr;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    VkShaderModule mod_dncr; VkPipeline dncr;   /* chain_dnconv_rows.comp: a prompt's convolution rows at once */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
@@ -421,7 +425,15 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
  * the compiler picks: an Intel Iris Xe (subgroups of 8 to 32) compiled chain_gemv and
  * chain_gemv2 at another width than the shader saw, and every decode GEMV came out
  * wrong. 0 (no subgroup size control, COLI_VK_SUBGROUP=0): the driver's choice. */
+/* vkc_hybrid_set_flush: the host's part of a hybrid step still to come. Run before the host
+ * waits for a frame (frame_wait) and before it makes a pipeline: a frame that waits for the
+ * host's event inside it (vkc_ev_wait) may be executing, and a driver that executes on a
+ * thread of its own and builds pipelines under its lock (Lavapipe) would wait for that frame
+ * -- which waits for the host. */
+static void (*g_hyb_flush)(void);
+static void host_first(void) { if (g_hyb_flush) g_hyb_flush(); }
 static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = (uint32_t)KC.core.pin_sg};
@@ -437,6 +449,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 /* A pipeline of the matrix units' shaders: at the device's cooperative-matrix subgroup
  * size (64 or 32), required, in full subgroups; NULL elsewhere or when it fails. */
 static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    host_first();
     int sg = KC.core.coop_sg;
     if (!m || (sg != 64 && sg != 32)) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
@@ -476,6 +489,10 @@ static uint32_t kc_shared_limit(void) {
 /* and qmatmul_gemm_bdc.comp's (its tiles, its partial-tile patch and bdstep's tables): a device with
  * less keeps the floats' GEMM there */
 #define GEMM_BDC_SHARED 33344u
+/* and qmatmul_gemm_bdcw.comp's, its 128 tile (no IQ grid in its tables) */
+#define GEMM_BDCW_SHARED 41056u
+/* and qmatmul_grp*_bdcw.comp's, the experts' wider item (its tiles, patches and tables) */
+#define GRP_BDCW_SHARED 41536u
 /* an ASan or UBSan build (gcc defines __SANITIZE_ADDRESS__; clang has __has_feature) */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
 #define VKC_SANITIZED 1
@@ -534,6 +551,11 @@ int vkc_init(void) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         int xs = (int)((pp.limits.maxComputeSharedMemorySize - 512) / 16);   /* past the subgroups' 32 vec4 sums */
         if (xs > 4096) xs = 4096;
+        {   /* a prompt's convolution, every row at once (COLI_VK_DNCONV_ROWS=0: one thread a channel) */
+            const char *dr = getenv("COLI_VK_DNCONV_ROWS");
+            if (!(dr && *dr == '0') && (KC.mod_dncr = load_module(KC.core.spv_path, "chain_dnconv_rows.spv")))
+                KC.dncr = make_pipe(KC.mod_dncr, NULL);
+        }
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
             /* and its variant for a row past the staging, x read from its buffer */
             VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
@@ -648,6 +670,7 @@ int vkc_init(void) {
                           .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
                           .pSpecializationInfo = &si}, .layout = KC.pl};
+            host_first();
             if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
         }
     }
@@ -719,15 +742,25 @@ static void frame_reclaim(VkcFrame *f) {
     f->cur_pool = 0;
 }
 /* A frame is milliseconds of work and the thread waiting on it has nothing else to do:
- * poll the fence for up to COLI_VK_CHAIN_SPIN_US (2000 us) before blocking, whose
- * wake-up costs 50 to 150 us per frame, two frames a layer. */
+ * poll the fence for up to COLI_VK_CHAIN_SPIN_US before blocking, whose wake-up costs 50 to
+ * 150 us per frame, two frames a layer. On a discrete card 50 ms, a whole decode step: at 2 ms
+ * the host slept through each step's last frames and woke after the device had run dry
+ * (Qwen3.6 UD-Q4_K_M on an RTX PRO 4000 decoded 76.5 tok/s, 90.7 polling to the end; the
+ * device idle about 1 ms a token between steps). An integrated GPU shares the package's power
+ * with the cores: 2 ms there. */
 static long chain_spin_us(void) {
     static long v = -1;
-    if (v < 0) { const char *e = getenv("COLI_VK_CHAIN_SPIN_US"); v = e && *e ? atol(e) : 2000; if (v < 0) v = 0; }
+    if (v < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_SPIN_US");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        v = e && *e ? atol(e) : pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 50000 : 2000;
+        if (v < 0) v = 0;
+    }
     return v;
 }
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
+    if (g_hyb_flush) g_hyb_flush();   /* a hybrid step's host part the frame may wait for */
     double t0 = vkc_now_ms();
     VkResult r = VK_NOT_READY;
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
@@ -857,6 +890,7 @@ int vkc_hybrid_submit(uint64_t g) {
     return vkc_submit(0);
 }
 void vkc_hybrid_wait_next(uint64_t h) { KC.next_wait_h = h; }
+void vkc_hybrid_set_flush(void (*fn)(void)) { g_hyb_flush = fn; }
 /* the host's side, from any thread: the primary device's two timelines */
 int vkc_hybrid_host_wait(uint64_t g) {
     if (!g_hyb_dev) return 0;
@@ -1022,7 +1056,10 @@ int vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n) {
  * a copy command with 16384 regions of 512 bytes took 3.3 ms on an RTX PRO 4000 (OLMoE,
  * a chunk of 1024 rows, four of them a layer). Regions on a grid (one length; the
  * destination and the source moving by fixed steps along an inner and an outer index)
- * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. */
+ * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. A
+ * shorter list takes one dispatch when it is a grid whole: a decode step's 16 regions of 512
+ * bytes (OLMoE's heads) took 8.3 us as a copy command, 1.46 us as a dispatch. A list that is
+ * no grid keeps the copy command rather than many small dispatches. */
 #define VKC_CP2_MIN 64
 static struct { VkShaderModule mod; VkPipeline pipe, pipe_h; int tried, tried_h; } g_cp2[2];
 #define CP2 (g_cp2[g_kd])
@@ -1049,8 +1086,8 @@ static void cp2_shutdown(void) {
 }
 typedef struct { uint32_t d0, s0; int32_t dh, sh, dq, sq; uint32_t len, per, n; } VkcCp2;
 /* the regions' grid, when they are one: region i = (q, h) = (i / per, i % per) */
-static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g) {
-    if (n < VKC_CP2_MIN || !r[0].n) return 0;
+static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g, int min) {
+    if (n < min || n < 2 || !r[0].n) return 0;
     long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
     long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
     int per = 1;
@@ -1101,12 +1138,20 @@ int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
         }
     VkcCp2 g;
     const char *e = getenv("COLI_VK_COPY_GRID");   /* 0: every list through the copy command */
+    if (dst != src && !(e && *e == '0') && n >= 2 && n < VKC_CP2_MIN && cp2_pipe() && cp2_grid(r, n, &g, 2)) {
+        KC.kind = PK_COPY;   /* a short list that is one grid */
+        VkcBind bd[2] = {B(src, 0), B(dst, 1)};
+        uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
+        if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) return 0;
+        KC.st.copy_grids++;
+        return 1;
+    }
     const int grids = dst != src && !(e && *e == '0') && n >= VKC_CP2_MIN && cp2_pipe();
     VkBufferCopy *c = NULL;
     int nc = 0;
     for (int i = 0; i < n; ) {   /* each grid of VKC_CP2_MIN regions or more in a launch, the rest in one copy */
         int k = grids ? cp2_run(r + i, n - i) : n - i;
-        if (grids && k >= VKC_CP2_MIN && cp2_grid(r + i, k, &g)) {
+        if (grids && k >= VKC_CP2_MIN && cp2_grid(r + i, k, &g, VKC_CP2_MIN)) {
             KC.kind = PK_COPY;
             VkcBind bd[2] = {B(src, 0), B(dst, 1)};
             uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
@@ -1147,7 +1192,7 @@ int vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
     for (int i = 0; i < n; ) {
         int k = cp2_run(r + i, n - i);
         VkcCp2 g;
-        if (!(k >= 2 && cp2_grid(r + i, k, &g))) {
+        if (!cp2_grid(r + i, k, &g, 2)) {
             k = 1;
             g = (VkcCp2){(uint32_t)r[i].dst, (uint32_t)r[i].src, 0, 0, 0, 0, (uint32_t)r[i].n, 1, 1};
         }
@@ -1270,10 +1315,10 @@ static int codes_of(int I) {
  * on first use; NULL for a type it does not decode (Q4_K and Q5_K also want rows of whole
  * 16-byte steps) */
 static VkPipeline bdv_pipe(int t, int nr, int rowWords, int I) {
-    static const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
+    static const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 1, 30};   /* 1, 30: F16, BF16 */
     int on = 0;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) on |= types[k] == t;
-    if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13 || t == 1 || t == 30) && rowWords % 4)) return VK_NULL_HANDLE;
     /* the smallest staging only for one row of IQ2_XXS, IQ2_XS, IQ3_XXS or IQ2_S, whose decoders wait on
      * their grid reads: twice the workgroups an SM hide them, 10240 x 2560 at 61.2 -> 48.4
      * and 66.4 -> 52.0 us. The others read at the memory's rate, and more workgroups cost
@@ -1316,10 +1361,29 @@ static VkPipeline bdv8_pipe(int t, int nr, int rowWords, int I) {
     return KC.bdv8[nr - 1][t][b];
 }
 int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
+/* qmatmul_gemm_bdcw.comp's pipeline for ggml type t: the matrix units' GEMM at 128 x 128, for the
+ * types with no IQ grid in shared memory (its tables hold four words); made on first use,
+ * COLI_VK_GEMM_WIDE=0 never */
+static VkPipeline bdgw_pipe(int t) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_GEMM_WIDE"); on = !(e && *e == '0'); }
+    if (!on || t < 0 || t >= 64 || t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || !KC.bdgc[t]) return VK_NULL_HANDLE;
+    if (!KC.bdgw_tried[t]) {
+        KC.bdgw_tried[t] = 1;
+        if (kc_shared_limit() < GEMM_BDCW_SHARED) return VK_NULL_HANDLE;
+        if (!KC.mod_bdgw) KC.mod_bdgw = load_module(KC.core.spv_path, "qmatmul_gemm_bdcw.spv");
+        int32_t v[2] = {t, KC.core.coop_sg};
+        VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+        VkSpecializationInfo si = {2, me, sizeof v, v};
+        if (KC.mod_bdgw) KC.bdgw[t] = coop_pipe(KC.mod_bdgw, &si);
+    }
+    return KC.bdgw[t];
+}
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
 static VkPipeline bdg_pipe(int t, int rowWords) {
     if (t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 ||
-        t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+        t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 1 || t == 30) ||
+        ((t == 12 || t == 13 || t == 1 || t == 30) && rowWords % 4)) return VK_NULL_HANDLE;
     /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
     if (!KC.bdgc_tried[t]) {
         KC.bdgc_tried[t] = 1;
@@ -1356,6 +1420,13 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     if (gp) {
         struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
         KC.kind = PK_GEMM;
+        /* 128 x 128 where the rows fill it, on the matrix units */
+        VkPipeline wp = S >= 128 && gp == KC.bdgc[ti->fmt - 100] ? bdgw_pipe(ti->fmt - 100) : VK_NULL_HANDLE;
+        if (wp) {
+            int ok = record(wp, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + 127) / 128), (uint32_t)((S + 127) / 128), 1);
+            KC.st.matmuls += ok; KC.st.gemms += ok; KC.st.tile_gemms += ok; KC.st.tile_wide += ok;
+            return ok;
+        }
         int ok = record(gp, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + 63) / 64), (uint32_t)((S + 63) / 64), 1);
         KC.st.matmuls += ok; KC.st.gemms += ok;
         if (gp == KC.bdgc[ti->fmt - 100]) KC.st.tile_gemms += ok;   /* on the matrix units */
@@ -1620,6 +1691,7 @@ static VkPipeline fa_pipe(int hd, int gq) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_fa, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
@@ -1676,14 +1748,20 @@ static VkPipeline adec_pipe(void) {
 static VkPipeline adg_pipe(int hd, int gq) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
-    if (!on || gq < 2 || gq > 16 || hd < 1 || hd > 256 || !adec_pipe()) return VK_NULL_HANDLE;
+    if (!on || gq < 1 || gq > 16 || hd < 1 || hd > 256 || !adec_pipe()) return VK_NULL_HANDLE;
     for (int i = 0; i < KC.nadg; i++) if (KC.adg_hd[i] == hd && KC.adg_gq[i] == gq && KC.adg_kv[i] == g_kvh) return KC.adg[i];
     if (KC.nadg == VKC_ADG_MAX) return VK_NULL_HANDLE;
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
     if (((size_t)gq * (hd + 256 + 64) + hd) * 4 > pp.limits.maxComputeSharedMemorySize) return VK_NULL_HANDLE;
-    int32_t sv[3] = {gq, hd, g_kvh};
-    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}};
-    VkSpecializationInfo si = {3, me, sizeof sv, sv};
+    /* two threads a position for the scores at head dims of 256, one below; the same for
+     * either cache, whose bits stay equal. One layer after 18K positions (float16): a Radeon
+     * 780M's 64 lanes of 512-byte rows 1463 -> 1025 us at two, its 128 dims 1241 -> 1452 (one
+     * kept); an RTX PRO 4000 125.5 -> 121.8 us, its 128 dims 131.1 -> 129.6 */
+    const char *te = getenv("COLI_VK_ATTN_DEC_TPP");
+    int tpp = te && (*te == '1' || *te == '2') ? *te - '0' : hd >= 256 ? 2 : 1;
+    int32_t sv[4] = {gq, hd, g_kvh, tpp};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}, {2, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof sv, sv};
     VkPipeline p = make_pipe(KC.mod_adec, &si);
     if (!p) return VK_NULL_HANDLE;
     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
@@ -1727,7 +1805,7 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
      * workgroups a KV head: Qwen3.6 after 18K positions on an RTX PRO 4000, 256 positions a
      * block, 279 us a layer; 64 (a workgroup a KV head) 325 us, its join alone 60 */
-    VkPipeline gp = G > 1 && w->a.hd == w->vd && w->a.k_off % 4 == 0 && w->a.v_off % 4 == 0 ? adg_pipe(w->a.hd, G) : VK_NULL_HANDLE;
+    VkPipeline gp = G >= 1 && w->a.hd == w->vd && w->a.k_off % 4 == 0 && w->a.v_off % 4 == 0 ? adg_pipe(w->a.hd, G) : VK_NULL_HANDLE;
     int hc = gp ? 4 * w->a.KVH : w->a.H, nb = 1;
     for (int r = 0; r < S; r++) {   /* the most blocks a row takes, of its window's positions as the shader counts them */
         int nr = w->a.pos_base + r + 1;
@@ -1834,9 +1912,24 @@ int vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
                          int ch, int nz, int o_z, int st_z) {
     return ch > 0 && attn_part_rec(q, kc, vc, o, p, blk, anchor, st_off, ch, nz, o_z, st_z);
 }
+/* From this many rows a prompt's convolution takes chain_dnconv_rows.comp: every output at
+ * once, then the ring (the same sums in the same order: the same bits). One thread a channel
+ * walking 979 rows of LFM3 took 442 us a layer on an RTX PRO 4000. */
+#define VKC_DNCONV_ROWS 8
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     KC.kind = PK_DNCONV;
     if (p->CK < 1 || p->CK > 9) return 0;
+    if (KC.dncr && p->S >= VKC_DNCONV_ROWS) {
+        struct { VkcDnConv c; int phase; } pc = {*p, 0};
+        VkcBind b0[5] = {B(in, 0), B(w, 0), B(ring, 0), B(out, 1), B(NULL, 0)};
+        uint32_t gx, gy; grid(((uint64_t)p->S * (uint64_t)p->CD + 255) / 256, &gx, &gy);
+        if (!record(KC.dncr, b0, 5, &pc, sizeof pc, gx, gy, 1)) return 0;
+        pc.phase = 1;   /* the ring after the last row (and snap after snap_row), once every output read it */
+        VkcBind b1[5] = {B(in, 0), B(w, 0), B(ring, 1), B(NULL, 0), B(snap, snap != NULL && snap != ring)};
+        if (snap == ring) b1[4].written = 0;
+        grid(((uint64_t)p->CD + 255) / 256, &gx, &gy);
+        return record(KC.dncr, b1, 5, &pc, sizeof pc, gx, gy, 1);
+    }
     VkcBind bd[5] = {B(in, 0), B(w, 0), B(ring, 1), B(out, 1), B(snap, snap != NULL && snap != ring)};
     if (snap == ring) bd[4].written = 0;   /* the same buffer: tracked once, as written */
     uint32_t gx, gy; grid(((uint64_t)p->CD + 63) / 64, &gx, &gy);
@@ -1904,6 +1997,70 @@ int vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p
     if (e == y) bd[4] = (VkcBind){y->buf, 0, 0, 0};
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     return record(KC.pipe[P_EW], bd, 5, p, sizeof *p, gx, gy, 1);
+}
+/* ---- the hybrid steps' events (vk_chain.h) ---------------------------------------- */
+#define VKC_EV_RING 256
+static struct { VkEvent g[VKC_EV_RING], h[VKC_EV_RING]; unsigned long long serial[VKC_EV_RING]; uint64_t step[VKC_EV_RING]; int on, tried; } g_ev;
+static int ev_init(void) {
+    if (g_ev.on) return 1;
+    if (g_ev.tried || !vkc_ready()) return 0;
+    g_ev.tried = 1;
+    VkEventCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    for (int k = 0; k < VKC_EV_RING; k++)
+        if (vkCreateEvent(KC.dev, &ci, NULL, &g_ev.g[k]) != VK_SUCCESS || vkCreateEvent(KC.dev, &ci, NULL, &g_ev.h[k]) != VK_SUCCESS) return 0;
+    g_ev.on = 1;
+    return 1;
+}
+int vkc_ev_ready(void) { return ev_init(); }
+/* step g's slot, its events reset once the frame that used them last is done */
+static int ev_slot(uint64_t g) {
+    int k = (int)(g % VKC_EV_RING);
+    if (g_ev.step[k] == g) return k;
+    if (g_ev.serial[k] && !vkc_wait_serial(g_ev.serial[k])) return -1;
+    if (vkResetEvent(KC.dev, g_ev.g[k]) != VK_SUCCESS || vkResetEvent(KC.dev, g_ev.h[k]) != VK_SUCCESS) return -1;
+    g_ev.step[k] = g; g_ev.serial[k] = 0;
+    return k;
+}
+int vkc_ev_signal(uint64_t g) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost || !ev_init()) return 0;
+    int k = ev_slot(g);
+    if (k < 0) return 0;
+    /* everything before it done and visible to the host, then the event */
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(f->cmd, ALL_STAGES, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdSetEvent(f->cmd, g_ev.g[k], ALL_STAGES | VK_PIPELINE_STAGE_HOST_BIT);
+    KC.st.barriers++;
+    track_reset();
+    g_ev.serial[k] = KC.serial;
+    return 1;
+}
+int vkc_ev_wait(uint64_t g) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost || !ev_init()) return 0;
+    int k = ev_slot(g);
+    if (k < 0) return 0;
+    if (KC.prof) prof_mark(f, PK_EW);   /* the gap to the next mark is the wait: PK_WAIT's */
+    VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = ALL_RW};
+    vkCmdWaitEvents(f->cmd, 1, &g_ev.h[k], VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 1, &hb, 0, NULL, 0, NULL);
+    if (KC.prof) prof_mark(f, PK_WAIT);
+    KC.st.barriers++;
+    track_reset();
+    g_ev.serial[k] = KC.serial;
+    return 1;
+}
+int vkc_ev_host_done(uint64_t g) {
+    if (!g_ev.on || KC.lost) return -1;
+    VkResult r = vkGetEventStatus(KC.dev, g_ev.g[g % VKC_EV_RING]);
+    return r == VK_EVENT_SET ? 1 : r == VK_EVENT_RESET ? 0 : -1;
+}
+int vkc_ev_host_set(uint64_t g) {
+    /* set even once the chain counts the device lost: a frame submitted before (a software
+     * device's, or a fault injected at a later submission) may still be waiting for it, and
+     * a truly lost device just returns an error */
+    if (!g_ev.on || !KC.dev) return 0;
+    return vkSetEvent(KC.dev, g_ev.h[g % VKC_EV_RING]) == VK_SUCCESS;
 }
 enum { QSA_SCORES = 1, QSA_SELECT };   /* the modes of chain_qsa.comp that VkcQsa mode 1 runs in turn */
 int vkc_qsa(VkcBuf *src, VkcBuf *w, VkcBuf *pk, VkcBuf *cs, VkcBuf *sc, VkcBuf *sel, const VkcQsa *p) {
@@ -2169,6 +2326,9 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
      * both sides of the shader's choice stays in bounds (the 256-byte dummy would not) */
     VkcRoute q = *p;
     if (!q.has_bias) q.b_off = q.l_off;
+    static int sg = -1;   /* COLI_VK_ROUTE_SG=0: every row on the workgroup's path */
+    if (sg < 0) { const char *e = getenv("COLI_VK_ROUTE_SG"); sg = !(e && *e == '0'); }
+    if (!sg) q.wg = 1;
     VkcBind bd[4] = {B(logits, 0), B(q.has_bias ? bias : logits, 0), B(ids, 1), B(w, 1)};
     uint32_t gx, gy; grid((uint64_t)q.S, &gx, &gy);
     return record(KC.mpipe[PM_ROUTE], bd, 4, &q, sizeof q, gx, gy, 1);
@@ -2304,6 +2464,8 @@ static int moe_build(void) {
 static int rows_make(void);
 static VkPipeline grp_pipe(int v, int t, int coop);
 static VkPipeline grpq_pipe(int v, int coop);
+static VkPipeline grpw_pipe(int v, int t);
+static int grp_wide_rows(void);
 int vkc_prewarm(const VkcPrewarm *pw) {
     const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
     if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
@@ -2339,6 +2501,8 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             VkPipeline g = KC.mod_bdg ? bdg_pipe(t, 64) : VK_NULL_HANDLE;   /* the same row against 64 rows of x */
             struct VkcPC pc = {100 + t, 64, 256, 1, 64, 0};
             if (g && ok) { ok = record(g, bd, 4, &pc, sizeof pc, 1, 1, 1); n += ok; }
+            VkPipeline gw = g && g == KC.bdgc[t] ? bdgw_pipe(t) : VK_NULL_HANDLE;   /* and on the 128 tile */
+            if (gw && ok) { ok = record(gw, bd, 4, &pc, sizeof pc, 1, 1, 1); n += ok; }
         }
     }
     /* the experts' (1 colibri's formats, 2 the block formats'): a table without a resident
@@ -2380,8 +2544,8 @@ int vkc_prewarm(const VkcPrewarm *pw) {
      * table entry has only the block table's address for the decoders' tables: nothing is
      * read past them, nothing written. */
     if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours) && rows_make()) {
-        struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } rp =
-            {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0};
+        struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; int tm, bo1, bo0; } rp =
+            {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0, 32, 32, 64};
         VkcBind rb[7] = {B(ids, 0), B(tab, 0), B(hid, 1), B(y, 1), B(w, 1), B(x, 1), B(rw, 1)};
         ok = record(KC.rows, rb, 7, &rp, sizeof rp, 1, 1, 1); n += ok;
         uint64_t ta = coli_vk_block_table_addr(g_kd);
@@ -2393,8 +2557,8 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         for (int t = 0; t < 64 && ok; t++)
             for (int v = 0; v < 2 && ok; v++) {
                 if (!((v ? pw->ex_gu : pw->ex_dn) >> t & 1)) continue;
-                for (int c = 0; c < 2 && ok; c++) {   /* in floats and on the matrix units */
-                    VkPipeline g = grp_pipe(v, t, c);
+                for (int c = 0; c < 3 && ok; c++) {   /* in floats, on the matrix units and at their wider item */
+                    VkPipeline g = c < 2 ? grp_pipe(v, t, c) : grp_wide_rows() > 0 ? grpw_pipe(v, t) : VK_NULL_HANDLE;
                     if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
                 }
             }
@@ -2422,7 +2586,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     }
     /* a decode's attention over its positions' blocks (chain_attn_dec), its join launched on
      * one row of one position */
-    if (ok && pw->attn_hd > 0 && pw->attn_gq > 1) adg_pipe(pw->attn_hd, pw->attn_gq);   /* its grouped mode: made, not run */
+    if (ok && pw->attn_hd > 0 && pw->attn_gq > 0) adg_pipe(pw->attn_hd, pw->attn_gq);   /* its grouped mode: made, not run */
     if (ok && pw->attn_hd > 0 && adec_pipe()) {
         struct { VkcAttnW w; int mode, L, nb; } pc;
         memset(&pc, 0, sizeof pc);
@@ -2497,6 +2661,10 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
         int t = p->gfmt - 100, kq = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14;
         int wide = kq || (long long)p->K * ((p->I + 63) / 64) >= 128;
         rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
+        /* Q6_K's down at 4 steps: its step's decode wants more lanes a row (an RTX PRO 4000,
+         * D 2048 I 512 K 8: 27.4 -> 20.9 us; D 2560 I 640 K 10 34.1 -> 32.3; the other types
+         * the same or slower) */
+        if (p->dfmt == 114) sd = 4;
     }
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */
@@ -2603,6 +2771,30 @@ static VkPipeline rows_pipe(int v, int f, int coop) {
 static int rows_coop(int v, int f, VkPipeline p) {
     return p && (f >= 100 && f < 164 ? p == KC.grpc[v][f - 100] : our_fmt(f) && p == KC.grpqc[v]);
 }
+/* the grouped GEMM's wider item for pass v and ggml type t (qmatmul_grp*_bdcw.comp, 64 rows
+ * by 128 decoded rows): where the matrix units take the type, made on first use */
+static VkPipeline grpw_pipe(int v, int t) {
+    static const char *file[2] = {"qmatmul_grp_bdcw.spv", "qmatmul_grp_gate_up_bdcw.spv"};
+    if (t < 0 || t >= 64 || !grp_pipe(v, t, 1)) return VK_NULL_HANDLE;
+    if (!KC.grpw_tried[v][t]) {
+        KC.grpw_tried[v][t] = 1;
+        if (kc_shared_limit() >= GRP_BDCW_SHARED) {
+            if (!KC.mod_grpw[v]) KC.mod_grpw[v] = load_module(KC.core.spv_path, file[v]);
+            int32_t c[2] = {t, KC.core.coop_sg};
+            VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+            VkSpecializationInfo si = {2, me, sizeof c, c};
+            if (KC.mod_grpw[v]) KC.grpw[v][t] = coop_pipe(KC.mod_grpw[v], &si);
+        }
+    }
+    return KC.grpw[v][t];
+}
+/* the experts' rows a chunk's pairs give each on average from which the wider item takes both
+ * passes: COLI_VK_GRP_WIDE (0 never) */
+static int grp_wide_rows(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_VK_GRP_WIDE"); v = e && *e ? atoi(e) : 32; if (v < 0) v = 0; }
+    return v;
+}
 /* One dispatch whose group counts the device wrote (args at byte off of a buffer an earlier
  * dispatch of the frame wrote): the bindings' hazards as record's, and a barrier the
  * indirect read waits on. */
@@ -2670,18 +2862,23 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     if (p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || E < 1 || E > VKC_ROUTE_EMAX || p->act != 0 || p->D % 64 ||
         p->I % 64 || p->t_off < 0 || p->x_off || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
     size_t pairs = (size_t)p->S * p->K;
-    int nob1 = (p->I + 31) / 32, nob0 = (p->D + 63) / 64;
+    /* the wider item when the experts' rows fill it, both passes on the matrix units */
+    int wr = grp_wide_rows();
+    int wide = wr > 0 && !p->floats && p->gfmt >= 100 && p->dfmt >= 100 && pairs >= (size_t)wr * E &&
+               grpw_pipe(1, p->gfmt - 100) && grpw_pipe(0, p->dfmt - 100);
+    int tm = wide ? 64 : 32, bo1 = wide ? 64 : 32, bo0 = wide ? 128 : 64;
+    int nob1 = (p->I + bo1 - 1) / bo1, nob0 = (p->D + bo0 - 1) / bo0;
     /* a pass's items at most: every expert's partial tile and the pairs' whole ones */
-    size_t imax = ((pairs + 31) / 32 + (size_t)E) * (size_t)(nob1 > nob0 ? nob1 : nob0);
+    size_t imax = ((pairs + tm - 1) / tm + (size_t)E) * (size_t)(nob1 > nob0 ? nob1 : nob0);
     if (imax > 65535 * 16) return 0;
     uint64_t ta = coli_vk_block_table_addr(g_kd);
     if (!vkc_reserve(&r->cnt, (size_t)3 * E * 4, VKC_DEV) || !vkc_reserve(&r->amap, pairs * 4, VKC_DEV) ||
         !vkc_reserve(&r->items, 2 * imax * 16, VKC_DEV) || !vkc_reserve(&r->etab, (size_t)32 * E * 4, VKC_DEV) ||
         !vkc_reserve(&r->aux, 32, VKC_DEV) || !vkc_reserve(&r->hid, pairs * p->I * 4, VKC_DEV) ||
         !vkc_reserve(&r->yk, pairs * p->D * 4, VKC_DEV)) return 0;
-    struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } pc =
+    struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; int tm, bo1, bo0; } pc =
         {0, p->S, p->K, E, p->D, p->I, p->t_off, (int)imax, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row,
-         (uint32_t)ta, (uint32_t)(ta >> 32)};
+         (uint32_t)ta, (uint32_t)(ta >> 32), tm, bo1, bo0};
     uint32_t gp = (uint32_t)((pairs + 255) / 256);
     /* count, plan, scatter: their tables in r */
     VkcBind sb[7] = {B(ids, 0), B(table, 0), B(r->cnt, 1), B(r->amap, 1), B(r->items, 1), B(r->etab, 1), B(r->aux, 1)};
@@ -2695,13 +2892,15 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     r->etab->last_frame = KC.serial;
     /* on the matrix units unless the caller keeps the floats (p->floats: the tier's host pool,
      * whose experts the GEMMs read over PCIe; there the floats' were faster) */
-    VkPipeline pgu = rows_pipe(1, p->gfmt, !p->floats), pdn = rows_pipe(0, p->dfmt, !p->floats);
+    VkPipeline pgu = wide ? grpw_pipe(1, p->gfmt - 100) : rows_pipe(1, p->gfmt, !p->floats),
+               pdn = wide ? grpw_pipe(0, p->dfmt - 100) : rows_pipe(0, p->dfmt, !p->floats);
     ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
     ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
-    if (ok) KC.st.grp_coop += rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
+    if (ok) KC.st.grp_coop += wide ? 2 : rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
+    if (ok && wide) KC.st.grp_wide += 2;
     /* the rows' sums over their experts, in rank order */
     pc.mode = 3;
     VkcBind yb[7] = {B(ids, 0), B(table, 0), B(NULL, 0), B(NULL, 0), B(w, 0), B(r->yk, 0), B(y, 1)};
@@ -2955,6 +3154,7 @@ static VkPipeline kf_coop_pipe(int hd) {
                   .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
+    host_first();
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
     return KF.cpipe[k];
 }
@@ -3319,6 +3519,13 @@ void vkc_shutdown(void) {
     for (int i = 0; i < P_NPIPE; i++) {
         if (KC.pipe[i]) vkDestroyPipeline(KC.dev, KC.pipe[i], NULL);
         if (KC.mod[i]) vkDestroyShaderModule(KC.dev, KC.mod[i], NULL);
+        if (i == 0 && g_ev.tried) {   /* the hybrid steps' events */
+            for (int k = 0; k < VKC_EV_RING; k++) {
+                if (g_ev.g[k]) vkDestroyEvent(KC.dev, g_ev.g[k], NULL);
+                if (g_ev.h[k]) vkDestroyEvent(KC.dev, g_ev.h[k], NULL);
+            }
+            memset(&g_ev, 0, sizeof g_ev);
+        }
     }
     for (int i = 0; i < KC.nkdarec; i++) vkDestroyPipeline(KC.dev, KC.kdarec[i], NULL);
     for (int i = 0; i < KC.nkdar; i++) if (KC.kdar[i]) vkDestroyPipeline(KC.dev, KC.kdar[i], NULL);
@@ -3333,6 +3540,7 @@ void vkc_shutdown(void) {
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     for (int i = 0; i < KC.ndnrr; i++) if (KC.dnrr[i]) vkDestroyPipeline(KC.dev, KC.dnrr[i], NULL);
     if (KC.mod_dnrr) vkDestroyShaderModule(KC.dev, KC.mod_dnrr, NULL);
+    if (KC.dncr) vkDestroyPipeline(KC.dev, KC.dncr, NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.gemv4n) vkDestroyPipeline(KC.dev, KC.gemv4n, NULL);
@@ -3342,6 +3550,7 @@ void vkc_shutdown(void) {
     if (KC.mod_mdec) vkDestroyShaderModule(KC.dev, KC.mod_mdec, NULL);
     if (KC.mod_adec) vkDestroyShaderModule(KC.dev, KC.mod_adec, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
+    if (KC.mod_dncr) vkDestroyShaderModule(KC.dev, KC.mod_dncr, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.bd) vkDestroyPipeline(KC.dev, KC.bd, NULL);
@@ -3353,9 +3562,13 @@ void vkc_shutdown(void) {
     if (KC.mod_fetch) vkDestroyShaderModule(KC.dev, KC.mod_fetch, NULL);
     for (int t = 0; t < 64; t++) if (KC.bdgc[t]) vkDestroyPipeline(KC.dev, KC.bdgc[t], NULL);
     if (KC.mod_bdgc) vkDestroyShaderModule(KC.dev, KC.mod_bdgc, NULL);
+    for (int i = 0; i < 64; i++) if (KC.bdgw[i]) vkDestroyPipeline(KC.dev, KC.bdgw[i], NULL);
+    if (KC.mod_bdgw) vkDestroyShaderModule(KC.dev, KC.mod_bdgw, NULL);
     for (int v = 0; v < 2; v++) {
         for (int t = 0; t < 64; t++) if (KC.grpc[v][t]) vkDestroyPipeline(KC.dev, KC.grpc[v][t], NULL);
         if (KC.mod_grpc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpc[v], NULL);
+        for (int t = 0; t < 64; t++) if (KC.grpw[v][t]) vkDestroyPipeline(KC.dev, KC.grpw[v][t], NULL);
+        if (KC.mod_grpw[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpw[v], NULL);
     }
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);

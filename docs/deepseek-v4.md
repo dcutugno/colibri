@@ -1185,6 +1185,31 @@ batches several tokens per expert load. The `decprof` line gained a
 `[block: alloc free total pre marks tail]` tail (the block function's
 time around its stage marks; `pre` was the print itself, now ~0.2 ms).
 
+DeepInfer (2026-11-03): DeepSeek's production inference engine, open
+since 2026-10-20 (Apache-2.0, github.com/deepseek-ai/DeepInfer), read
+for what this engine could borrow. It serves DeepSeek-V4.1-Flash on
+NVIDIA SM100 and Ascend 950 across a scale-up domain (attention DP,
+MoE expert parallelism with load balancing, FlashMLA, DeepGEMM, DeepEP,
+DeepSelect, TileLang kernels), built on vLLM; the experts live in GPU
+memory and the serving cost is compute and interconnect, so the kernels
+and the parallelism do not transfer to one consumer card streaming
+experts from NVMe, where the token is expert bytes over the drives and
+PCIe. Two ideas were worth a measurement here. Speculative decoding
+(DSpark with confidence-scheduled verification, drafts up to 5):
+this engine carries DSpark's drafter and full MTP; on today's build
+`V4_MTP=1` 10.19 s and `V4_DRAFT=1` 9.99 s after the first token
+against 9.6 s plain, the text the same. The reason is structural: a
+verification batch of k tokens loads the union of their experts, and
+consecutive tokens share only ~35 % of them, so the MoE cost grows
+almost with k and the win per accepted token is small even before the
+replay of a rejected suffix; the setups where it pays have the experts
+resident. Bounded replay ("SWA bounded replay", a kept suffix of 140
+tokens) addresses the replay cost on their YOCO decoder; this model's
+recurrent compressor state has no such suffix, though an undo log of the
+few rows a token changes (its ring slot, its compressor rows, an emitted
+row every fourth token) would make a rejection cheap if speculation
+ever paid. Nothing else applies.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
