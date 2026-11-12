@@ -1396,6 +1396,40 @@ without the profile (9.64 before), md5 85d209f4e138;
 `V4_LAYER_FUSED_VERIFY` and `DSV4_WO_VERIFY` clean over 1,505 calls
 each; with the second card 9.84 s profiled (10.27 before).
 
+Upstream pull requests from this work (2026-11-12, each a branch cut from
+dev, measured on dev itself with an experiment manifest under
+`docs/experiments`):
+
+- `fix/v4-head-lazy-upload` (`DSV4_CUDA_HEAD_LAZY`): the exact head
+  uploaded at the first head call. On dev, same commit: 81.5 -> 66.2 s to
+  the first token of the 3.3k prompt, the 556 `kv ring / kv comp
+  allocation: out of memory` lines per run gone.
+- `perf/v4-hc-decode-calling-thread` (`V4_HC_TEAM`): a decode token's
+  hyper-connection steps on a team of 6 for the mix and on the calling
+  thread for the column loops when the GPU tier is on; dev's loops kept,
+  only their team sized (`if` / `num_threads` clauses), so identical by
+  construction. On dev: hc 27.2 -> 17.0 ms per token, 22.45 -> 22.29 s
+  after the first token (a token there is 640 ms). Team sizes: 0 (the
+  default team) 27.2, 1 30.5, 4 18.4, 6 16.8, 8 18.7, 12 18.4, 16 19.7.
+- dev's `decprof` line is one write already: the 37 ms per token of the
+  thirty-fourth measurement was this branch's own longer line.
+
+What the second one found about this branch's hyper-connection forms
+(the twenty-fifth to twenty-seventh measurements: the plain column
+loops, `V4_HC_MIX_GROUP`, `V4_HC_MIX_TEAM`). They were called bitwise on
+the strength of the generated text. Compared directly now (each result
+of `coli_hc_pre` / `coli_hc_post` hashed against dev's header, GCC 16.1
+`-O3 -march=native -fopenmp`, the shape known only at run time as in the
+engine): identical in every mode for hc 4 with d 4096, 1021, 2048 and
+5120, for hc 8 and for hc 2; for hc 3, d 37 the single-thread grouped
+mix (`V4_HC_MIX_TEAM=1`) differs in `comb`. A first form of the pull
+request with the same regrouping inside one function differed by 1 ulp
+for most shapes, hc 4 x 4096 included. So this branch's forms are equal
+where the engine uses them (V4 Flash is hc 4, d 4096), but by
+measurement, not by construction: on FMA targets GCC contracts a
+differently shaped loop differently. A change to these loops needs the
+direct comparison, not the text md5.
+
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
 `DSV4_IDX_VERIFY=1` (GPU indexer projection/scoring and the fused selection
