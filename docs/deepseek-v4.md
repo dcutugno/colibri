@@ -1413,6 +1413,35 @@ dev, measured on dev itself with an experiment manifest under
   default team) 27.2, 1 30.5, 4 18.4, 6 16.8, 8 18.7, 12 18.4, 16 19.7.
 - dev's `decprof` line is one write already: the 37 ms per token of the
   thirty-fourth measurement was this branch's own longer line.
+- `perf/v4-decode-attention-fused` (`V4_LAYER_FUSED`, off by default there):
+  the fused decode attention layer carved onto dev, with the chained forms
+  under it and the kernels they share; dev's `coli_v4_indexer_select_batch`,
+  expert pipeline and prompt paths untouched. On dev: attention 81.6 ->
+  20.1 ms per token, 22.81 -> 20.52 s after the first token, 85.0 -> 63.2 s
+  to the first token (with the switch on dev's unread resident copies are
+  not uploaded, so the prompt's 556 allocation failures go too); both
+  verifiers clean over 1,505 calls each.
+
+The first two are JustVugg/colibri#2772 and #2773 (accepted into the next
+batch), the third #2778. The plan agreed in JustVugg/colibri#2774: decode
+attention next (off by default with the verify switch, on by default once
+measured on more than one card), then the expert pipeline ported INTO
+dev's per-device mirror caches (the peer pool, layer placement and full
+residency stand on them), one pull request per piece and each behind its
+own switch: the one-block mirror, the uploader thread with the fence, the
+piece uploads under the read, the next layer's prediction; the matvec
+kernels that change the summation order measured against
+`DSV4_CUDA_MOE_FUSED6` first; then the prompt path.
+
+Dev's other state on this box (15f810f0, per decode token): hc 27, attention
+81, MoE 525 ms; with dev's own opt-in switches (`V4_GPU_RESIDENT_FIRST`,
+`V4_ATTN_BATCH_PROJ`, `V4_IDX_FAST`, `DSV4_CUDA_MOE_FUSED6`,
+`V4_GPU_ROUTE_REUSE`) attention 72, MoE 492, 20.98 s after the first token.
+
+This branch does not pass upstream's CPU-only test build (`make -C c
+check` under Linux): the predictor's counters and the expert slot's shift
+fields are declared under the GPU tier and used outside it. The attention
+unit is fixed; the rest gets fixed as each piece is ported.
 
 What the second one found about this branch's hyper-connection forms
 (the twenty-fifth to twenty-seventh measurements: the plain column
