@@ -2403,16 +2403,17 @@ static int attention_token_impl(float *output,
     if (aprof) clock_gettime(CLOCK_MONOTONIC, &ap0);
 #define AP_MARK(acc) do { if (aprof) { clock_gettime(CLOCK_MONOTONIC, &ap1); acc += (ap1.tv_sec - ap0.tv_sec) + (ap1.tv_nsec - ap0.tv_nsec) * 1e-9; ap0 = ap1; } } while (0)
     int gpu_proj = 0, qa_done = 0, kv_done = 0;
-    int fused_done = 0, fused_checked = 0, lf_sel_n = 0, lf_emit = 0;
+    int fused_done = 0;
+    float comp_kv[1024], comp_gate[1024];
+#ifdef COLI_V4_GPU_TIER
+    float idx_kv[256], idx_gate[256];
+    int idx_proj = 0;
+    int fused_checked = 0, lf_sel_n = 0, lf_emit = 0;
     float *lf_out = NULL, *lf_kv = NULL, *lf_qa = NULL, *lf_q = NULL;
     int *lf_sel = NULL;
     float lf_ckv[1024], lf_cg[1024], lf_ikv[256], lf_ig[256];
     float lf_emit_a[1024], lf_emit_i[1024];
     int lf_comp_before = 0, lf_idx_before = 0;
-#ifdef COLI_V4_GPU_TIER
-    float comp_kv[1024], comp_gate[1024];
-    float idx_kv[256], idx_gate[256];
-    int idx_proj = 0;
     int comp_rows = (weights->plan.compression_ratio == 4 ? 2 : 1) * head_dim;
     int idx_rows = 2 * config->index_head_dim;
     /* V4_LAYER_FUSED: the whole layer in one round trip when the token
@@ -2909,6 +2910,7 @@ static int attention_token_impl(float *output,
                 weights->plan.layer, position, bq, wq_, ba, wa_, bo, wo_, bh, wh);
     }
     free(chain_out); free(chain_att); free(chain_oa); free(chain_q);
+#ifdef COLI_V4_GPU_TIER
     if (!result && fused_checked) {
         /* V4_LAYER_FUSED_VERIFY: the fused layer's output, kv row, qa, q
          * (when the host made one), compressor projections and selection
@@ -2968,6 +2970,7 @@ static int attention_token_impl(float *output,
                 lf_sel_n, sel_cmp, lf_emit, be);
     }
     free(lf_out); free(lf_kv); free(lf_qa); free(lf_q); free(lf_sel);
+#endif
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
