@@ -245,9 +245,17 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         t->type = (int)gguf_rd_u32(&r);
         uint64_t rel = gguf_rd_u64(&r);
         if (r.bad) { free(t->name); break; }
-        int64_t rb = gq_row_bytes(t->type, t->ne[0]);
+        /* 64.. are the engine's own interleaved forms (GQ_*_R16), built at load for whole groups
+         * of 16 rows: never a file's type, or its rows are read as groups they do not fill */
+        int64_t rb = (t->type >= 0 && t->type < GQ_TYPE_MAX) ? gq_row_bytes(t->type, t->ne[0]) : -1;
         if (rb < 0) { r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s: type %d (%s) cannot hold rows of %lld", path, t->name, t->type, gq_type_name(t->type), (long long)t->ne[0]); free(t->name); break; }
-        t->nbytes = rb * (numel / t->ne[0]);
+        int64_t rows = numel / t->ne[0];
+        if (rb > INT64_MAX / rows) {
+            r.bad = 1;
+            snprintf(g->err, sizeof g->err, "%s: tensor %s byte size overflows int64", path, t->name);
+            free(t->name); break;
+        }
+        t->nbytes = rb * rows;
         t->file = part; t->off = rel;          /* made absolute below */
         g->n_tensors++;
     }
@@ -291,10 +299,18 @@ static int gguf_is_file(const char *path) {
  * (NAME-00001-of-000NN.gguf), in which case every part is opened. */
 static int gguf_open(gguf_ctx *g, const char *path) {
     memset(g, 0, sizeof *g);
-    const char *of = strstr(path, "-of-");
+    const char *filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+#ifdef _WIN32
+    const char *backslash = strrchr(filename, '\\');
+    if (backslash) filename = backslash + 1;
+#endif
+    size_t flen = strlen(filename);
+    const char *of = flen >= 20 ? filename + flen - 14 : NULL;
     int parts = 1;
     size_t plen = strlen(path);
-    if (of && of - path >= 6 && plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
+    if (of && !strncmp(of, "-of-", 4) && of - filename >= 6 &&
+        plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
         const char *num = of - 5;
         int a = atoi(num), b = atoi(of + 4);
         if (num[-1] == '-' && a == 1 && b >= 1 && b <= 9999) parts = b;
@@ -349,6 +365,17 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
         p += r; pos += (uint64_t)r; left -= r;
     }
     return 0;
+}
+
+/* Ask the OS to read n bytes at byte `off` inside tensor t ahead (POSIX_FADV_WILLNEED), so a
+ * gguf_read of them later finds them in the page cache; nothing where there is no fadvise. */
+static void gguf_advise(const gguf_ctx *g, const gguf_tensor *t, int64_t off, int64_t n) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(_WIN32)
+    if (off < 0 || n <= 0 || off > t->nbytes || n > t->nbytes - off) return;
+    (void)posix_fadvise(g->fds[t->file], (off_t)(t->off + (uint64_t)off), (off_t)n, POSIX_FADV_WILLNEED);
+#else
+    (void)g; (void)t; (void)off; (void)n;
+#endif
 }
 
 /* Whole tensor to float32 (any supported type). dst holds numel floats. */

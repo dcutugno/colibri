@@ -1456,6 +1456,27 @@ memInfo.free:                     23.50 GB (97%)
                     self.assertEqual(ram["dense_bytes"], cpu["dense_bytes"])
                     self.assertEqual(ram["expert_cache_bytes"], cpu["expert_cache_bytes"])
 
+    def test_vulkan_plan_sizes_the_device_coli_vk_dev_names(self):
+        """#2127: two discrete GPUs, the small one enumerated first. The engine opens
+        COLI_VK_DEV's device; the plan sized the ranking's first discrete one."""
+        self.write_qwen38()
+        MiB = 1 << 20
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[])
+        small = {"name": "RTX 3050", "type": "discrete", "budget_bytes": GB + MiB}
+        large = {"name": "RTX 5060 Ti", "type": "discrete", "budget_bytes": 16 * GB}
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": [small, large]}):
+            ranked = build_plan(self.model, env={"COLI_VULKAN": "1"}, **kwargs)
+            chosen = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DEV": "1"}, **kwargs)
+            ignored = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DEV": "2"}, **kwargs)
+        self.assertEqual(ranked["vulkan"]["name"], "RTX 3050")
+        self.assertEqual(ranked["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(chosen["vulkan"]["name"], "RTX 5060 Ti")
+        self.assertGreater(chosen["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertIn("Vulkan · RTX 5060 Ti", format_plan(chosen))
+        # out of range: the engine ignores it and ranks, and so does the plan
+        self.assertEqual(ignored["vulkan"]["name"], "RTX 3050")
+
     def test_vulkan_device_only_decision_follows_the_engine_rule(self):
         from resource_plan import vk_dense_device_only
         on = {"COLI_VULKAN": "1"}
@@ -1798,6 +1819,10 @@ memInfo.free:                     23.50 GB (97%)
         text = format_plan(plan)
         self.assertIn("next actions:", text)
         self.assertIn("coli tune --model <model>", text)
+        action = plan["next_actions"][0]
+        self.assertIn('iobench "<model-shard>" 19 64 8 1', action["command"])
+        self.assertIn(action["command"], text)
+        self.assertIn("existing model weight file of at least 38 MiB", text)
 
     def test_trusted_storage_probe_removes_probe_action(self):
         info = analyze_model(self.model)
@@ -3178,7 +3203,11 @@ class WindowsCommitLimitTest(unittest.TestCase):
 
     def test_physical_is_used_when_commit_is_larger_or_unknown(self):
         self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
-        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, None), 110 << 30)
+
+    def test_zero_commit_headroom_is_not_an_unknown_measurement(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 0)
+        self.assertEqual(windows_available_bytes(0, 40 << 30), 0)
 
     def test_memorystatusex_layout_is_the_documented_one(self):
         # Order matters for ctypes: a skipped field shifts every later one.

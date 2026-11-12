@@ -108,6 +108,57 @@ measurements and what they leave out are in
 9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
 ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
 
+## The prefix store
+
+An agent starts every task as a new conversation on the same system prompt and tools, thousands
+of tokens, then a question of its own. Three of every four layers here are DeltaNet, whose
+recurrence cannot be wound back: the state a slot holds is the last conversation's end, not the
+point where the new one parts from it, so the new conversation read its whole prompt again. The
+store (`prefix_store.h`, `COLI_PREFIX_STORE`, on) keeps every prompt read by content:
+
+- the full attention layers' K/V rows in blocks of 256 tokens, each named by its tokens and the
+  block before it, so every prompt that starts with the same tokens shares them;
+- checkpoints of the rest (the DeltaNet recurrences and conv windows, a sliding layer's ring and
+  its positions) where a prompt's messages start (the prompt is read in pieces there: after the
+  system prompt, where a new conversation on it parts, and where the last message starts) and
+  where a turn ends.
+
+A request takes the deepest checkpoint its prompt starts with, when it reaches further than what
+its slot holds: the rows go back into the slot's cache, the state into the layers, and only what
+follows is read. Any slot takes any prefix, so a conversation the gateway sends back to the other
+slot reads only what is new. The budget is a quarter of the free RAM at the first request, at most
+4 GiB (`COLI_PREFIX_STORE_MB`); the least recently used entries nothing follows go first, and an
+entry that would leave less than 1.5 GiB free goes only when older ones make the room. Off with the
+MTP head (its rows live on its device), for a picture's prompt and for a read-out.
+
+A request from the store gets the logits a fresh read gives: on Qwen3.6-35B-A3B the 12 steps
+after a 9,757-token prompt, every step's top five logits to six decimals, the same on the CUDA
+chain and on the Vulkan chain as with the prompt read whole (`tests/test_qwen36_prefix_store.py`
+holds the tiny fixture to it on the CPU, and fails when the state or the rows are not put back).
+
+Measured with a 9.7K-token system prompt (time to the first token; A1 and A2 one conversation,
+B1 and C1 new ones on the same system prompt, A3 the first one again):
+
+| | A1 | A2 | B1 | A3 | C1 |
+|---|---|---|---|---|---|
+| CUDA chain, RTX PRO 4000, one slot, before | 2.88 s | 0.08 | 2.88 | 0.05 | 2.83 |
+| CUDA chain, one slot, the store | 3.03 | 0.10 | 0.15 | 0.16 | 0.15 |
+| CUDA chain, two slots, before | 2.92 | 0.09 | 2.83 | 2.88 | 2.90 |
+| CUDA chain, two slots, the store | 3.04 | 0.08 | 0.14 | 0.15 | 0.18 |
+| Vulkan chain, one slot, before | 4.30 | 0.09 | 4.17 | 0.05 | 4.18 |
+| Vulkan chain, one slot, the store | 4.43 | 0.10 | 0.24 | 0.26 | 0.25 |
+| the CPU alone, 16 Zen 4 cores, 4.9K-token system prompt, before | 44.0 | 0.35 | 34.4 | 0.02 | 34.3 |
+| the CPU alone, the store | 42.7 | 0.39 | 0.38 | 0.31 | 0.31 |
+
+The first conversation pays its prompt read in two pieces and the checkpoint's copy (380 MiB of
+rows, the DeltaNet state): 0.1 s on the CUDA chain. A3 on one slot came back from the parked
+conversation before (0.05 s) and comes from the store now (0.16 s: the rows go up to the device
+again). With two slots A3 was read whole before: the gateway had sent it to the slot B held.
+
+The rows stay in the KV cache's float16. What block formats (8-bit and 4-bit, with scales every 16
+or 32 values) would cost this model's rows is measured in
+[experiments/kv-formats-2026-11-10.md](experiments/kv-formats-2026-11-10.md).
+
 ## Prompt-lookup drafts (on by default, `COLI_LOOKUP=0` turns them off)
 
 When the recent tokens repeat an n-gram of the prompt or the output (a code edit, a
@@ -141,6 +192,23 @@ python3 c/tools/convert_qwen36.py --model /path/to/hf-checkpoint \
   --out /path/to/converted-with-mtp
 SNAP=/path/to/converted-with-mtp Q36_MTP=1 ./c/qwen36 8 4 "Explain speculative decoding."
 ```
+
+**A dense model's GGUF (Qwen3.8-27B).** llama.cpp writes the head as one more
+layer, `blk.<n_layers>` with `nextn_predict_layers` 1: the decoder layer's
+tensors under their usual names and `nextn.eh_proj`, `nextn.enorm`,
+`nextn.hnorm` and `nextn.shared_head_norm` for `mtp.fc` and the three head
+norms (each stored as 1 + w, as the trunk's are). `Q36_MTP=1` reads it from the
+file the container links; its MLP is the layer's dense gate, up and down with no
+router and no gate. On the CUDA chain it runs on the card, its matrices placed
+as the trunk's. unsloth's UD-Q3_K_XL and UD-Q4_K_XL files carry the head; their
+UD-IQ2_XXS does not. Measured on the 27B, greedy, thinking off, every text
+identical to plain decoding:
+
+| | code | prose |
+|---|---|---|
+| CPU (Ryzen 7 8700GE, UD-Q3_K_XL): plain / one draft / three | 3.27 / 4.99 / 6.02 tok/s | 3.40 / 4.88 / 5.10 tok/s |
+| one draft, drafts accepted | 97.5 % | 80.7 % |
+| RTX PRO 4000 SFF (UD-Q4_K_XL, whole card): plain / two drafts / three | 20.7 / 43.4 / 45.0 tok/s | 20.6 / 30.9 / 30.0 tok/s |
 
 The computation follows Qwen's MTP module: at position p, concatenate the
 normalized embedding of token p+1 with the normalized backbone output h_p,
@@ -470,10 +538,57 @@ Through the gateway (`coli serve`), greedy decode ran at 2.1 tok/s in int8 and
 3.45 tok/s with everything in int4, after a load of 73 and 114 s; the answers
 to the same English, Italian and Turkish questions were the same but for a word.
 
+With the trunk in int4 the CPU interleaves its matrices by 16 rows at load
+(`[qwen36] trunk: 401 int4 matrices interleaved by 16`), so one integer
+dot product advances sixteen rows and a group of 64 needs no sum of its own
+for every row; the answers keep their bits (`Q36_ILV16=0` keeps the
+grouped layout). On a Ryzen 7 8700GE (16 threads), every matrix in int4, a
+1000-token prompt and 300 tokens of decode through `coli serve`:
+
+| build | prompt before | prompt now | decode before | decode now |
+|---|---|---|---|---|
+| x86-64-v3 (the release's) | 9.5 tok/s | 22.4 tok/s | 3.8 tok/s | 4.0 tok/s |
+| native (AVX-512 VNNI) | 9.2 tok/s | 41.1 tok/s | 3.7 tok/s | 4.0 tok/s |
+
+The int8 trunk's prompt on the same CPU is 43.6 tok/s, its decode 2.3.
+
 The MLP is 17 of the 27 billion parameters, so int4 on the MLP and the LM head
 keeps most of the saving at half the loss. With a matrix in int4 the engine
 no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what
 brings the full int4 run from 42.4 to 18.8 GB.
+
+#### From a GGUF on a CUDA card
+
+unsloth's dynamic mixes give a DeltaNet layer's `attn_qkv` and `attn_gate` two
+ggml types in about half the layers (UD-IQ2_XXS: IQ1_M or IQ1_S beside IQ2_XXS in
+25 of 48; UD-Q4_K_XL: Q4_K beside Q5_K in 26). Such a layer's in_proj sits on the
+card as two tensors in the file's two types (`[dnp] N of them as two tensors`), so
+every layer is on the device and the CUDA chain runs the trunk. On an RTX PRO 4000
+(24 GB), through `coli serve`, prompts of 1000 and 4000 tokens, then 128 tokens of
+decode:
+
+| file | before: prompt 1K / 4K, decode | now: prompt 1K / 4K, decode |
+|---|---|---|
+| UD-IQ2_XXS | 19.5 / 18.2, 10.0 tok/s | 408.0 / 242.6, 29.5 tok/s |
+| UD-Q4_K_XL | 18.9 / 17.4, 9.6 tok/s | 580.7 / 300.0, 19.5 tok/s |
+
+Before, a layer with two types kept its in_proj on the CPU and the chain
+stayed off (`the DeltaNet in_proj of layer 1 is not on a device`).
+
+The 27B's attention has six query heads a kv head (24 over 4). The chain's
+prompt attention on the tensor cores took groupings that divide 64, so its
+prompt rows went to a kernel on the CUDA cores, and its decode, which follows
+the prompt's path for its bits, read every position a block a head. Both now
+run as for the other models (`cc_attn_f2` three or six warps a block, a kv
+head's heads a block in the decode); the same card, prompts of 1000, 4000 and
+8000 tokens, the decode after 1000 and after 8000:
+
+| file | prompt 1K / 4K / 8K | decode after 1K / 8K |
+|---|---|---|
+| UD-IQ2_XXS, before | 411 / 244 / 144 tok/s | 30.3 / 14.7 tok/s |
+| UD-IQ2_XXS, now | 494 / 495 / 492 tok/s | 31.9 / 28.3 tok/s |
+| UD-Q4_K_XL, before | 556 / 290 / 160 tok/s | 19.2 / 12.1 tok/s |
+| UD-Q4_K_XL, now | 762 / 804 / 810 tok/s | 21.0 / 19.8 tok/s |
 
 #### Images
 

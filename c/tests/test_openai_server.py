@@ -59,6 +59,22 @@ def echo_record(pos, data, lp, topk):
             "topk": topk}
 
 
+@contextlib.contextmanager
+def _json_decoder_limit():
+    """json.loads raising RecursionError on a deeply nested array, as a decoder at its limit does.
+    How deep that is depends on the interpreter and its C stack (Python 3.12 stops near 1,000
+    levels; 3.14 with a large stack parses 100,000), so these tests make the limit happen at
+    their input on every version and check the server's policy, not the interpreter's."""
+    real = json.loads
+
+    def limited(s, *args, **kwargs):
+        if isinstance(s, str) and '[' * 64 in s:
+            raise RecursionError('maximum recursion depth exceeded while decoding a JSON array')
+        return real(s, *args, **kwargs)
+    with patch.object(json, 'loads', limited):
+        yield
+
+
 def _spawn_test_server(case, engine, kv_slots=1, max_tokens=16):
     """A throwaway APIServer on an ephemeral port, torn down with the test case."""
     server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", max_tokens,
@@ -613,6 +629,41 @@ class TemplateTest(unittest.TestCase):
             self.assertNotEqual(render_chat_for_arch(history, True, "xhigh"),
                                 render_chat_qwen38(history, True, "xhigh"))
 
+    def test_embedded_history_json_limits_keep_renderer_error_policy(self):
+        bad_arguments = ('[' * 10000 + '0' + ']' * 10000, '9' * 10000)
+        with _json_decoder_limit():
+            for arch in ('glm', 'glm53', 'qwen36', 'qwen38', 'mimo', 'olmoe'):
+                for raw in bad_arguments:
+                    with self.subTest(arch=arch, nested=raw.startswith('[')):
+                        engine = ScriptedEngine()
+                        base = _spawn_test_server(self, engine)
+                        body = {'model': 'test-model', 'messages': [
+                            {'role': 'user', 'content': 'run'},
+                            {'role': 'assistant', 'content': '', 'tool_calls': [
+                                {'id': 'x', 'type': 'function', 'function': {
+                                    'name': 'f', 'arguments': raw}}]},
+                            {'role': 'tool', 'tool_call_id': 'x', 'content': 'done'},
+                            {'role': 'user', 'content': 'continue'}]}
+                        with patch('openai_server.ARCH', arch), patch('openai_server._TOOL_FALLBACK', True):
+                            if arch in ('glm', 'glm53'):
+                                with _post_chat(base, body) as response:
+                                    self.assertEqual(response.status, 200)
+                                self.assertEqual(len(engine.calls), 1)
+                            else:
+                                status, error = _error_body(self, lambda: _post_chat(base, body))
+                                self.assertEqual(status, 400)
+                                self.assertIn('arguments', error['param'])
+                                self.assertEqual(engine.calls, [])
+
+    def test_coder_history_json_nesting_is_a_client_error(self):
+        raw = '[' * 10000 + '0' + ']' * 10000
+        with _json_decoder_limit(), self.assertRaises(APIError) as caught:
+            openai_server.render_chat_qwen3_coder([
+                {'role': 'assistant', 'content': '', 'tool_calls': [
+                    {'function': {'name': 'f', 'arguments': raw}}]}])
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, 'messages.0.tool_calls.0.function.arguments')
+
     def test_kimi_renders_tool_declaration_and_choice(self):
         tools = [{"type": "function", "function": {
             "name": "get_weather", "parameters": {"type": "object"}}}]
@@ -634,6 +685,29 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
         self.assertTrue(prompt.endswith("G 0\n"))
 
+    def test_kimi_renders_the_thinking_effort_as_the_reference_does(self):
+        """K3 and K3.1's template: a thinking-effort system message after the tools, its
+        values low, high and max; nothing without thinking or without an effort."""
+        body = ("`thinking_effort` guides on how much to think in your thinking channel "
+                "(not including the response channel), supported values include `low`, "
+                "`medium`, `high`, and `max`.\n"
+                "Now the system is invoked with `thinking_effort=max`.")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "max")
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 15 {len(body.encode('utf-8'))}\nthinking-effort{body}"
+                         "M user 2\nHiG 1\n")
+        for asked, sent in (("minimal", "low"), ("low", "low"), ("medium", "high"),
+                            ("high", "high"), ("xhigh", "max")):
+            self.assertIn(f"`thinking_effort={sent}`.", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], True, asked))
+        for thinking, effort in ((False, "max"), (True, None), (True, "none"), (True, "bogus")):
+            self.assertNotIn("thinking-effort", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], thinking, effort))
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "low", tools)
+        self.assertLess(prompt.index("tool-declare"), prompt.index("thinking-effort"))
+        self.assertLess(prompt.index("thinking-effort"), prompt.index("M user"))
+
     def test_kimi_renders_tool_calls_and_results(self):
         messages = [
             {"role": "user", "content": "Weather in Rome?"},
@@ -653,6 +727,18 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("V 6 7 4\nmetricbooleantrue", prompt)
         # O: the result resolves its name through tool_call_id
         self.assertIn("O 1 11 5\nget_weathersunny", prompt)
+
+    def test_kimi_argument_fallback_keeps_trailing_data(self):
+        for raw in ('{} trailing', '{"city":"Rome"} trailing', '{}{}'):
+            with self.subTest(raw=raw):
+                records = openai_server._k3_call_records(
+                    [{'function': {'name': 'f', 'arguments': raw}}], 'tool_calls')
+                self.assertEqual(records, [f'J 1 {len(raw)}\nf{raw}'])
+
+    def test_kimi_argument_parser_allows_only_whitespace_after_object(self):
+        self.assertEqual(openai_server._k3_parse_arguments(' {} \n'), [])
+        self.assertEqual(openai_server._k3_parse_arguments(' {"n":1e2} \t'),
+                         [('n', 'number', '1e2')])
 
     def test_kimi_tool_results_resort_by_call_id(self):
         messages = [
@@ -3869,6 +3955,28 @@ class HTTPTest(unittest.TestCase):
                     "model": "test-model", "messages": history}) as response:
                 self.assertEqual(response.status, 200)
         self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
+
+    def test_chat_template_kwargs_reach_the_template(self):
+        """Many OpenAI-compatible clients turn a Qwen model's thinking off with
+        chat_template_kwargs; it was ignored, and Qwen3.8 reasoned at xhigh. The body's own
+        key still wins, and a chat_template_kwargs that is not an object is refused."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        off = {"chat_template_kwargs": {"enable_thinking": False}}
+        cases = ((off, render_chat_qwen38(history, False, None)),
+                 (dict(off, enable_thinking=True), render_chat_qwen38(history, True, "xhigh")),
+                 ({"chat_template_kwargs": {"reasoning_effort": "low"}}, render_chat_qwen38(history, True, "low")))
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with self.request("/v1/chat/completions", {
+                            "model": "test-model", "messages": history, **extra}) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(self.engine.calls[-1][0], expected)
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history, "chat_template_kwargs": [1]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
 
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""

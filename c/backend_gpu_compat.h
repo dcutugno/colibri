@@ -98,6 +98,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventRecord          hipEventRecord
 #define cudaEventSynchronize     hipEventSynchronize
 #define cudaEventQuery           hipEventQuery
+#define cudaStreamQuery          hipStreamQuery       /* cuda_chain.cu: a signal's flush */
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree
@@ -115,6 +116,8 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
+#define cudaMallocAsync          hipMallocAsync      /* gemv_i8_w4's split-K partials */
+#define cudaFreeAsync            hipFreeAsync
 #define cudaMemset               hipMemset
 /* Device-side kernel abort (weight_at's undecodable-format backstop,
  * backend_cuda.cu). CUDA's __trap() intrinsic has no HIP name-twin; HIP

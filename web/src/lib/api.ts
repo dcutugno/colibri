@@ -91,6 +91,8 @@ export interface ProfileTurn {
   attention_s: number
   lm_head_s: number
   forwards: number
+  /* what the machine's devices used over the turn, once /power runs (joules) */
+  energy_j?: number
 }
 
 export interface ProfileResponse {
@@ -182,16 +184,36 @@ export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSig
   return (await response.json()) as ProfileResponse
 }
 
+/* The machine's power draw, from the gateway (c/power.py) when joules is installed next
+   to it (pip install landauer-gap). available is false, with the reason, when it is not
+   installed or the machine has no power counters; a gateway without /power is the same. */
+export interface PowerDevice { name: string; kind: string; watts: number | null }
+export interface PowerResponse {
+  available: boolean
+  reason?: string
+  watts?: number | null
+  energy_j?: number
+  simulated?: boolean
+  devices?: PowerDevice[]
+}
+
+export async function getPower(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<PowerResponse> {
+  const response = await fetch(serverEndpoint(baseUrl, "power"), { headers: headers(apiKey), signal })
+  if (!response.ok) return { available: false, reason: `${response.status} ${response.statusText}` }
+  return (await response.json()) as PowerResponse
+}
+
+/* "GPU 400 · CPU 60": the watts of each kind of device, the GPUs first */
+export function powerByKind(power: PowerResponse) {
+  const kinds = new Map<string, number>()
+  for (const device of power.devices ?? []) if (device.watts != null) kinds.set(device.kind, (kinds.get(device.kind) ?? 0) + device.watts)
+  return [...kinds].sort(([a], [b]) => Number(b === "gpu") - Number(a === "gpu"))
+    .map(([kind, watts]) => `${kind.toUpperCase()} ${Math.round(watts)}`).join(" · ")
+}
+
 export function extractSSE(buffer: string) {
-  const frames = buffer.split(/\r?\n\r?\n/)
-  const rest = frames.pop() || ""
-  const data = frames.flatMap((frame) =>
-    frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart()),
-  )
-  return { data, rest }
+  const { events, rest } = extractSSEEvents(buffer)
+  return { data: events.map(event => event.data), rest }
 }
 
 export interface SSEEvent {
@@ -279,12 +301,13 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let finished = false
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
   let compaction: Compaction | null = null
 
   const consume = (data: string) => {
-    if (data === "[DONE]") return
+    if (data === "[DONE]") { finished = true; return }
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
@@ -300,14 +323,23 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     if (event.usage) usage = event.usage
   }
 
-  while (true) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    const parsed = extractSSE(buffer)
-    buffer = parsed.rest
-    parsed.data.forEach(consume)
-    if (done) break
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      const parsed = extractSSE(buffer)
+      buffer = parsed.rest
+      for (const data of parsed.data) {
+        consume(data)
+        if (finished) break
+      }
+      if (done) break
+    }
+  } catch (cause) {
+    reader.cancel().catch(() => undefined)
+    throw cause
   }
+  if (finished) reader.cancel().catch(() => undefined)
 
   const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
   const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)

@@ -31,15 +31,20 @@ def find(text, needle, start=0, where="deepseek_v4.c"):
 
 
 class V4MirrorGuardSourceTest(unittest.TestCase):
+    """The guard's state is per cache (cache->...) since the peer pool, and the
+    margin comes back from v4_gpu_mirror_reserve_mb."""
+
     def setUp(self):
         text = SOURCE.read_text(encoding="utf-8")
-        start = find(text, "static int v4_gpu_mirror_place(")
-        self.body = text[start:find(text, "\n}\n", start)]
+        # the guard (v4_gpu_mirror_may_grow) and the placement that calls it
+        start = find(text, "static int v4_gpu_mirror_may_grow(")
+        place = find(text, "static int v4_gpu_mirror_place(", start)
+        self.body = text[start:find(text, "\n}\n", place)]
 
     def test_probe_resets_the_grown_count(self):
         probe = find(self.body, "last_free_mb = cache->ops->mem_free_mb(cache->device);")
         close = find(self.body, "}", probe)
-        self.assertIn("grown_bytes = 0;", self.body[probe:close])
+        self.assertIn("cache->grown_bytes = 0;", self.body[probe:close])
 
     def test_grown_mirrors_count_against_the_reserve(self):
         self.assertRegex(self.body, r"grown_mb = \(cache->grown_bytes \+ mirror_bytes")
@@ -54,13 +59,16 @@ class V4MirrorGuardSourceTest(unittest.TestCase):
         self.assertIn("cache->grown_bytes = 0;", self.body[fail:fail + 80])
 
     def test_bank_default_keeps_its_margin(self):
-        self.assertIn(": v4_gpu_mirror_reserve_margin_mb(cache->count);", self.body)
+        # dev's two-result reserve: the margin comes back with it, 0 unless the
+        # bank-sized default applies
+        self.assertIn(": v4_gpu_mirror_reserve_mb(cache->count, &margin_mb);", self.body)
         text = SOURCE.read_text(encoding="utf-8")
-        start = find(text, "static long long v4_gpu_mirror_reserve_margin_mb(int live) {")
-        margin = text[start:find(text, "\n}\n", start)]
-        self.assertIn("v4_gpu_mirror_reserve_explicit_mb() >= 0", margin)
-        self.assertIn("v4_gpu_mirror_reserve_mb(live) <= COLI_V4_RESERVE_HEADROOM_MB", margin)
-        self.assertIn("COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes) >> 20", margin)
+        start = find(text, "static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {")
+        reserve = text[start:find(text, "\n}\n", start)]
+        self.assertIn("if (margin_mb) *margin_mb = 0;", reserve)
+        self.assertIn("if (explicit_mb >= 0) return explicit_mb;", reserve)
+        self.assertIn("if (v4_bank_make_room_on()) return COLI_V4_RESERVE_HEADROOM_MB;", reserve)
+        self.assertIn("COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes", reserve)
 
 if __name__ == "__main__":
     unittest.main()

@@ -132,8 +132,9 @@ def _vk_device(env, vulkan):
     if vulkan is not None or not _vk_flag(env, "COLI_VULKAN"):
         return vulkan
     try:
-        from setup_hw import best_vulkan_device, detect_vulkan
-        return best_vulkan_device(detect_vulkan().get("devices", []))
+        # COLI_VK_DEV's device when it names one, as the engine opens it (#2127)
+        from setup_hw import detect_vulkan, engine_vulkan_device
+        return engine_vulkan_device(detect_vulkan().get("devices", []), env)
     except Exception:
         return None
 
@@ -2033,7 +2034,7 @@ def windows_available_bytes(avail_phys, avail_pagefile):
     handed the resulting cap to the engine; the engine filled it slot by slot
     until Windows refused the next 14 MB. Physical memory was there. Commit
     was not, and nothing had looked at it."""
-    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+    if avail_pagefile is not None and 0 <= avail_pagefile < avail_phys:
         return avail_pagefile
     return avail_phys
 
@@ -3273,8 +3274,10 @@ def _next_actions(bottleneck_class, projected_hit, probe_state, probe_gbs,
             actions.append({
                 "id": "measure-storage",
                 "priority": "required",
-                "reason": "cold experts remain on disk and no trusted storage probe is available",
-                "command": "make -C c iobench && ./c/iobench",
+                "reason": ("cold experts remain on disk and no trusted storage probe is available; "
+                           "from a source checkout, replace <model-shard> with an existing "
+                           "model weight file of at least 38 MiB on the model drive"),
+                "command": 'make -C c iobench && ./c/iobench "<model-shard>" 19 64 8 1',
             })
         actions.append({
             "id": "measure-residency",

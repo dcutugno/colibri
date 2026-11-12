@@ -2,6 +2,7 @@
 """Dependency-free OpenAI-compatible HTTP gateway for the colibri engine."""
 
 import argparse
+import ast
 import codecs
 import collections
 import contextlib
@@ -12,6 +13,7 @@ import mimetypes
 import os
 import select
 import queue
+import shutil
 import signal
 import stat
 import socket
@@ -20,10 +22,12 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 import image_engine                 # the qwenimage serve protocol, PNG and request rules
+import power                        # the machine's watts and each turn's joules, when joules is installed
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              display_for, family_ids, resolve_model)
 from family_registry import default_model_id as registry_default_model_id
@@ -446,7 +450,7 @@ def _fallback_tool_calls(tool_calls, index):
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if args and not isinstance(args, dict):
@@ -666,17 +670,72 @@ def _tool_param_types(tools):
     return out
 
 
-def _coerce_arg(value, declared):
+# A model can write a list or a dict the way Python prints one rather than as JSON:
+# [7, 'x,y', None], a trailing comma. Where the schema declares an array or an object, such
+# text is read as a Python literal, JSON's null/true/false taken too, and kept only when it
+# is that container made of JSON values throughout (str keys; str, finite number, bool, None,
+# list, dict). The text is parsed, never run, and only below _LITERAL_MAX characters.
+_LITERAL_MAX = 1 << 18
+_LITERAL_NAMES = {"null": None, "true": True, "false": False}
+
+
+class _JsonNames(ast.NodeTransformer):
+    def visit_Name(self, node):
+        if node.id in _LITERAL_NAMES:
+            return ast.copy_location(ast.Constant(_LITERAL_NAMES[node.id]), node)
+        return node
+
+
+def _json_shaped(value):
+    if value is None or isinstance(value, (str, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_shaped(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_shaped(v) for k, v in value.items())
+    return False
+
+
+def _literal_container(raw, kinds):
+    """The list (when `kinds` has "array") or dict (when it has "object") that a parameter's
+    text spells as a Python literal, or None."""
+    want = tuple(t for k, t in (("array", list), ("object", dict)) if k in kinds)
+    if not want or not isinstance(raw, str) or len(raw) > _LITERAL_MAX:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")      # an escape Python does not know is a warning
+            tree = _JsonNames().visit(ast.parse(raw.strip(), mode="eval"))
+            value = ast.literal_eval(tree)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return None
+    try:
+        if not isinstance(value, want) or not _json_shaped(value):
+            return None
+    except RecursionError:
+        return None
+    sys.stderr.write("[api] tool call: an %s argument written as a Python literal, read as one\n"
+                     % ("array" if isinstance(value, list) else "object"))
+    sys.stderr.flush()
+    return value
+
+
+def _coerce_arg(value, declared, literal=True):
     """Decode a raw <arg_value> according to the declared schema type.
 
     A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
-    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    the previous permissive behaviour (parse if it parses, otherwise leave as text), except
+    that a declared array or object written as a Python literal is read as one unless
+    `literal` is False (the strict parser)."""
     if declared == "string":
         return value
     try:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
-        return value
+        container = _literal_container(value, (declared,)) if literal else None
+        return value if container is None else container
     if declared in ("integer", "number") and isinstance(parsed, bool):
         return value                              # `true` is not a number
     if declared and declared not in ("integer", "number", "boolean", "object", "array"):
@@ -808,7 +867,7 @@ def parse_glm_tool_calls_strict(reply, tools):
             declared_type = spec.get("type")
             if isinstance(declared_type, list):
                 declared_type = next((item for item in declared_type if item != "null"), None)
-            parsed = _coerce_arg(value, declared_type)
+            parsed = _coerce_arg(value, declared_type, literal=False)
             valid = (declared_type in (None, "string") or
                      (declared_type == "integer" and type(parsed) is int) or
                      (declared_type == "number" and type(parsed) in (int, float)) or
@@ -940,6 +999,26 @@ def _dsv4_tool_calls(tool_calls):
     return v4_dsml.render_tool_calls(tool_calls)
 
 
+def _dsml_arguments(calls):
+    """The vendored DSML decoders put a parameter marked string="false" into `arguments` as
+    the model wrote it, so a list in single quotes made the call's arguments text that is
+    not JSON. Such arguments are read as a Python literal dict of JSON values and carried as
+    JSON; arguments that are JSON already, or that read as nothing, stay as they were."""
+    for call in calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("arguments"), str):
+            continue
+        try:
+            json.loads(fn["arguments"])
+            continue
+        except ValueError:
+            pass
+        container = _literal_container(fn["arguments"], ("object",))
+        if container is not None:
+            fn["arguments"] = json.dumps(container, ensure_ascii=False)
+    return calls
+
+
 def parse_dsv4_tool_calls(reply):
     """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
 
@@ -950,6 +1029,7 @@ def parse_dsv4_tool_calls(reply):
     and any thinking/eos markers around the block are scrubbed.
     """
     content, calls = v4_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
@@ -1011,7 +1091,8 @@ def parse_k3_tool_calls(reply, tools=None):
                         try:
                             args[key] = json.loads(val)
                         except (json.JSONDecodeError, ValueError):
-                            args[key] = val
+                            container = _literal_container(val, (typ,))
+                            args[key] = val if container is None else container
                 arguments = json.dumps(args, ensure_ascii=False)
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": arguments}})
@@ -1037,6 +1118,7 @@ def parse_dsv41_tool_calls(reply):
     its token budget.
     """
     content, calls = v41_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
@@ -1146,6 +1228,18 @@ def detect_chat_flavor(family_id, model_dir):
             config = {}
         if isinstance(config, dict) and config.get("model_type") == "mistral_large4":
             return "mistral_large4"
+        # GLM-5.2 and the full GLM-5.3 share glm_moe_dsa. Their trained
+        # template, not the folder name or weight architecture, distinguishes
+        # the always-open GLM-5.3 reasoning contract (#2540).
+        for name in ("chat_template.jinja", "tokenizer_config.json"):
+            try:
+                text = (Path(model_dir) / name).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if ("[gMASK]<sop>" in text and
+                    "effective_reasoning_effort = reasoning_effort if reasoning_effort is defined" in text and
+                    "enable_thinking" not in text):
+                return "glm53_full"
         return None
     if family_id != "qwen36" or not model_dir:
         return None
@@ -1364,6 +1458,22 @@ def decode_wav_mono16k(data, param):
             if len(body) < 16:
                 raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
+            if fmt[0] == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE identifies encoding by GUID.
+                if len(body) < 40:
+                    raise APIError(400, "WAV extensible fmt chunk is too short.", param, "invalid_value")
+                extension_size = _struct.unpack_from("<H", body, 16)[0]
+                if extension_size < 22 or 18 + extension_size > len(body):
+                    raise APIError(400, "WAV extensible fmt has an invalid extension size.",
+                                   param, "invalid_value")
+                guid = body[24:40]
+                guid_tail = bytes.fromhex("00001000800000aa00389b71")
+                if guid == b"\x01\0\0\0" + guid_tail:
+                    fmt = (1,) + fmt[1:]
+                elif guid == b"\x03\0\0\0" + guid_tail:
+                    fmt = (3,) + fmt[1:]
+                else:
+                    raise APIError(400, "Unsupported WAV extensible subformat; use PCM16 or float32.",
+                                   param, "invalid_value")
         elif cid == b"data":
             raw = body
         pos += 8 + size + pad
@@ -1375,8 +1485,6 @@ def decode_wav_mono16k(data, param):
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
-    if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
-        audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
@@ -1391,6 +1499,8 @@ def decode_wav_mono16k(data, param):
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
+    if not np.isfinite(samples).all():
+        raise APIError(400, "WAV samples must be finite numbers.", param, "invalid_value")
     if channels > 1:
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
@@ -1480,7 +1590,9 @@ def _k3_parse_arguments(raw):
     skip()
     if idx >= len(s) or s[idx] != "{": return None
     idx += 1; skip()
-    if idx < len(s) and s[idx] == "}": return []
+    if idx < len(s) and s[idx] == "}":
+        idx += 1; skip()
+        return [] if idx == len(s) else None
     out = []
     try:
         while True:
@@ -1496,7 +1608,7 @@ def _k3_parse_arguments(raw):
             skip()
             if idx >= len(s): return None
             c = s[idx]; idx += 1; skip()
-            if c == "}": return out
+            if c == "}": return out if idx == len(s) else None
             if c != ",": return None
     except (json.JSONDecodeError, ValueError):
         return None
@@ -1572,6 +1684,10 @@ def _k3_order_tool_results(messages):
     return out
 
 
+_K3_THINKING_EFFORT = {"minimal": "low", "low": "low", "medium": "high", "high": "high",
+                       "xhigh": "max", "max": "max"}
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None, add_generation_prompt=True):
     """Validated multi-turn K3 payload for the C engine.
@@ -1603,6 +1719,17 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
                 "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
                                          sort_keys=True) + "\n```")
         parts.append(f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}")
+    # The thinking effort (Kimi K3 and K3.1: low, high, max), as the reference template
+    # renders it: a system message of its own after the tools. OpenAI's medium is high
+    # here, xhigh is max; with no effort named the model thinks at its own default.
+    effort = (_K3_THINKING_EFFORT.get(reasoning_effort) if isinstance(reasoning_effort, str)
+              else None) if enable_thinking else None
+    if effort:
+        body = ("`thinking_effort` guides on how much to think in your thinking channel "
+                "(not including the response channel), supported values include `low`, "
+                "`medium`, `high`, and `max`.\n"
+                f"Now the system is invoked with `thinking_effort={effort}`.")
+        parts.append(f"Y 15 {len(body.encode('utf-8'))}\nthinking-effort{body}")
     tool_index = 0
     last_calls = []
     for index, message in enumerate(messages):
@@ -2036,7 +2163,7 @@ def _qwen_tool_calls(tool_calls, has_content, index):
         if isinstance(args, str) and args:
             try:
                 args = json.loads(args)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
         if isinstance(args, dict):
@@ -2591,9 +2718,15 @@ def _muse_value(raw, schema):
         # the template writes None as `null`, and every string as is
         return None if raw == "null" and "null" in kinds else raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # Python accepts NaN, Infinity and overflowing JSON exponents, also
+        # inside containers. Tool arguments must remain JSON; use the same
+        # text fallback as any other value that cannot be read as JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
     except ValueError:
-        return raw
+        container = _literal_container(raw, kinds)
+        return raw if container is None else container
 
 
 def parse_muse_tool_calls(reply, tools):
@@ -2815,6 +2948,17 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
             parts.append("<|im_start|>assistant")
             if text.strip():
                 parts.append("\n" + text.strip() + "\n")
+            # The template puts a blank line between the text and the first call, but the
+            # model does not always write one: Qwen3-Coder-30B-A3B often ends its text with a
+            # single newline and opens <tool_call> straight after. The reply's content keeps
+            # that newline, so a client that sends it back untrimmed is sending the turn as
+            # generated. Rendering the template's blank line instead makes the history differ
+            # from the engine's state by one token, and prefix reuse -- all or nothing --
+            # misses: the whole conversation is read again, every such turn (measured with
+            # COLI_PREFIX_LOG=1: held ".\n<tool_call>", rendered ".\n\n<tool_call>"; a
+            # 2,400-token agent turn went from ~5 s to ~100 s). A trimmed or blank-line content
+            # renders as the template does.
+            single = text.strip() and text.endswith("\n") and not text.endswith("\n\n")
             for position, call in enumerate(calls):
                 where = f"messages.{index}.tool_calls.{position}"
                 fn = call.get("function", call) if isinstance(call, dict) else None
@@ -2824,13 +2968,14 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         raise APIError(400, "`function.arguments` must be a JSON object.",
                                        f"{where}.function.arguments")
                 if not isinstance(args, dict):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
-                parts.append(f"\n<tool_call>\n<function={fn['name']}>\n")
+                lead = "" if position == 0 and single else "\n"
+                parts.append(f"{lead}<tool_call>\n<function={fn['name']}>\n")
                 for key, value in args.items():
                     shown = (json.dumps(value, ensure_ascii=False)
                              if isinstance(value, (dict, list, tuple)) else _jinja_string(value))
@@ -2875,7 +3020,12 @@ def _qwen_argument(raw, declared):
         return raw
     if "boolean" in kinds and value.lower() in ("true", "false"):
         return value.lower() == "true"
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = _literal_container(raw, kinds)
+        if parsed is None:
+            raise
     numeric = type(parsed) in (int, float)
     finite = numeric and (type(parsed) is int or math.isfinite(parsed))
     if (("array" in kinds and isinstance(parsed, list)) or
@@ -3062,7 +3212,7 @@ def _mimo_tool_calls(calls, index):
             if isinstance(args, str) and args.strip():
                 try:
                     args = json.loads(args)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     raise APIError(400, "`function.arguments` must be a JSON object.",
                                    f"{where}.function.arguments")
             if isinstance(args, dict):
@@ -3168,39 +3318,52 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     def make_call(name, body):
         args = {}
         found = MIMO_PARAM_RE.findall(body)
-        for key, raw in found:
-            key = key.strip()
-            if raw.startswith("\n"):
-                raw = raw[1:]
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            args[key] = _coerce_arg(raw, kind if isinstance(kind, str) else None) \
-                if kind not in (None, "string") else raw
-        if not found and body.strip():
-            try:
+        if found and MIMO_PARAM_RE.sub("", body).strip():
+            return None
+        try:
+            for key, raw in found:
+                key = key.strip()
+                if key in args:
+                    return None
+                if raw.startswith("\n"):
+                    raw = raw[1:]
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                declared = (schema.get(name) or {}).get(key) or {}
+                args[key] = _qwen_argument(raw, declared)
+            if not found and body.strip():
                 parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (TypeError, ValueError):
-                pass
+                if not isinstance(parsed, dict):
+                    return None
+                args = parsed
+            # Python accepts NaN/Infinity in JSON; these are not JSON arguments.
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            return None
         return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                "function": {"name": name, "arguments": arguments}}
 
     text = reply or ""
     matches = list(MIMO_CALL_RE.finditer(text))
-    calls = [make_call(m.group(1).strip(), m.group(2)) for m in matches]
+    accepted = []
+    calls = []
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            accepted.append(match)
     if not calls and tools and ("<tool_call>" in text or "<function=" in text):
         sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
     if not track_spans:
-        return MIMO_CALL_RE.sub("", text).strip(), calls, None, None
-    # The same two deletions as the line above -- every call block, then the surrounding
+        for match in reversed(accepted):
+            text = text[:match.start()] + text[match.end():]
+        return text.strip(), calls, None, None
+    # The same two deletions as the line above -- accepted call blocks, then surrounding
     # whitespace -- found as ranges, so logprobs.content can describe the content returned
     # rather than the raw reply with the call syntax in it.
-    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in matches])
+    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in accepted])
     head = len(content) - len(content.lstrip())
     kept = len(content.strip())
     content, step = _apply_cuts(content, [(0, head), (head + kept, len(content))])
@@ -3518,7 +3681,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
+                    except (TypeError, ValueError, RecursionError):
                         args = {}
                 if not isinstance(args, dict):
                     # `arguments` that is valid JSON but not an object ("[1,2]",
@@ -3958,7 +4121,7 @@ def _glm53_tool_calls(calls):
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except ValueError:
+            except (ValueError, RecursionError):
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}                        # same gap as render_chat above
@@ -3971,9 +4134,38 @@ def _glm53_tool_calls(calls):
     return "\n" + "".join(out) + "\n" if out else ""
 
 
+def _glm53_full_order_tool_results(messages):
+    """The full model's template orders an unambiguous tool run by call ID."""
+    result, i = list(messages), 0
+    while i < len(messages):
+        if not isinstance(messages[i], dict) or messages[i].get("role") != "tool":
+            i += 1
+            continue
+        end = i
+        while end < len(messages) and isinstance(messages[end], dict) and messages[end].get("role") == "tool":
+            end += 1
+        previous = messages[i - 1] if i else {}
+        calls = previous.get("tool_calls") if isinstance(previous, dict) and previous.get("role") == "assistant" else None
+        if isinstance(calls, list):
+            ids = [(call.get("tool_call_id") or call.get("id")) if isinstance(call, dict) else None for call in calls]
+            run = messages[i:end]
+            replies = [message.get("tool_call_id") or message.get("id") for message in run]
+            if (all(isinstance(value, str) and value for value in ids + replies)
+                    and len(set(ids)) == len(ids) and len(set(replies)) == len(replies)
+                    and all(value in ids for value in replies)):
+                order = {value: pos for pos, value in enumerate(ids)}
+                result[i:end] = sorted(run, key=lambda message: order[message.get("tool_call_id") or message.get("id")])
+        i = end
+    return result
+
+
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None, add_generation_prompt=True):
+                      tool_choice=None, add_generation_prompt=True, *, full_model=False):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    The full GLM-5.3 uses this text/tool subset too (`full_model=True`),
+    retaining its template's leading tool-call newline and grouped, ID-ordered
+    tool results. The Flash-only cache optimization below stays Flash-only.
 
     Not a variant of the GLM-5.2 renderer above, and the differences are not
     cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
@@ -3992,6 +4184,9 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    if full_model:
+        messages = _glm53_full_order_tool_results(messages)
 
     forced = None
     if isinstance(tool_choice, dict):
@@ -4062,7 +4257,8 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         elif role == "system":
             prompt.append(f"<|system|>{content}")
         elif role == "tool":
-            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+            prefix = "" if full_model and index > 0 and messages[index - 1].get("role") == "tool" else "<|observation|>"
+            prompt.append(f"{prefix}<tool_response>{content}</tool_response>")
         elif role == "assistant":
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
@@ -4082,7 +4278,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
             # model's own trailing newline is stripped by .strip() and put back
             # by the renderer, so the tokens already line up, and changing that
             # case would break the one that works today.
-            if calls and not body:
+            if calls and not body and not full_model:
                 calls = calls.lstrip("\n")
             prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
@@ -4561,6 +4757,40 @@ CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_
 _CPU_LAST = {}
 
 
+_GPU_LAST = {"t": 0.0, "v": None}
+
+
+def _gpu_stats():
+    """The NVIDIA cards as nvidia-smi sees them (use, memory, temperature, power), at most once a
+    second: the monitors (the TUI's, the chat page's) poll /health every second or two. None when
+    there is no nvidia-smi, which is then not looked for again."""
+    now = time.monotonic()
+    if _GPU_LAST.get("absent") or now - _GPU_LAST["t"] < 1.0:
+        return _GPU_LAST["v"]
+    _GPU_LAST["t"] = now
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        _GPU_LAST["absent"] = True
+        _GPU_LAST["v"] = None
+        return None
+    try:
+        r = subprocess.run([smi, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,"
+                            "power.draw,power.limit", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=2)
+        rows = []
+        for line in r.stdout.strip().splitlines():
+            f = [x.strip() for x in line.split(",")]
+            num = lambda v: float(v) if v not in ("", "[N/A]", "N/A") else None
+            rows.append({"name": f[0], "util": num(f[1]),
+                         "mem_used_gb": round(num(f[2]) / 1024, 2) if num(f[2]) is not None else None,
+                         "mem_total_gb": round(num(f[3]) / 1024, 2) if num(f[3]) is not None else None,
+                         "temp": num(f[4]), "power_w": num(f[5]), "power_max_w": num(f[6])})
+        _GPU_LAST["v"] = rows or None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        _GPU_LAST["v"] = None
+    return _GPU_LAST["v"]
+
+
 def _system_stats(engine):
     """RAM of the box and of the engine process, and the engine's CPU since the last call
     (100 = one core busy). Read from /proc, so empty fields off Linux."""
@@ -4577,6 +4807,9 @@ def _system_stats(engine):
         out["cores"] = os.cpu_count() or 0
     except (OSError, KeyError, ValueError):
         pass
+    gpus = _gpu_stats()
+    if gpus:
+        out["gpus"] = gpus
     pid = getattr(getattr(engine, "process", None), "pid", None)
     if pid:
         try:
@@ -4699,6 +4932,60 @@ def resolve_generation_prompt(messages, body):
     return False
 
 
+CHAT_TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+
+
+def lift_chat_template_kwargs(body):
+    """A chat request's `chat_template_kwargs` (the template's own arguments, as several
+    OpenAI-compatible servers take them: {"enable_thinking": false} is how many clients turn a
+    Qwen model's thinking off) for the keys this gateway reads at the top of the body, where the
+    body does not set them itself. Before, they were ignored: a Qwen3.8 request that asked for no
+    thinking this way reasoned at xhigh. Their values go through the same checks there."""
+    kwargs = body.get("chat_template_kwargs")
+    if kwargs is None:
+        return body
+    if not isinstance(kwargs, dict):
+        raise APIError(400, "`chat_template_kwargs` must be an object.", "chat_template_kwargs")
+    lifted = {k: kwargs[k] for k in CHAT_TEMPLATE_KWARGS if k in kwargs and k not in body}
+    return dict(body, **lifted) if lifted else body
+
+
+def default_reasoning_effort():
+    """The reasoning_effort of a chat request that names neither reasoning_effort nor
+    enable_thinking: Qwen3.8's, Muse Spark's and the full GLM-5.3's templates think at their
+    maximum unless told, MiMo-V2.6's and LFM3's think too; the other families keep the older
+    opt-in default (none), which COLI_THINK=1 turns on for all of them."""
+    if chat_flavor() in ("qwen38", "muse", "glm53_full"):
+        return "xhigh"
+    if ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
+        return "high"
+    return None
+
+
+def template_thinks():
+    """False for the templates with no thinking mode at all: Qwen3-Coder's (no <think>
+    anywhere) and OLMoE's (enable_thinking accepted but unused)."""
+    return not (ARCH == "olmoe" or chat_flavor() == "qwen3_coder")
+
+
+def tune_chat_prompt(model, text):
+    """TEXT as one user message, rendered as this gateway renders a chat request for MODEL
+    that sets nothing else: the checkpoint's own template (detect_chat_flavor) and its
+    default reasoning. `coli tune` measures with it, so the request it times is the one
+    `coli serve` is sent. A family-wide template opened <think> for every qwen36
+    checkpoint, and Qwen3-Coder, which has no thinking mode, ended its turn on the first
+    token there: no decode speed, and the tune failed (#2590). Qwen3.6 with thinking off
+    gets the template's pre-closed block, a state it was trained on (the bare
+    `assistant\n` is not, render_chat_qwen). Sets ARCH and CHAT_FLAVOR as a server does."""
+    global ARCH, CHAT_FLAVOR
+    family = resolve_model(model).descriptor
+    ARCH = family.id
+    CHAT_FLAVOR = detect_chat_flavor(family.id, model)
+    effort = default_reasoning_effort()
+    thinking = effort not in (None, "none") and template_thinks()
+    return render_chat_for_arch([{"role": "user", "content": text}], thinking, effort)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None, add_generation_prompt=True,
                          preserve_thinking=False):
@@ -4735,6 +5022,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
+    if chat_flavor() == "glm53_full":
+        effort = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "xhigh"}.get(
+            reasoning_effort, "xhigh" if enable_thinking else "low")
+        return render_chat_glm53(messages, True, effort, tools, tool_choice, add_generation_prompt, full_model=True)
     if chat_flavor() == "mistral_large4":
         return render_chat_mistral_large4(messages, enable_thinking, reasoning_effort, tools,
                                           tool_choice, add_generation_prompt)
@@ -4800,7 +5091,7 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
         return False
     if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
         return False
-    return (enable_thinking or ARCH == "glm53") and add_generation_prompt
+    return (enable_thinking or ARCH == "glm53" or chat_flavor() == "glm53_full") and add_generation_prompt
 
 
 class ThinkingStreamSplit:
@@ -5025,6 +5316,9 @@ def anthropic_to_openai(body):
                                    f"{where}.signature")
                 reasoning.append(block["thinking"])
             elif kind == "tool_use":
+                if role != "assistant":
+                    raise APIError(400, "`tool_use` blocks are valid only in assistant messages.",
+                                   where, "unsupported_content_type")
                 name = block.get("name")
                 if not isinstance(name, str) or not name:
                     raise APIError(400, "`tool_use` blocks require a string `name`.", f"{where}.name")
@@ -5038,6 +5332,9 @@ def anthropic_to_openai(body):
                               "function": {"name": name,
                                            "arguments": json.dumps(arguments, ensure_ascii=False)}})
             elif kind == "tool_result":
+                if role != "user":
+                    raise APIError(400, "`tool_result` blocks are valid only in user messages.",
+                                   where, "unsupported_content_type")
                 pictures = []
                 results.append({"role": "tool",
                                 "tool_call_id": block.get("tool_use_id") or "",
@@ -7245,6 +7542,12 @@ class Engine:
                         turn["cluster_transfer_s"] = float(fields[10])
                         turn["cluster_tx_bytes"] = int(fields[11])
                         turn["cluster_rx_bytes"] = int(fields[12])
+                    try:   # what the devices used over the turn, once a page has asked for /power
+                        energy = power.energy_since(turn["wall_s"])
+                    except Exception:   # noqa: BLE001 - a meter that failed: the turn keeps its timings
+                        energy = None
+                    if energy is not None:
+                        turn["energy_j"] = round(energy, 1)
                     self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
@@ -8416,6 +8719,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
+            if path == "/power":
+                # this machine's watts from joules, when it is installed (c/power.py); the
+                # first request starts the meters. Gated like /profile: it says how busy the box is.
+                payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
+                self.send_json(200, payload, request_id)
+                return
             if self.serve_static(path):
                 return
             self.require_auth()
@@ -9579,6 +9888,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        body = lift_chat_template_kwargs(body)
         strict_tools = body.get("strict_tool_calls", False)
         if not isinstance(strict_tools, bool):
             raise APIError(400, "`strict_tool_calls` must be a boolean.", "strict_tool_calls")
@@ -9600,17 +9910,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
         if reasoning_effort is None and "enable_thinking" not in body:
-            # Qwen3.8's official template defaults to enabled xhigh thinking;
-            # preserve the older opt-in default for the other families.
-            if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
-                reasoning_effort = "xhigh"
-            elif ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
-                # MiMo-V2.6's and LFM3's templates think unless told not to (enable_thinking false)
-                reasoning_effort = "high"
+            reasoning_effort = default_reasoning_effort()
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
-        if (ARCH == "olmoe" or chat_flavor() == "qwen3_coder") and enable_thinking:
+        if not template_thinks() and enable_thinking:
             # Qwen3-Coder's template has no thinking mode either (no <think> anywhere).
             # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
             # but unused"), so the engine never emits <think>/</think>. Left on,
