@@ -1112,6 +1112,10 @@ int coli_v4_gpu_indexer_score_batch(
 int coli_v4_gpu_bf16_project_multi(
     const ColiDeepSeekV4LayerWeights *weights, const char *const *keys, int n,
     float *const *outs, const float *inputs, int batch);
+/* V4_PREFILL_PROJ: the same through dsv4_cuda_matmul_bf16_rows (the same bits). */
+int coli_v4_gpu_bf16_project_rows(
+    const ColiDeepSeekV4LayerWeights *weights, const char *const *keys, int n,
+    float *const *outs, const float *inputs, int batch);
 int coli_v4_gpu_decode_proj_multi(const ColiDeepSeekV4LayerWeights *weights,
                                   void *const *fp8_gpu, int nf, const char *const *keys, int nk,
                                   float *const *outs, const float *input);   /* V4_DECODE_PROJ6 */

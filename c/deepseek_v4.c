@@ -3477,7 +3477,7 @@ static double v4_attn_prof_now(void) {
  * cached arena per slot amortizes them to zero; explicit memset keeps the old
  * calloc semantics where the algorithm may read before writing. */
 static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
-    enum { V4_ATTN_SCRATCH_SLOTS = 25 };
+    enum { V4_ATTN_SCRATCH_SLOTS = 28 };   /* 25-26: V4_COMP_BATCH's (#2906); 27: V4_PREFILL_PROJ's verify */
     static void *arena[V4_ATTN_SCRATCH_SLOTS];
     static size_t capacity[V4_ATTN_SCRATCH_SLOTS];
     if (slot < 0 || slot >= V4_ATTN_SCRATCH_SLOTS || !bytes) return NULL;
@@ -3592,20 +3592,57 @@ int coli_v4_attention_window_batch_ref(
      * riuso via _pre (dedup rinviato da #1076). Bit-identico; il path GPU
      * riceve gli input raw come prima.
      * EN: wq_a and wkv consume the same input batch — qdq once, reuse. */
-    float *inputs_act = malloc((size_t)batch * hidden * sizeof(*inputs_act));
-    uint8_t *inputs_act_scales = malloc((size_t)batch * (hidden / 128 + 1));
-    int result = (!inputs_act || !inputs_act_scales) ? -1 : 0;
-    for (int item = 0; !result && item < batch; item++)
+    /* V4_PREFILL_PROJ (opt-in): the chunk's input projections without the host
+     * work the card makes redundant, the same bits:
+     *  - with both wq_a and wkv mirrored, no host quantized copy: the card
+     *    quantizes the raw inputs itself, and coli_fp8_matmul_batch_ref makes
+     *    the copy only if the card refuses (it was 1.5 s of a 3.3k prompt);
+     *  - the query's norm over the items on the OpenMP threads (each item is
+     *    its own, in its own order);
+     *  - the compressor's and the indexer-compressor's four projections in one
+     *    device call: one upload, one sync, and a kernel that reads each input
+     *    once for four rows, in mm_bf16_batch's order (dsv4_cuda_matmul_bf16_rows).
+     * 2 = verify: the projections run both ways and are compared bit for bit
+     * (pfproj lines); the separate calls' results are kept. */
+    static int pre_proj = -1;
+    if (pre_proj < 0) {
+        const char *env = getenv("V4_PREFILL_PROJ");
+        pre_proj = env && *env ? atoi(env) : 0;
+        if (pre_proj < 0 || pre_proj > 2) pre_proj = 0;
+    }
+    int lazy_act = pre_proj && wq_a.gpu && wkv.gpu;
+    float *inputs_act = NULL;
+    uint8_t *inputs_act_scales = NULL;
+    int result = 0;
+    if (!lazy_act) {
+        inputs_act = malloc((size_t)batch * hidden * sizeof(*inputs_act));
+        inputs_act_scales = malloc((size_t)batch * (hidden / 128 + 1));
+        result = (!inputs_act || !inputs_act_scales) ? -1 : 0;
+    }
+    for (int item = 0; !result && !lazy_act && item < batch; item++)
         if (coli_fp8_activation_qdq_ref(
                 inputs_act + (size_t)item * hidden,
                 inputs_act_scales + (size_t)item * (hidden / 128),
                 inputs + (size_t)item * hidden, (size_t)hidden, 128))
             result = -1;
-    if (!result) result = coli_fp8_matmul_batch_pre(qa, &wq_a, inputs, inputs_act, batch);
+    if (!result) result = lazy_act
+        ? coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch)
+        : coli_fp8_matmul_batch_pre(qa, &wq_a, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
-    for (int item = 0; !result && item < batch; item++) {
+    if (!result && pre_proj) {
+        int bad = 0;
+        float eps = config->rms_norm_eps;
+        #pragma omp parallel for schedule(static) reduction(|:bad)
+        for (int item = 0; item < batch; item++) {
+            float *item_qa = qa + (size_t)item * q_rank;
+            if (coli_v4_rmsnorm(item_qa, item_qa, norm, q_rank, eps)) bad = 1;
+            else coli_bf16_round_array(item_qa, (size_t)q_rank);
+        }
+        if (bad) result = -1;
+    }
+    for (int item = 0; !result && !pre_proj && item < batch; item++) {
         float *item_qa = qa + (size_t)item * q_rank;
         result = coli_v4_rmsnorm(item_qa, item_qa, norm, q_rank,
                                  config->rms_norm_eps);
@@ -3629,23 +3666,80 @@ int coli_v4_attention_window_batch_ref(
                                        sizeof(*comp_kv_proj), 0);
         comp_gate_proj = v4_attn_scratch(14, (size_t)batch * comp_rows *
                                          sizeof(*comp_gate_proj), 0);
-        if (!comp_kv_proj || !comp_gate_proj ||
-            coli_v4_gpu_compressor_project_batch(
-                weights, "attn.compressor.wkv", "attn.compressor.wgate",
-                comp_rows, comp_kv_proj, comp_gate_proj, inputs, batch))
-            comp_kv_proj = comp_gate_proj = NULL;
         if (weights->plan.has_indexer) {
             idx_rows = 2 * config->index_head_dim;
             idx_kv_proj = v4_attn_scratch(15, (size_t)batch * idx_rows *
                                           sizeof(*idx_kv_proj), 0);
             idx_gate_proj = v4_attn_scratch(16, (size_t)batch * idx_rows *
                                             sizeof(*idx_gate_proj), 0);
-            if (!idx_kv_proj || !idx_gate_proj ||
+        }
+        /* V4_PREFILL_PROJ: the four in one call; when it is refused, and in
+         * verify, the separate calls */
+        int proj_n = weights->plan.has_indexer ? 4 : 2, proj_done = 0;
+        float *proj_check = NULL;
+        if (pre_proj && comp_kv_proj && comp_gate_proj &&
+            (proj_n == 2 || (idx_kv_proj && idx_gate_proj))) {
+            static const char *const proj_keys[4] = {
+                "attn.compressor.wkv", "attn.compressor.wgate",
+                "attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
+            float *proj_outs[4] = {comp_kv_proj, comp_gate_proj, idx_kv_proj, idx_gate_proj};
+            if (pre_proj == 2) {
+                proj_check = v4_attn_scratch(27, (size_t)batch * (2 * comp_rows + 2 * idx_rows) *
+                                             sizeof(*proj_check), 0);
+                proj_outs[0] = proj_check;
+                proj_outs[1] = proj_check ? proj_outs[0] + (size_t)batch * comp_rows : NULL;
+                proj_outs[2] = proj_check ? proj_outs[1] + (size_t)batch * comp_rows : NULL;
+                proj_outs[3] = proj_check ? proj_outs[2] + (size_t)batch * idx_rows : NULL;
+            }
+            if (pre_proj == 1 || proj_check) {
+                int got = coli_v4_gpu_bf16_project_rows(weights, proj_keys, proj_n,
+                                                        proj_outs, inputs, batch) == 0;
+                if (pre_proj == 1) proj_done = got;
+                else if (!got) proj_check = NULL;
+            }
+        }
+        if (!proj_done) {
+            if (!comp_kv_proj || !comp_gate_proj ||
                 coli_v4_gpu_compressor_project_batch(
-                    weights, "attn.indexer.compressor.wkv",
-                    "attn.indexer.compressor.wgate", idx_rows,
-                    idx_kv_proj, idx_gate_proj, inputs, batch))
+                    weights, "attn.compressor.wkv", "attn.compressor.wgate",
+                    comp_rows, comp_kv_proj, comp_gate_proj, inputs, batch))
+                comp_kv_proj = comp_gate_proj = NULL;
+            if (weights->plan.has_indexer &&
+                (!idx_kv_proj || !idx_gate_proj ||
+                 coli_v4_gpu_compressor_project_batch(
+                     weights, "attn.indexer.compressor.wkv",
+                     "attn.indexer.compressor.wgate", idx_rows,
+                     idx_kv_proj, idx_gate_proj, inputs, batch)))
                 idx_kv_proj = idx_gate_proj = NULL;
+        }
+        if (pre_proj == 2) {
+            /* verify: the one call's four results against the separate calls' */
+            static long long calls, declined, bad_matrices, values;
+            calls++;
+            if (!proj_check || !comp_kv_proj || (proj_n == 4 && !idx_kv_proj)) declined++;
+            else {
+                const float *got = proj_check;
+                const float *want[4] = {comp_kv_proj, comp_gate_proj, idx_kv_proj, idx_gate_proj};
+                for (int m = 0; m < proj_n; m++) {
+                    size_t count = (size_t)batch * (m < 2 ? comp_rows : idx_rows);
+                    long long bad = 0, first = -1;
+                    for (size_t i = 0; i < count; i++)
+                        if (memcmp(&got[i], &want[m][i], sizeof(float))) {
+                            if (first < 0) first = (long long)i;
+                            bad++;
+                        }
+                    if (bad) {
+                        bad_matrices++;
+                        fprintf(stderr, "pfproj layer=%d start=%d matrix=%d MISMATCH values=%lld first=%lld\n",
+                                weights->plan.layer, start_position, m, bad, first);
+                    }
+                    values += (long long)count;
+                    got += count;
+                }
+            }
+            if (calls % 43 == 0)
+                fprintf(stderr, "pfproj verify calls=%lld declined=%lld mismatched=%lld values_checked=%lld\n",
+                        calls, declined, bad_matrices, values);
         }
     }
 #endif
@@ -3781,7 +3875,9 @@ int coli_v4_attention_window_batch_ref(
         }
     V4_ATTN_PROF_MARK(prof_qb);
 
-    if (!result) result = coli_fp8_matmul_batch_pre(kv, &wkv, inputs, inputs_act, batch);
+    if (!result) result = lazy_act
+        ? coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch)
+        : coli_fp8_matmul_batch_pre(kv, &wkv, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!raw_kv_norm || decode_bf16(norm, raw_kv_norm, head_dim))) result = -1;
@@ -16337,6 +16433,18 @@ int coli_v4_gpu_bf16_project_multi(
         if (!ts[i] || !outs[i]) return -1;
     }
     return dsv4_cuda_matmul_bf16_multi(ts, n, inputs, batch, outs) ? 0 : -1;
+}
+int coli_v4_gpu_bf16_project_rows(
+    const ColiDeepSeekV4LayerWeights *weights, const char *const *keys, int n,
+    float *const *outs, const float *inputs, int batch) {
+    Dsv4CudaTensor *ts[8];
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !keys || !outs ||
+        !inputs || n < 1 || n > 8 || batch < 1) return -1;
+    for (int i = 0; i < n; i++) {
+        ts[i] = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, keys[i]);
+        if (!ts[i] || !outs[i]) return -1;
+    }
+    return dsv4_cuda_matmul_bf16_rows(ts, n, inputs, batch, outs) ? 0 : -1;
 }
 /* V4_DECODE_PROJ6 (0): a decode token's projections of the attention input
  * (the fp8 wq_a and wkv views' mirrors, the compressor's and the indexer-

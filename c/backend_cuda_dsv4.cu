@@ -3542,6 +3542,38 @@ __global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
 }
+/* mm_bf16_batch over R rows per block: each activation element is read once
+ * for R rows instead of once per row (the prompt's compressor projections were
+ * bound by those re-reads). Every (row, token) keeps mm_bf16_batch's order, the
+ * same strided per-thread partial and the same shared-memory tree, so the
+ * outputs are the same bits. O%R==0. */
+template<int R> __global__ void mm_bf16_batch_rows(const __nv_bfloat16*w,const float*x,float*y,int O,int I,int T){
+    int o0=blockIdx.x*R;if(o0>=O)return;int tbase=blockIdx.y*16,tcount=T-tbase<16?T-tbase:16;
+    float sum[R][16];
+    #pragma unroll
+    for(int r=0;r<R;r++){
+        #pragma unroll
+        for(int t=0;t<16;t++)sum[r][t]=0.f;}
+    for(int i=threadIdx.x;i<I;i+=blockDim.x){float v[R];
+        #pragma unroll
+        for(int r=0;r<R;r++)v[r]=__bfloat162float(w[(long long)(o0+r)*I+i]);
+        #pragma unroll
+        for(int t=0;t<16;t++)if(t<tcount){float xv=x[(long long)(tbase+t)*I+i];
+            #pragma unroll
+            for(int r=0;r<R;r++)sum[r][t]+=xv*v[r];}}
+    __shared__ float s[16][256];
+    #pragma unroll
+    for(int r=0;r<R;r++){
+        #pragma unroll
+        for(int t=0;t<16;t++)s[t][threadIdx.x]=sum[r][t];
+        __syncthreads();
+        for(int n=128;n;n>>=1){if(threadIdx.x<n){
+            #pragma unroll
+            for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
+        if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o0+r]=s[t][0];
+        __syncthreads();
+    }
+}
 /* One lane owns one output row, preserving the decode reference's column
  * order and fused fp32 accumulation. Rows32 packing coalesces weight reads. */
 __global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bfloat16 *gate,
@@ -3634,7 +3666,16 @@ extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int to
 }
 /* Several bf16 matmuls over the same x in one round trip: one upload, one
  * launch each, one download each, one sync. Same kernel as the single call. */
+static int bf16_multi_run(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens,float*const*ys,int rows);
 extern "C" int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens,float*const*ys){
+    return bf16_multi_run(ts,n,x,tokens,ys,0);
+}
+/* V4_PREFILL_PROJ: dsv4_cuda_matmul_bf16_multi with mm_bf16_batch_rows for a
+ * prompt chunk (4 rows per block where O%4==0); the same bits. */
+extern "C" int dsv4_cuda_matmul_bf16_rows(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens,float*const*ys){
+    return bf16_multi_run(ts,n,x,tokens,ys,1);
+}
+static int bf16_multi_run(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens,float*const*ys,int rows){
     if(!ts||!ys||n<1||n>8||!x||tokens<1)return 0;
     Dev*c=ctx(ts[0]->device);
     if(!c||!ok(cudaSetDevice(ts[0]->device),"select bf16 multi device"))return 0;
@@ -3650,6 +3691,7 @@ extern "C" int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor*const*ts,int n,const f
         size_t ob=(size_t)tokens*ts[i]->O*4;
         float*dy=(float*)((char*)c->dy+off);
         if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,c->stream);
+        else if(rows&&ts[i]->O%4==0)mm_bf16_batch_rows<4><<<dim3(ts[i]->O/4,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
         else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
         if(!ok(cudaGetLastError(),"bf16 multi launch")||
            !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;

@@ -1511,6 +1511,15 @@ dsv4-prefill-chain-test: tests/test_dsv4_prefill_chain_cuda.c backend_cuda_dsv4.
 	$(CC) $(CFLAGS) tests/test_dsv4_prefill_chain_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) 		-o dsv4_prefill_chain_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_prefill_chain_cuda_test$(EXE)
 
+# V4_PREFILL_PROJ: the prompt's row-blocked bf16 projections (dsv4_cuda_matmul_bf16_rows)
+# against dsv4_cuda_matmul_bf16_multi, bit for bit. Needs a GPU. Windows: coli_cuda_dsv4.dll
+# of this tree beside the binary; elsewhere the backend objects.
+.PHONY: dsv4-prefill-proj-test
+dsv4-prefill-proj-test: tests/test_dsv4_prefill_proj_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) tests/test_dsv4_prefill_proj_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_prefill_proj_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_prefill_proj_cuda_test$(EXE)
+
 # V4_ATTN_BATCH_PROJ: dsv4_cuda_proj_batch against per-call matvec, bit for bit (needs a GPU).
 # Windows: the DLL is loaded at run time and must sit next to the test binary (make
 # cuda-dsv4-dll first). On Linux build with CUDA=1: it links backend_cuda_dsv4.o, like
