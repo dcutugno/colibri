@@ -927,6 +927,38 @@ the RAM cache, gains more: 1.1–1.8 s on each of five 3.3k-token turns. The
 verify found no difference over 1,032 calls. The record is in
 `docs/experiments/v4-prefill-proj-2026-11-17/`.
 
+### A prompt chunk's normalized input read where it already is (`V4_PREFILL_RESIDENT`, opt-in)
+
+The block's first hyper-connection step computes the chunk's normalized
+attention input on the card and leaves it in its device slot. The attention then
+uploaded that same host array again three or four times per chunk and layer: for
+wq_a, for wkv, for the compressor and indexer-compressor projections and, on
+indexer layers, for the prompt indexer. With `V4_PREFILL_RESIDENT=1` the block
+names the slot as holding the array for the length of the attention call:
+
+- **wq_a and wkv**: the fp8 batch matmul takes the slot as its input activation.
+- **The bf16 projections and the prompt indexer** read it in place through a
+  DLL-side alias (`dsv4_cuda_input_alias`, an optional export; an older DLL
+  uploads as before).
+
+There are no device-to-device copies: on this card they queue on the copy
+engine behind the expert bank's uploads, and a first version that copied made
+the query-rank stage slower. The same kernels over the same bytes: the same
+bits. `V4_PREFILL_RESIDENT=2` compares the slot with the host array before and
+after each attention call (`pfresident` lines);
+`tests/test_dsv4_prefill_resident_cuda.c` checks the in-place reads against the
+uploaded input.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt, with
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1
+V4_HC_FUSED=1 V4_PREFILL_PIN=1 V4_PREFILL_PROJ=1`): time to the first token
+21.2 → 21.05 s, the same text. Over the prompt the query-rank stage goes from
+0.34 to 0.04 s and the block's attention from 12.1 to 11.3 s, but most of that
+becomes wait for the expert bank (`moebprof`'s `switch`, 1.8 → 2.2 s). The
+service at `--ram 80` saves 0.3–0.4 s on each of five 3.3k-token turns, with
+the same replies. The verify found no difference over 1,118 calls. The record
+is in `docs/experiments/v4-prefill-resident-2026-11-18/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1181,6 +1213,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_HC_FUSED` (0) | `1` = the prompt block's attention post and FFN pre/norm as one device pass, the states kept on the card; `2` = verify against the two-step path (`hcfused`) |
 | `V4_PREFILL_PIN` (0) | `1` = the prompt's state buffers and the prompt block's arrays in page-locked memory (see above) |
 | `V4_PREFILL_PROJ` (0) | `1` = a prompt chunk's input projections without the host's redundant work (see above); `2` = verify the one-call projections against the separate calls (`pfproj`) |
+| `V4_PREFILL_RESIDENT` (0) | `1` = a prompt chunk's normalized input read where the attention hyper-connection step left it on the card (see above); `2` = check the device copy against the host array around each attention call (`pfresident`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |

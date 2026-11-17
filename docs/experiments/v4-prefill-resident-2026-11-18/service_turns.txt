@@ -1,0 +1,19 @@
+# The service (coli serve, --ram 80 --ctx 20000, the deploy stack's switches: the decode ones of the
+# baseline config plus V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1 V4_HC_FUSED=1
+# V4_COMP_BATCH=1 V4_PREFILL_PIN=1 V4_PREFILL_PROJ=1, DSV4_CUDA_PIN_CAP_GB=80, V4_UPLOAD_PIECES=2 V4_PRED_NEXT=2), a fresh process per
+# arm, five chat turns each: "Request N. " + prompt3k.txt, max_tokens 36, temperature 0. Seconds per request
+# (curl time_total: the prompt and 36 decoded tokens), arms in the order run; then the md5 of each reply's text.
+
+V4_PREFILL_RESIDENT=unset  turns_s: 33.598853 29.137189 27.577124 26.722568 26.038317  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=1  turns_s: 44.151312 33.421925 28.161135 26.845027 26.027741  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=unset  turns_s: 33.708034 29.134941 27.656567 26.775922 26.017127  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=1  turns_s: 33.260362 28.824848 27.384955 26.601364 25.682672  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=1  turns_s: 33.400877 28.991933 27.404392 26.332026 25.443071  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=unset  turns_s: 33.708125 29.248076 27.900615 27.045033 26.231314  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=1  turns_s: 33.247380 28.838352 27.266083 26.298506 25.613763  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_RESIDENT=unset  turns_s: 33.505653 29.135933 27.620126 26.686692 25.746365  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+
+# The second service (the first with V4_PREFILL_RESIDENT=1) started cold: its first three turns are
+# 10.4, 4.2 and 0.3 s slower than any other run's; the third and fourth rounds ran the arms in the
+# reverse order (1 first). V4_COMP_BATCH, V4_UPLOAD_PIECES and V4_PRED_NEXT are set by the service
+# script but not in this branch's binary.
