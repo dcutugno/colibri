@@ -841,6 +841,25 @@ experts prefetched and the same 19,857 expert requests in every run; the bank
 switch drops from about 7 s over the prompt to a few milliseconds. The record is
 in `docs/experiments/v4-bank-read-lanes-2026-11-17/`.
 
+### A prompt chunk's indexer selection on the card (`V4_PREFILL_INDEXER`, opt-in)
+
+A prompt chunk's indexer selection projected the query ranks on the card,
+brought them down, prepared each token's queries and head weights on the host
+and sent them up again to be scored. With `V4_PREFILL_INDEXER=1` the
+projection, the preparation, the head weights and the scoring run in one round
+trip over the resident weights and keys (`dsv4_cuda_indexer_select_fused`, the
+fused decode layer's launches over the chunk); the top-k stays on the host. Any
+refusal takes the host's path. With `DSV4_IDX_VERIFY=1` both run and the
+device's queries, head weights and scores are compared with the host's
+(`idxfused` lines).
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt,
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2`): time to the first token 32.0 → 29.1 s,
+the indexer stage 6.4 → 1.7 s, the same text; with dev's exact radix top-k
+(`V4_IDX_FAST=1`) as well, 27.7 s (30.4 s with `V4_IDX_FAST` alone). The verify
+found no difference over the prompt's 546 scored chunk-layers. The record is in
+`docs/experiments/v4-prefill-indexer-2026-11-17/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1091,6 +1110,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFILL_CHAIN` (0) | `1` = a prompt chunk's attention after the indexer as one device chain (see above); `2` = run the chain beside the host's path and compare every output (`pfchain verify`) |
 | `DSV4_PF_KPROF` (0, `.cu`) | `1` = the prompt chain's stage times per call (`pfkprof`) |
 | `V4_BANK_READ_LANES` (0) | reader threads for the prompt bank's prefetch (at most 8; see above) |
+| `V4_PREFILL_INDEXER` (0) | `1` = a prompt chunk's indexer selection on the card (see above); `DSV4_IDX_VERIFY=1` compares it with the host's |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |

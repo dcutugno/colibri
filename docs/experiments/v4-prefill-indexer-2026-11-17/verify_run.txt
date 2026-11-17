@@ -1,0 +1,1715 @@
+===== run q_verify (V4_PREFILL_INDEXER=1 DSV4_IDX_VERIFY=1 (verify)) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.116s wall=1794930206
+v4_gpu layer=1 uploaded=134.024MiB in 0.110s wall=1794930206
+v4_gpu layer=2 uploaded=155.024MiB in 0.114s wall=1794930206
+v4_gpu layer=3 uploaded=142.024MiB in 0.111s wall=1794930207
+v4_gpu layer=4 uploaded=155.024MiB in 0.115s wall=1794930207
+v4_gpu layer=5 uploaded=142.024MiB in 0.111s wall=1794930207
+v4_gpu layer=6 uploaded=155.024MiB in 0.115s wall=1794930207
+v4_gpu layer=7 uploaded=142.024MiB in 0.112s wall=1794930207
+v4_gpu layer=8 uploaded=155.024MiB in 0.115s wall=1794930207
+v4_gpu layer=9 uploaded=142.024MiB in 0.111s wall=1794930208
+v4_gpu layer=10 uploaded=155.024MiB in 0.111s wall=1794930208
+v4_gpu layer=11 uploaded=142.024MiB in 0.103s wall=1794930208
+v4_gpu layer=12 uploaded=155.024MiB in 0.108s wall=1794930208
+v4_gpu layer=13 uploaded=142.024MiB in 0.104s wall=1794930208
+v4_gpu layer=14 uploaded=155.024MiB in 0.107s wall=1794930209
+v4_gpu layer=15 uploaded=142.024MiB in 0.103s wall=1794930209
+v4_gpu layer=16 uploaded=155.024MiB in 0.107s wall=1794930209
+v4_gpu layer=17 uploaded=142.024MiB in 0.103s wall=1794930209
+v4_gpu layer=18 uploaded=155.024MiB in 0.107s wall=1794930209
+v4_gpu layer=19 uploaded=142.024MiB in 0.103s wall=1794930209
+v4_gpu layer=20 uploaded=155.024MiB in 0.106s wall=1794930210
+v4_gpu layer=21 uploaded=142.024MiB in 0.105s wall=1794930210
+v4_gpu layer=22 uploaded=155.024MiB in 0.107s wall=1794930210
+v4_gpu layer=23 uploaded=142.024MiB in 0.102s wall=1794930210
+v4_gpu layer=24 uploaded=155.024MiB in 0.106s wall=1794930210
+v4_gpu layer=25 uploaded=142.024MiB in 0.103s wall=1794930211
+v4_gpu layer=26 uploaded=155.024MiB in 0.108s wall=1794930211
+v4_gpu layer=27 uploaded=142.024MiB in 0.103s wall=1794930211
+v4_gpu layer=28 uploaded=155.024MiB in 0.106s wall=1794930211
+v4_gpu layer=29 uploaded=142.024MiB in 0.103s wall=1794930211
+v4_gpu layer=30 uploaded=155.024MiB in 0.108s wall=1794930211
+v4_gpu layer=31 uploaded=142.024MiB in 0.104s wall=1794930212
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794930212
+v4_gpu layer=33 uploaded=142.024MiB in 0.103s wall=1794930212
+v4_gpu layer=34 uploaded=155.024MiB in 0.107s wall=1794930212
+v4_gpu layer=35 uploaded=142.024MiB in 0.103s wall=1794930212
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794930212
+v4_gpu layer=37 uploaded=142.024MiB in 0.103s wall=1794930213
+v4_gpu layer=38 uploaded=155.024MiB in 0.107s wall=1794930213
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794930213
+v4_gpu layer=40 uploaded=155.024MiB in 0.106s wall=1794930213
+v4_gpu layer=41 uploaded=142.024MiB in 0.103s wall=1794930213
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794930214
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.56s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+idxproj layer=2 start=0 packed=1 mismatches=0 max=0
+idxverify layer=2 start=0 scored=125 mismatches=0 max=0
+idxfused layer=2 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=128 packed=1 mismatches=0 max=0
+idxverify layer=2 start=128 scored=128 mismatches=0 max=0
+idxfused layer=2 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=256 packed=1 mismatches=0 max=0
+idxverify layer=2 start=256 scored=128 mismatches=0 max=0
+idxfused layer=2 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=384 packed=1 mismatches=0 max=0
+idxverify layer=2 start=384 scored=128 mismatches=0 max=0
+idxfused layer=2 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=512 packed=1 mismatches=0 max=0
+idxverify layer=2 start=512 scored=128 mismatches=0 max=0
+idxfused layer=2 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=640 packed=1 mismatches=0 max=0
+idxverify layer=2 start=640 scored=128 mismatches=0 max=0
+idxfused layer=2 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=768 packed=1 mismatches=0 max=0
+idxverify layer=2 start=768 scored=128 mismatches=0 max=0
+idxfused layer=2 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=896 packed=1 mismatches=0 max=0
+idxverify layer=2 start=896 scored=128 mismatches=0 max=0
+idxfused layer=2 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=2 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=2 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=2 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=2 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=2 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=2 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=2 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=2 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=2 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=0 packed=1 mismatches=0 max=0
+idxverify layer=4 start=0 scored=125 mismatches=0 max=0
+idxfused layer=4 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=128 packed=1 mismatches=0 max=0
+idxverify layer=4 start=128 scored=128 mismatches=0 max=0
+idxfused layer=4 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=256 packed=1 mismatches=0 max=0
+idxverify layer=4 start=256 scored=128 mismatches=0 max=0
+idxfused layer=4 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=384 packed=1 mismatches=0 max=0
+idxverify layer=4 start=384 scored=128 mismatches=0 max=0
+idxfused layer=4 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=512 packed=1 mismatches=0 max=0
+idxverify layer=4 start=512 scored=128 mismatches=0 max=0
+idxfused layer=4 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=640 packed=1 mismatches=0 max=0
+idxverify layer=4 start=640 scored=128 mismatches=0 max=0
+idxfused layer=4 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=768 packed=1 mismatches=0 max=0
+idxverify layer=4 start=768 scored=128 mismatches=0 max=0
+idxfused layer=4 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=896 packed=1 mismatches=0 max=0
+idxverify layer=4 start=896 scored=128 mismatches=0 max=0
+idxfused layer=4 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=4 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=4 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=4 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=4 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=4 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=4 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=4 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=4 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=4 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=0 packed=1 mismatches=0 max=0
+idxverify layer=6 start=0 scored=125 mismatches=0 max=0
+idxfused layer=6 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=128 packed=1 mismatches=0 max=0
+idxverify layer=6 start=128 scored=128 mismatches=0 max=0
+idxfused layer=6 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=256 packed=1 mismatches=0 max=0
+idxverify layer=6 start=256 scored=128 mismatches=0 max=0
+idxfused layer=6 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=384 packed=1 mismatches=0 max=0
+idxverify layer=6 start=384 scored=128 mismatches=0 max=0
+idxfused layer=6 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=512 packed=1 mismatches=0 max=0
+idxverify layer=6 start=512 scored=128 mismatches=0 max=0
+idxfused layer=6 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=640 packed=1 mismatches=0 max=0
+idxverify layer=6 start=640 scored=128 mismatches=0 max=0
+idxfused layer=6 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=768 packed=1 mismatches=0 max=0
+idxverify layer=6 start=768 scored=128 mismatches=0 max=0
+idxfused layer=6 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=896 packed=1 mismatches=0 max=0
+idxverify layer=6 start=896 scored=128 mismatches=0 max=0
+idxfused layer=6 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=6 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=6 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=6 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=6 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=6 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=6 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=6 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=6 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=6 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=0 packed=1 mismatches=0 max=0
+idxverify layer=8 start=0 scored=125 mismatches=0 max=0
+idxfused layer=8 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=128 packed=1 mismatches=0 max=0
+idxverify layer=8 start=128 scored=128 mismatches=0 max=0
+idxfused layer=8 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=256 packed=1 mismatches=0 max=0
+idxverify layer=8 start=256 scored=128 mismatches=0 max=0
+idxfused layer=8 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=384 packed=1 mismatches=0 max=0
+idxverify layer=8 start=384 scored=128 mismatches=0 max=0
+idxfused layer=8 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=512 packed=1 mismatches=0 max=0
+idxverify layer=8 start=512 scored=128 mismatches=0 max=0
+idxfused layer=8 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=640 packed=1 mismatches=0 max=0
+idxverify layer=8 start=640 scored=128 mismatches=0 max=0
+idxfused layer=8 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=768 packed=1 mismatches=0 max=0
+idxverify layer=8 start=768 scored=128 mismatches=0 max=0
+idxfused layer=8 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=896 packed=1 mismatches=0 max=0
+idxverify layer=8 start=896 scored=128 mismatches=0 max=0
+idxfused layer=8 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=8 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=8 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=8 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=8 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=8 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=8 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=8 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=8 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=8 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=0 packed=1 mismatches=0 max=0
+idxverify layer=10 start=0 scored=125 mismatches=0 max=0
+idxfused layer=10 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=128 packed=1 mismatches=0 max=0
+idxverify layer=10 start=128 scored=128 mismatches=0 max=0
+idxfused layer=10 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=256 packed=1 mismatches=0 max=0
+idxverify layer=10 start=256 scored=128 mismatches=0 max=0
+idxfused layer=10 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=384 packed=1 mismatches=0 max=0
+idxverify layer=10 start=384 scored=128 mismatches=0 max=0
+idxfused layer=10 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=512 packed=1 mismatches=0 max=0
+idxverify layer=10 start=512 scored=128 mismatches=0 max=0
+idxfused layer=10 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=640 packed=1 mismatches=0 max=0
+idxverify layer=10 start=640 scored=128 mismatches=0 max=0
+idxfused layer=10 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=768 packed=1 mismatches=0 max=0
+idxverify layer=10 start=768 scored=128 mismatches=0 max=0
+idxfused layer=10 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=896 packed=1 mismatches=0 max=0
+idxverify layer=10 start=896 scored=128 mismatches=0 max=0
+idxfused layer=10 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=10 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=10 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=10 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=10 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=10 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=10 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=10 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=10 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=10 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=0 packed=1 mismatches=0 max=0
+idxverify layer=12 start=0 scored=125 mismatches=0 max=0
+idxfused layer=12 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=128 packed=1 mismatches=0 max=0
+idxverify layer=12 start=128 scored=128 mismatches=0 max=0
+idxfused layer=12 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=256 packed=1 mismatches=0 max=0
+idxverify layer=12 start=256 scored=128 mismatches=0 max=0
+idxfused layer=12 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=384 packed=1 mismatches=0 max=0
+idxverify layer=12 start=384 scored=128 mismatches=0 max=0
+idxfused layer=12 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=512 packed=1 mismatches=0 max=0
+idxverify layer=12 start=512 scored=128 mismatches=0 max=0
+idxfused layer=12 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=640 packed=1 mismatches=0 max=0
+idxverify layer=12 start=640 scored=128 mismatches=0 max=0
+idxfused layer=12 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=768 packed=1 mismatches=0 max=0
+idxverify layer=12 start=768 scored=128 mismatches=0 max=0
+idxfused layer=12 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=896 packed=1 mismatches=0 max=0
+idxverify layer=12 start=896 scored=128 mismatches=0 max=0
+idxfused layer=12 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=12 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=12 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=12 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=12 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=12 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=12 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=12 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=12 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=12 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=0 packed=1 mismatches=0 max=0
+idxverify layer=14 start=0 scored=125 mismatches=0 max=0
+idxfused layer=14 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=128 packed=1 mismatches=0 max=0
+idxverify layer=14 start=128 scored=128 mismatches=0 max=0
+idxfused layer=14 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=256 packed=1 mismatches=0 max=0
+idxverify layer=14 start=256 scored=128 mismatches=0 max=0
+idxfused layer=14 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=384 packed=1 mismatches=0 max=0
+idxverify layer=14 start=384 scored=128 mismatches=0 max=0
+idxfused layer=14 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=512 packed=1 mismatches=0 max=0
+idxverify layer=14 start=512 scored=128 mismatches=0 max=0
+idxfused layer=14 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=640 packed=1 mismatches=0 max=0
+idxverify layer=14 start=640 scored=128 mismatches=0 max=0
+idxfused layer=14 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=768 packed=1 mismatches=0 max=0
+idxverify layer=14 start=768 scored=128 mismatches=0 max=0
+idxfused layer=14 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=896 packed=1 mismatches=0 max=0
+idxverify layer=14 start=896 scored=128 mismatches=0 max=0
+idxfused layer=14 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=14 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=14 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=14 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=14 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=14 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=14 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=14 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=14 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=14 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=0 packed=1 mismatches=0 max=0
+idxverify layer=16 start=0 scored=125 mismatches=0 max=0
+idxfused layer=16 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=128 packed=1 mismatches=0 max=0
+idxverify layer=16 start=128 scored=128 mismatches=0 max=0
+idxfused layer=16 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=256 packed=1 mismatches=0 max=0
+idxverify layer=16 start=256 scored=128 mismatches=0 max=0
+idxfused layer=16 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=384 packed=1 mismatches=0 max=0
+idxverify layer=16 start=384 scored=128 mismatches=0 max=0
+idxfused layer=16 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=512 packed=1 mismatches=0 max=0
+idxverify layer=16 start=512 scored=128 mismatches=0 max=0
+idxfused layer=16 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=640 packed=1 mismatches=0 max=0
+idxverify layer=16 start=640 scored=128 mismatches=0 max=0
+idxfused layer=16 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=768 packed=1 mismatches=0 max=0
+idxverify layer=16 start=768 scored=128 mismatches=0 max=0
+idxfused layer=16 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=896 packed=1 mismatches=0 max=0
+idxverify layer=16 start=896 scored=128 mismatches=0 max=0
+idxfused layer=16 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=16 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=16 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=16 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=16 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=16 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=16 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=16 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=16 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=16 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=0 packed=1 mismatches=0 max=0
+idxverify layer=18 start=0 scored=125 mismatches=0 max=0
+idxfused layer=18 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=128 packed=1 mismatches=0 max=0
+idxverify layer=18 start=128 scored=128 mismatches=0 max=0
+idxfused layer=18 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=256 packed=1 mismatches=0 max=0
+idxverify layer=18 start=256 scored=128 mismatches=0 max=0
+idxfused layer=18 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=384 packed=1 mismatches=0 max=0
+idxverify layer=18 start=384 scored=128 mismatches=0 max=0
+idxfused layer=18 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=512 packed=1 mismatches=0 max=0
+idxverify layer=18 start=512 scored=128 mismatches=0 max=0
+idxfused layer=18 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=640 packed=1 mismatches=0 max=0
+idxverify layer=18 start=640 scored=128 mismatches=0 max=0
+idxfused layer=18 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=768 packed=1 mismatches=0 max=0
+idxverify layer=18 start=768 scored=128 mismatches=0 max=0
+idxfused layer=18 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=896 packed=1 mismatches=0 max=0
+idxverify layer=18 start=896 scored=128 mismatches=0 max=0
+idxfused layer=18 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=18 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=18 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=18 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=18 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=18 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=18 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=18 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=18 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=18 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=0 packed=1 mismatches=0 max=0
+idxverify layer=20 start=0 scored=125 mismatches=0 max=0
+idxfused layer=20 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=128 packed=1 mismatches=0 max=0
+idxverify layer=20 start=128 scored=128 mismatches=0 max=0
+idxfused layer=20 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=256 packed=1 mismatches=0 max=0
+idxverify layer=20 start=256 scored=128 mismatches=0 max=0
+idxfused layer=20 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=384 packed=1 mismatches=0 max=0
+idxverify layer=20 start=384 scored=128 mismatches=0 max=0
+idxfused layer=20 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=512 packed=1 mismatches=0 max=0
+idxverify layer=20 start=512 scored=128 mismatches=0 max=0
+idxfused layer=20 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=640 packed=1 mismatches=0 max=0
+idxverify layer=20 start=640 scored=128 mismatches=0 max=0
+idxfused layer=20 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=768 packed=1 mismatches=0 max=0
+idxverify layer=20 start=768 scored=128 mismatches=0 max=0
+idxfused layer=20 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=896 packed=1 mismatches=0 max=0
+idxverify layer=20 start=896 scored=128 mismatches=0 max=0
+idxfused layer=20 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=20 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=20 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=20 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=20 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=20 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=20 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=20 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=20 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=20 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=0 packed=1 mismatches=0 max=0
+idxverify layer=22 start=0 scored=125 mismatches=0 max=0
+idxfused layer=22 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=128 packed=1 mismatches=0 max=0
+idxverify layer=22 start=128 scored=128 mismatches=0 max=0
+idxfused layer=22 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=256 packed=1 mismatches=0 max=0
+idxverify layer=22 start=256 scored=128 mismatches=0 max=0
+idxfused layer=22 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=384 packed=1 mismatches=0 max=0
+idxverify layer=22 start=384 scored=128 mismatches=0 max=0
+idxfused layer=22 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=512 packed=1 mismatches=0 max=0
+idxverify layer=22 start=512 scored=128 mismatches=0 max=0
+idxfused layer=22 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=640 packed=1 mismatches=0 max=0
+idxverify layer=22 start=640 scored=128 mismatches=0 max=0
+idxfused layer=22 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=768 packed=1 mismatches=0 max=0
+idxverify layer=22 start=768 scored=128 mismatches=0 max=0
+idxfused layer=22 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=896 packed=1 mismatches=0 max=0
+idxverify layer=22 start=896 scored=128 mismatches=0 max=0
+idxfused layer=22 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=22 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=22 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=22 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=22 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=22 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=22 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=22 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=22 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=22 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=0 packed=1 mismatches=0 max=0
+idxverify layer=24 start=0 scored=125 mismatches=0 max=0
+idxfused layer=24 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=128 packed=1 mismatches=0 max=0
+idxverify layer=24 start=128 scored=128 mismatches=0 max=0
+idxfused layer=24 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=256 packed=1 mismatches=0 max=0
+idxverify layer=24 start=256 scored=128 mismatches=0 max=0
+idxfused layer=24 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=384 packed=1 mismatches=0 max=0
+idxverify layer=24 start=384 scored=128 mismatches=0 max=0
+idxfused layer=24 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=512 packed=1 mismatches=0 max=0
+idxverify layer=24 start=512 scored=128 mismatches=0 max=0
+idxfused layer=24 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=640 packed=1 mismatches=0 max=0
+idxverify layer=24 start=640 scored=128 mismatches=0 max=0
+idxfused layer=24 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=768 packed=1 mismatches=0 max=0
+idxverify layer=24 start=768 scored=128 mismatches=0 max=0
+idxfused layer=24 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=896 packed=1 mismatches=0 max=0
+idxverify layer=24 start=896 scored=128 mismatches=0 max=0
+idxfused layer=24 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=24 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=24 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=24 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=24 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=24 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=24 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=24 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=24 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=24 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=0 packed=1 mismatches=0 max=0
+idxverify layer=26 start=0 scored=125 mismatches=0 max=0
+idxfused layer=26 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=128 packed=1 mismatches=0 max=0
+idxverify layer=26 start=128 scored=128 mismatches=0 max=0
+idxfused layer=26 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=256 packed=1 mismatches=0 max=0
+idxverify layer=26 start=256 scored=128 mismatches=0 max=0
+idxfused layer=26 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=384 packed=1 mismatches=0 max=0
+idxverify layer=26 start=384 scored=128 mismatches=0 max=0
+idxfused layer=26 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=512 packed=1 mismatches=0 max=0
+idxverify layer=26 start=512 scored=128 mismatches=0 max=0
+idxfused layer=26 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=640 packed=1 mismatches=0 max=0
+idxverify layer=26 start=640 scored=128 mismatches=0 max=0
+idxfused layer=26 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=768 packed=1 mismatches=0 max=0
+idxverify layer=26 start=768 scored=128 mismatches=0 max=0
+idxfused layer=26 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=896 packed=1 mismatches=0 max=0
+idxverify layer=26 start=896 scored=128 mismatches=0 max=0
+idxfused layer=26 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=26 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=26 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=26 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=26 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=26 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=26 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=26 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=26 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=26 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=0 packed=1 mismatches=0 max=0
+idxverify layer=28 start=0 scored=125 mismatches=0 max=0
+idxfused layer=28 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=128 packed=1 mismatches=0 max=0
+idxverify layer=28 start=128 scored=128 mismatches=0 max=0
+idxfused layer=28 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=256 packed=1 mismatches=0 max=0
+idxverify layer=28 start=256 scored=128 mismatches=0 max=0
+idxfused layer=28 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=384 packed=1 mismatches=0 max=0
+idxverify layer=28 start=384 scored=128 mismatches=0 max=0
+idxfused layer=28 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=512 packed=1 mismatches=0 max=0
+idxverify layer=28 start=512 scored=128 mismatches=0 max=0
+idxfused layer=28 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=640 packed=1 mismatches=0 max=0
+idxverify layer=28 start=640 scored=128 mismatches=0 max=0
+idxfused layer=28 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=768 packed=1 mismatches=0 max=0
+idxverify layer=28 start=768 scored=128 mismatches=0 max=0
+idxfused layer=28 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=896 packed=1 mismatches=0 max=0
+idxverify layer=28 start=896 scored=128 mismatches=0 max=0
+idxfused layer=28 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=28 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=28 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=28 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=28 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=28 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=28 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=28 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=28 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=28 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=0 packed=1 mismatches=0 max=0
+idxverify layer=30 start=0 scored=125 mismatches=0 max=0
+idxfused layer=30 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=128 packed=1 mismatches=0 max=0
+idxverify layer=30 start=128 scored=128 mismatches=0 max=0
+idxfused layer=30 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=256 packed=1 mismatches=0 max=0
+idxverify layer=30 start=256 scored=128 mismatches=0 max=0
+idxfused layer=30 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=384 packed=1 mismatches=0 max=0
+idxverify layer=30 start=384 scored=128 mismatches=0 max=0
+idxfused layer=30 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=512 packed=1 mismatches=0 max=0
+idxverify layer=30 start=512 scored=128 mismatches=0 max=0
+idxfused layer=30 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=640 packed=1 mismatches=0 max=0
+idxverify layer=30 start=640 scored=128 mismatches=0 max=0
+idxfused layer=30 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=768 packed=1 mismatches=0 max=0
+idxverify layer=30 start=768 scored=128 mismatches=0 max=0
+idxfused layer=30 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=896 packed=1 mismatches=0 max=0
+idxverify layer=30 start=896 scored=128 mismatches=0 max=0
+idxfused layer=30 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=30 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=30 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=30 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=30 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=30 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=30 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=30 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=30 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=30 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=0 packed=1 mismatches=0 max=0
+idxverify layer=32 start=0 scored=125 mismatches=0 max=0
+idxfused layer=32 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=128 packed=1 mismatches=0 max=0
+idxverify layer=32 start=128 scored=128 mismatches=0 max=0
+idxfused layer=32 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=256 packed=1 mismatches=0 max=0
+idxverify layer=32 start=256 scored=128 mismatches=0 max=0
+idxfused layer=32 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=384 packed=1 mismatches=0 max=0
+idxverify layer=32 start=384 scored=128 mismatches=0 max=0
+idxfused layer=32 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=512 packed=1 mismatches=0 max=0
+idxverify layer=32 start=512 scored=128 mismatches=0 max=0
+idxfused layer=32 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=640 packed=1 mismatches=0 max=0
+idxverify layer=32 start=640 scored=128 mismatches=0 max=0
+idxfused layer=32 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=768 packed=1 mismatches=0 max=0
+idxverify layer=32 start=768 scored=128 mismatches=0 max=0
+idxfused layer=32 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=896 packed=1 mismatches=0 max=0
+idxverify layer=32 start=896 scored=128 mismatches=0 max=0
+idxfused layer=32 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=32 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=32 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=32 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=32 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=32 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=32 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=32 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=32 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=32 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=0 packed=1 mismatches=0 max=0
+idxverify layer=34 start=0 scored=125 mismatches=0 max=0
+idxfused layer=34 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=128 packed=1 mismatches=0 max=0
+idxverify layer=34 start=128 scored=128 mismatches=0 max=0
+idxfused layer=34 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=256 packed=1 mismatches=0 max=0
+idxverify layer=34 start=256 scored=128 mismatches=0 max=0
+idxfused layer=34 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=384 packed=1 mismatches=0 max=0
+idxverify layer=34 start=384 scored=128 mismatches=0 max=0
+idxfused layer=34 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=512 packed=1 mismatches=0 max=0
+idxverify layer=34 start=512 scored=128 mismatches=0 max=0
+idxfused layer=34 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=640 packed=1 mismatches=0 max=0
+idxverify layer=34 start=640 scored=128 mismatches=0 max=0
+idxfused layer=34 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=768 packed=1 mismatches=0 max=0
+idxverify layer=34 start=768 scored=128 mismatches=0 max=0
+idxfused layer=34 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=896 packed=1 mismatches=0 max=0
+idxverify layer=34 start=896 scored=128 mismatches=0 max=0
+idxfused layer=34 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=34 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=34 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=34 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=34 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=34 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=34 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=34 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=34 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=34 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=0 packed=1 mismatches=0 max=0
+idxverify layer=36 start=0 scored=125 mismatches=0 max=0
+idxfused layer=36 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=128 packed=1 mismatches=0 max=0
+idxverify layer=36 start=128 scored=128 mismatches=0 max=0
+idxfused layer=36 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=256 packed=1 mismatches=0 max=0
+idxverify layer=36 start=256 scored=128 mismatches=0 max=0
+idxfused layer=36 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=384 packed=1 mismatches=0 max=0
+idxverify layer=36 start=384 scored=128 mismatches=0 max=0
+idxfused layer=36 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=512 packed=1 mismatches=0 max=0
+idxverify layer=36 start=512 scored=128 mismatches=0 max=0
+idxfused layer=36 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=640 packed=1 mismatches=0 max=0
+idxverify layer=36 start=640 scored=128 mismatches=0 max=0
+idxfused layer=36 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=768 packed=1 mismatches=0 max=0
+idxverify layer=36 start=768 scored=128 mismatches=0 max=0
+idxfused layer=36 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=896 packed=1 mismatches=0 max=0
+idxverify layer=36 start=896 scored=128 mismatches=0 max=0
+idxfused layer=36 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=36 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=36 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=36 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=36 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=36 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=36 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=36 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=36 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=36 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=0 packed=1 mismatches=0 max=0
+idxverify layer=38 start=0 scored=125 mismatches=0 max=0
+idxfused layer=38 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=128 packed=1 mismatches=0 max=0
+idxverify layer=38 start=128 scored=128 mismatches=0 max=0
+idxfused layer=38 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=256 packed=1 mismatches=0 max=0
+idxverify layer=38 start=256 scored=128 mismatches=0 max=0
+idxfused layer=38 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=384 packed=1 mismatches=0 max=0
+idxverify layer=38 start=384 scored=128 mismatches=0 max=0
+idxfused layer=38 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=512 packed=1 mismatches=0 max=0
+idxverify layer=38 start=512 scored=128 mismatches=0 max=0
+idxfused layer=38 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=640 packed=1 mismatches=0 max=0
+idxverify layer=38 start=640 scored=128 mismatches=0 max=0
+idxfused layer=38 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=768 packed=1 mismatches=0 max=0
+idxverify layer=38 start=768 scored=128 mismatches=0 max=0
+idxfused layer=38 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=896 packed=1 mismatches=0 max=0
+idxverify layer=38 start=896 scored=128 mismatches=0 max=0
+idxfused layer=38 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=38 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=38 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=38 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=38 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=38 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=38 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=38 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=38 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=38 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=0 packed=1 mismatches=0 max=0
+idxverify layer=40 start=0 scored=125 mismatches=0 max=0
+idxfused layer=40 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=128 packed=1 mismatches=0 max=0
+idxverify layer=40 start=128 scored=128 mismatches=0 max=0
+idxfused layer=40 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=256 packed=1 mismatches=0 max=0
+idxverify layer=40 start=256 scored=128 mismatches=0 max=0
+idxfused layer=40 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=384 packed=1 mismatches=0 max=0
+idxverify layer=40 start=384 scored=128 mismatches=0 max=0
+idxfused layer=40 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=512 packed=1 mismatches=0 max=0
+idxverify layer=40 start=512 scored=128 mismatches=0 max=0
+idxfused layer=40 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=640 packed=1 mismatches=0 max=0
+idxverify layer=40 start=640 scored=128 mismatches=0 max=0
+idxfused layer=40 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=768 packed=1 mismatches=0 max=0
+idxverify layer=40 start=768 scored=128 mismatches=0 max=0
+idxfused layer=40 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=896 packed=1 mismatches=0 max=0
+idxverify layer=40 start=896 scored=128 mismatches=0 max=0
+idxfused layer=40 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=40 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=40 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=40 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=40 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=40 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=40 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=40 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=40 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=40 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=0 packed=1 mismatches=0 max=0
+idxverify layer=42 start=0 scored=125 mismatches=0 max=0
+idxfused layer=42 start=0 scored=125 cand=32 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=128 packed=1 mismatches=0 max=0
+idxverify layer=42 start=128 scored=128 mismatches=0 max=0
+idxfused layer=42 start=128 scored=128 cand=64 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=256 packed=1 mismatches=0 max=0
+idxverify layer=42 start=256 scored=128 mismatches=0 max=0
+idxfused layer=42 start=256 scored=128 cand=96 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=384 packed=1 mismatches=0 max=0
+idxverify layer=42 start=384 scored=128 mismatches=0 max=0
+idxfused layer=42 start=384 scored=128 cand=128 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=512 packed=1 mismatches=0 max=0
+idxverify layer=42 start=512 scored=128 mismatches=0 max=0
+idxfused layer=42 start=512 scored=128 cand=160 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=640 packed=1 mismatches=0 max=0
+idxverify layer=42 start=640 scored=128 mismatches=0 max=0
+idxfused layer=42 start=640 scored=128 cand=192 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=768 packed=1 mismatches=0 max=0
+idxverify layer=42 start=768 scored=128 mismatches=0 max=0
+idxfused layer=42 start=768 scored=128 cand=224 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=896 packed=1 mismatches=0 max=0
+idxverify layer=42 start=896 scored=128 mismatches=0 max=0
+idxfused layer=42 start=896 scored=128 cand=256 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1024 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1024 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1024 scored=128 cand=288 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1152 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1152 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1152 scored=128 cand=320 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1280 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1280 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1280 scored=128 cand=352 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1408 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1408 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1408 scored=128 cand=384 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1536 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1536 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1536 scored=128 cand=416 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1664 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1664 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1664 scored=128 cand=448 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1792 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1792 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1792 scored=128 cand=480 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=1920 packed=1 mismatches=0 max=0
+idxverify layer=42 start=1920 scored=128 mismatches=0 max=0
+idxfused layer=42 start=1920 scored=128 cand=512 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2048 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2048 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2048 scored=128 cand=544 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2176 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2176 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2176 scored=128 cand=576 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2304 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2304 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2304 scored=128 cand=608 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2432 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2432 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2432 scored=128 cand=640 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2560 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2560 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2560 scored=128 cand=672 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2688 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2688 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2688 scored=128 cand=704 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2816 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2816 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2816 scored=128 cand=736 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=2944 packed=1 mismatches=0 max=0
+idxverify layer=42 start=2944 scored=128 mismatches=0 max=0
+idxfused layer=42 start=2944 scored=128 cand=768 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=3072 packed=1 mismatches=0 max=0
+idxverify layer=42 start=3072 scored=128 mismatches=0 max=0
+idxfused layer=42 start=3072 scored=128 cand=800 query-mismatches=0 head-mismatches=0 score-mismatches=0
+idxproj layer=42 start=3200 packed=1 mismatches=0 max=0
+idxverify layer=42 start=3200 scored=78 mismatches=0 max=0
+idxfused layer=42 start=3200 scored=78 cand=819 query-mismatches=0 head-mismatches=0 score-mismatches=0
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4368 misses=15435 hit_rate=21.997 bytes=206355824640 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=170.823s after_first=9.529s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.394 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=531 refills=4818 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15435 flock_reads=0 fallbacks=0 payload_bytes=194217246720
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 180.422s
+
