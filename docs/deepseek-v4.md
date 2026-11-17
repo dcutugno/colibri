@@ -512,6 +512,61 @@ runs per arm: 9.37 s unset, 9.23 s with two pieces (+1.6 % tok/s), the same
 text; the verifier read 4,066 piece-filled mirrors back, no difference. The
 record is in `docs/experiments/v4-upload-pieces-2026-11-16/`.
 
+### The next layer's experts read ahead (`V4_PRED_NEXT`, opt-in)
+
+A decode token's layer reads the experts its router picked only once it has
+routed, and most of them are not in RAM. `V4_PRED_NEXT=N` guesses them a layer
+early: once layer L has routed, a predictor thread scores layer L+1's router
+on layer L's FFN input (the bf16 gate, sqrt(softplus) plus the bias, the top-k:
+the router's selection order, ids only), and N read-ahead lanes look the
+predicted experts up in the store while layer L's experts and layer L+1's
+attention run. A hash-router layer's set is exact from the token id and is
+queued when the layer before it starts. An expert a card already mirrors is
+skipped.
+
+A lane's lookup is the store's own, uncounted (the routing books stay the
+router's): a RAM hit costs a lease and a recency touch, a miss is read from the
+drive into the RAM cache. Where the piece uploads can reserve a mirror
+(`V4_UPLOAD_PIECES` and what it needs, see above), the lane's read is copied to
+it as it lands; `V4_PRED_PIECES=0` keeps the read-ahead in RAM. Layer L+1 routes
+as before: a right guess is a RAM hit or a mirror, a wrong one costs a read in
+a window where the drive would otherwise idle. The text never depends on a
+guess.
+
+A read-ahead mirror is filled outside the step that uses it, so its copies are
+fenced differently from a decode lane's: the lane notes the card for the next
+join after its last copy is enqueued and before the mirror becomes its
+expert's, the step joins before its all-resident path as well, and the lane
+waits for its copies before it gives the slab back to the RAM cache. Decode
+only (single-token forwards), not with the hybrid split (`DSV4_HYBRID`).
+
+The exit line `v4_pred: lanes= handed= predicted= mirrored= queued= dup=
+dropped= read= failed= hit=P% of N` counts the guesses; `hit` is the share of
+the routed experts the guess for their layer held.
+
+Measured on an RTX 5080 under Linux (Ryzen 9 3900X, 3,278-token prompt, 36
+tokens, `V4_BANK_MAKE_ROOM=1 V4_UPLOAD_THREAD=1 V4_MIRROR_BLOCK=1
+V4_UPLOAD_PIECES=2` in every cell, three interleaved runs per cell, medians:
+seconds for the 35 tokens after the first; the text is the same in every run):
+
+| `V4_PRED_NEXT` | `--memory-gb 16` | routed experts, attention (ms per token) |
+|---|---|---|
+| unset | 12.24 | 271, 62 |
+| `1` | 11.54 (+6.1 % tok/s) | |
+| `2` | 11.14 (+9.9 %) | 230, 70 |
+| `3` | 11.40 (+7.4 %) | |
+| `2`, `V4_PRED_PIECES=0` | 11.43 (+7.1 %) | |
+
+The guess holds 72.7 % of the routed experts (the two hash layers' exact sets
+included). Two lanes is the best; a third adds reads beside the decode lanes'
+own and is slower. Read into RAM only, the read-ahead is worth about two
+thirds of what it is with the copies to the card under the read. The
+attention rises by a few milliseconds a token beside the lanes' copies and
+threads. With `--memory-gb 80` from a cold start: 13.38 s against 13.99 (+4.6 %; the first run without it took 43.9 s and stays in that median). The verifier
+(`V4_MIRROR_BLOCK_VERIFY=1`) read back 5,972 piece-filled mirrors, the
+read-ahead's among them, with no difference. The record is in
+`docs/experiments/v4-pred-next-2026-11-17/`.
+
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
@@ -1237,6 +1292,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
 | `V4_UPLOAD_PIECES` (0) | `N` = a decode lane's read lands in N pieces, each copied to a mirror reserved before the read as it lands (`1`: the whole record once it is in; 16 at most); needs `V4_UPLOAD_THREAD=1`, `V4_MIRROR_BLOCK=1` and `V4_SLAB_SHIFT` (see [A read copied to its mirror as it lands](#a-read-copied-to-its-mirror-as-it-lands-v4_upload_pieces-opt-in)) |
 | `DSV4_UPLOAD_SUBMIT` (1, `.cu`) | `0` = an enqueued upload is not submitted to the driver at once (a stream status query after the copy); no difference measured on Windows |
+| `V4_PRED_NEXT` (0) | `N` = during decode the next layer's experts are predicted (its router scored on this layer's FFN input; a hash layer's set exactly) and N lanes read the ones no card mirrors ahead, into RAM and, with the piece uploads, into a mirror as the read lands (8 at most; 2 measured best) (see [The next layer's experts read ahead](#the-next-layers-experts-read-ahead-v4_pred_next-opt-in)) |
+| `V4_PRED_PIECES` (1) | `0` = the read-ahead fills RAM only, no mirror reserved |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `V4_HOT_SPLIT` (on for one HIP card below 10 GiB of `--vram`, else 0) | `1` = decode computes the experts mirrored in VRAM on the GPU while the CPU computes the others, and at most one expert per layer is uploaded, after it, by use count (see [Hot experts on the card, the rest on the CPU](#hot-experts-on-the-card-the-rest-on-the-cpu-v4_hot_split-on-below-10-gib-on-hip)); needs the shared experts in RAM |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
