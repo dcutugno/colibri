@@ -820,6 +820,27 @@ The record is in `docs/experiments/v4-prefill-chain-2026-11-17/`, with the two
 profiled runs (`DSV4_ATTN_PROF=1 V4_MOE_BATCH_PROF=1`, this change's parent and the
 chain) beside the timed ones.
 
+### The expert bank's prefetch reads on lanes (`V4_BANK_READ_LANES`, opt-in)
+
+The prompt's expert bank is double-buffered: while a layer's chunks run, a
+worker fills the second bank with the next layer's experts. It looked each
+expert up in the store and uploaded it before looking up the next, so a miss's
+read had the drive to itself with nothing else in flight, about 0.95 s per
+layer for V4 Flash's 256 experts. Once the prompt's attention is fast
+(`V4_PREFILL_CHAIN`) that is longer than a layer's compute, and every layer
+waits for its bank (`moebprof`'s `switch`). With `V4_BANK_READ_LANES=N` (at most
+8), N reader threads claim the experts in order, at most 2N ahead of the one the
+worker is uploading, look them up (the same uncounted lookups) and hand the views
+over; the worker uploads them in order as before. The bank's contents and books
+are unchanged.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt,
+`V4_PREFILL_CHAIN=1` and the merged decode switches): time to the first token
+35.4 → 31.9 s with two lanes (32.1 s with four), the same text, the same 10,752
+experts prefetched and the same 19,857 expert requests in every run; the bank
+switch drops from about 7 s over the prompt to a few milliseconds. The record is
+in `docs/experiments/v4-bank-read-lanes-2026-11-17/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1069,6 +1090,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `V4_PREFILL_CHAIN` (0) | `1` = a prompt chunk's attention after the indexer as one device chain (see above); `2` = run the chain beside the host's path and compare every output (`pfchain verify`) |
 | `DSV4_PF_KPROF` (0, `.cu`) | `1` = the prompt chain's stage times per call (`pfkprof`) |
+| `V4_BANK_READ_LANES` (0) | reader threads for the prompt bank's prefetch (at most 8; see above) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
