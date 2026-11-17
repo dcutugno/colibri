@@ -860,6 +860,23 @@ the indexer stage 6.4 → 1.7 s, the same text; with dev's exact radix top-k
 found no difference over the prompt's 546 scored chunk-layers. The record is in
 `docs/experiments/v4-prefill-indexer-2026-11-17/`.
 
+### The prompt block's middle hyper-connection step on the card (`V4_HC_FUSED`, opt-in)
+
+The batched block's attention post brought the four-stream states (8 MB per
+chunk and layer) down only for the FFN pre to send them up again. With
+`V4_HC_FUSED=1` the post writes a device mirror the FFN pre and norm read in
+place; only the FFN posts/combs and the normalized FFN input come down, and the
+FFN post reads the states where they are (a host fallback of that post fetches
+them first). The same device calls in the same order as the two-step path.
+`V4_HC_FUSED=2` runs the two-step path beside it and compares the states, the
+FFN posts/combs and the normalized FFN input (`hcfused` lines).
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt, with
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1`):
+time to the first token 27.4 → 25.6 s, the step 3.6 → 1.4 s, the same text; the
+verify found no difference over the prompt's 1,118 chunk-layers. The record is in
+`docs/experiments/v4-hc-fused-2026-11-17/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1111,6 +1128,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_PF_KPROF` (0, `.cu`) | `1` = the prompt chain's stage times per call (`pfkprof`) |
 | `V4_BANK_READ_LANES` (0) | reader threads for the prompt bank's prefetch (at most 8; see above) |
 | `V4_PREFILL_INDEXER` (0) | `1` = a prompt chunk's indexer selection on the card (see above); `DSV4_IDX_VERIFY=1` compares it with the host's |
+| `V4_HC_FUSED` (0) | `1` = the prompt block's attention post and FFN pre/norm as one device pass, the states kept on the card; `2` = verify against the two-step path (`hcfused`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
