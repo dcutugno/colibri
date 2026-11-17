@@ -1,0 +1,101 @@
+===== run pj_verify (V4_PREFILL_PROJ=2 (verify)) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.12s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=4902833
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.114s wall=1794942661
+v4_gpu layer=1 uploaded=134.024MiB in 0.107s wall=1794942661
+v4_gpu layer=2 uploaded=155.024MiB in 0.110s wall=1794942661
+v4_gpu layer=3 uploaded=142.024MiB in 0.108s wall=1794942661
+v4_gpu layer=4 uploaded=155.024MiB in 0.111s wall=1794942662
+v4_gpu layer=5 uploaded=142.024MiB in 0.108s wall=1794942662
+v4_gpu layer=6 uploaded=155.024MiB in 0.112s wall=1794942662
+v4_gpu layer=7 uploaded=142.024MiB in 0.109s wall=1794942662
+v4_gpu layer=8 uploaded=155.024MiB in 0.111s wall=1794942662
+v4_gpu layer=9 uploaded=142.024MiB in 0.111s wall=1794942663
+v4_gpu layer=10 uploaded=155.024MiB in 0.111s wall=1794942663
+v4_gpu layer=11 uploaded=142.024MiB in 0.108s wall=1794942663
+v4_gpu layer=12 uploaded=155.024MiB in 0.111s wall=1794942663
+v4_gpu layer=13 uploaded=142.024MiB in 0.108s wall=1794942663
+v4_gpu layer=14 uploaded=155.024MiB in 0.111s wall=1794942664
+v4_gpu layer=15 uploaded=142.024MiB in 0.108s wall=1794942664
+v4_gpu layer=16 uploaded=155.024MiB in 0.111s wall=1794942664
+v4_gpu layer=17 uploaded=142.024MiB in 0.106s wall=1794942664
+v4_gpu layer=18 uploaded=155.024MiB in 0.104s wall=1794942665
+v4_gpu layer=19 uploaded=142.024MiB in 0.101s wall=1794942665
+v4_gpu layer=20 uploaded=155.024MiB in 0.105s wall=1794942665
+v4_gpu layer=21 uploaded=142.024MiB in 0.101s wall=1794942665
+v4_gpu layer=22 uploaded=155.024MiB in 0.104s wall=1794942665
+v4_gpu layer=23 uploaded=142.024MiB in 0.101s wall=1794942665
+v4_gpu layer=24 uploaded=155.024MiB in 0.104s wall=1794942666
+v4_gpu layer=25 uploaded=142.024MiB in 0.101s wall=1794942666
+v4_gpu layer=26 uploaded=155.024MiB in 0.104s wall=1794942666
+v4_gpu layer=27 uploaded=142.024MiB in 0.100s wall=1794942666
+v4_gpu layer=28 uploaded=155.024MiB in 0.105s wall=1794942666
+v4_gpu layer=29 uploaded=142.024MiB in 0.100s wall=1794942667
+v4_gpu layer=30 uploaded=155.024MiB in 0.104s wall=1794942667
+v4_gpu layer=31 uploaded=142.024MiB in 0.101s wall=1794942667
+v4_gpu layer=32 uploaded=155.024MiB in 0.105s wall=1794942667
+v4_gpu layer=33 uploaded=142.024MiB in 0.101s wall=1794942667
+v4_gpu layer=34 uploaded=155.024MiB in 0.105s wall=1794942668
+v4_gpu layer=35 uploaded=142.024MiB in 0.100s wall=1794942668
+v4_gpu layer=36 uploaded=155.024MiB in 0.104s wall=1794942668
+v4_gpu layer=37 uploaded=142.024MiB in 0.101s wall=1794942668
+v4_gpu layer=38 uploaded=155.024MiB in 0.104s wall=1794942668
+v4_gpu layer=39 uploaded=142.024MiB in 0.101s wall=1794942669
+v4_gpu layer=40 uploaded=155.024MiB in 0.103s wall=1794942669
+v4_gpu layer=41 uploaded=142.024MiB in 0.100s wall=1794942669
+v4_gpu layer=42 uploaded=155.024MiB in 0.104s wall=1794942669
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.58s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+pfproj verify calls=43 declined=0 mismatched=0 values_checked=10619904
+pfproj verify calls=86 declined=0 mismatched=0 values_checked=21188608
+pfproj verify calls=129 declined=0 mismatched=0 values_checked=31688704
+pfproj verify calls=172 declined=0 mismatched=0 values_checked=40487936
+pfproj verify calls=215 declined=0 mismatched=0 values_checked=49287168
+pfproj verify calls=258 declined=0 mismatched=0 values_checked=58530816
+pfproj verify calls=301 declined=0 mismatched=0 values_checked=69099520
+pfproj verify calls=344 declined=0 mismatched=0 values_checked=79668224
+pfproj verify calls=387 declined=0 mismatched=0 values_checked=89775104
+pfproj verify calls=430 declined=0 mismatched=0 values_checked=98574336
+pfproj verify calls=473 declined=0 mismatched=0 values_checked=107373568
+pfproj verify calls=516 declined=0 mismatched=0 values_checked=117010432
+pfproj verify calls=559 declined=0 mismatched=0 values_checked=127579136
+pfproj verify calls=602 declined=0 mismatched=0 values_checked=138147840
+pfproj verify calls=645 declined=0 mismatched=0 values_checked=147861504
+pfproj verify calls=688 declined=0 mismatched=0 values_checked=156660736
+pfproj verify calls=731 declined=0 mismatched=0 values_checked=165459968
+pfproj verify calls=774 declined=0 mismatched=0 values_checked=175490048
+pfproj verify calls=817 declined=0 mismatched=0 values_checked=186058752
+pfproj verify calls=860 declined=0 mismatched=0 values_checked=196627456
+pfproj verify calls=903 declined=0 mismatched=0 values_checked=205947904
+pfproj verify calls=946 declined=0 mismatched=0 values_checked=214747136
+pfproj verify calls=989 declined=0 mismatched=0 values_checked=223546368
+pfproj verify calls=1032 declined=0 mismatched=0 values_checked=233969664
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4384 misses=15419 hit_rate=22.078 bytes=206141915136 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=22.390s after_first=9.589s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.401 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=531 refills=4818 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15419 flock_reads=0 fallbacks=0 payload_bytes=194015920128
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 32.052s
+

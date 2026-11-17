@@ -896,6 +896,37 @@ stage from 3.6 to 2.2 s (its projections upload the block's normalized inputs).
 The record is in `docs/experiments/v4-prefill-pin-2026-11-17/`, with the profiled
 runs of both arms.
 
+### A prompt chunk's input projections without the host's redundant work (`V4_PREFILL_PROJ`, opt-in)
+
+The batched attention quantized the whole chunk on the host for wq_a and wkv
+although both run on their card mirrors, which quantize the raw inputs
+themselves and never read that copy (1.5 s over a 3.3k-token prompt). It then
+normalized the query one item after another, and made the compressor's and the
+indexer-compressor's four bf16 projections in two calls, each uploading the
+chunk again and syncing. With `V4_PREFILL_PROJ=1`:
+
+- **The quantized copy** is made only where a matrix has no mirror, or when the
+  card refuses (`coli_fp8_matmul_batch_ref` then makes it, as before).
+- **The query's norm** runs over the items on the OpenMP threads, each item in
+  its own order.
+- **The four projections** are one device call (`dsv4_cuda_matmul_bf16_rows`):
+  one upload, one sync, and a kernel that reads each input once for four rows in
+  `mm_bf16_batch`'s order.
+
+The same bits. `V4_PREFILL_PROJ=2` runs the projections both ways and compares
+them (`pfproj` lines); `tests/test_dsv4_prefill_proj_cuda.c` checks the kernel
+against `dsv4_cuda_matmul_bf16_multi`.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt, with
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1
+V4_HC_FUSED=1 V4_PREFILL_PIN=1`): time to the first token 22.1 → 21.1 s, the
+same text. The query-rank stage over the prompt goes from 2.2 to 0.1 s, but
+most of what the attention saves becomes wait for the expert bank (`moebprof`'s
+`switch`, 1.3 → 2.0 s). The service at `--ram 80`, where the bank comes from
+the RAM cache, gains more: 1.1–1.8 s on each of five 3.3k-token turns. The
+verify found no difference over 1,032 calls. The record is in
+`docs/experiments/v4-prefill-proj-2026-11-17/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1149,6 +1180,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFILL_INDEXER` (0) | `1` = a prompt chunk's indexer selection on the card (see above); `DSV4_IDX_VERIFY=1` compares it with the host's |
 | `V4_HC_FUSED` (0) | `1` = the prompt block's attention post and FFN pre/norm as one device pass, the states kept on the card; `2` = verify against the two-step path (`hcfused`) |
 | `V4_PREFILL_PIN` (0) | `1` = the prompt's state buffers and the prompt block's arrays in page-locked memory (see above) |
+| `V4_PREFILL_PROJ` (0) | `1` = a prompt chunk's input projections without the host's redundant work (see above); `2` = verify the one-call projections against the separate calls (`pfproj`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |

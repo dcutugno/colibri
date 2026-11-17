@@ -1,0 +1,10 @@
+# The service (coli serve, --ram 80 --ctx 20000, the deploy stack's switches: the decode ones of the
+# baseline config plus V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1 V4_HC_FUSED=1
+# V4_COMP_BATCH=1 V4_PREFILL_PIN=1, DSV4_CUDA_PIN_CAP_GB=80, V4_UPLOAD_PIECES=2 V4_PRED_NEXT=2), a fresh process per
+# arm, five chat turns each: "Request N. " + prompt3k.txt, max_tokens 36, temperature 0. Seconds per request
+# (curl time_total: the prompt and 36 decoded tokens), arms in the order run; then the md5 of each reply's text.
+
+V4_PREFILL_PROJ=unset  turns_s: 34.216743 29.675686 28.058277 27.051066 26.463628  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_PROJ=1  turns_s: 33.063164 28.429256 26.704063 25.753716 24.848506  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_PROJ=unset  turns_s: 34.072465 29.606261 28.180624 27.349905 26.606016  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+V4_PREFILL_PROJ=1  turns_s: 32.971962 28.471464 26.819355 25.607501 24.774020  replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
