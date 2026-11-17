@@ -114,6 +114,20 @@ static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_l
 extern "C" int dsv4_cuda_lost(void){return g_cuda_lost;}
 static Dev *ctx(int d){if(g_cuda_lost)return nullptr;for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
 static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));if(sticky(e))cuda_lost(s,e);return 0;}
+/* V4_PREFILL_RESIDENT: a host range the engine vouches a device activation
+ * holds byte for byte (a prompt chunk's normalized input, left on the card by
+ * the block's first hyper-connection step), for the length of one call into
+ * the engine. A kernel whose input lies in it reads the activation in place:
+ * the same bytes, no transfer (a device-to-device copy would queue on the copy
+ * engine behind the expert bank's uploads). The single generation thread sets
+ * and clears it; nothing else reads it. */
+static struct{uintptr_t lo,hi;const Dsv4CudaActivation*act;long long hits;}g_in_alias;
+static const float*in_alias(int device,const void*x,size_t bytes){
+    const Dsv4CudaActivation*a=g_in_alias.act;uintptr_t p=(uintptr_t)x;
+    if(!a||a->device!=device||!x||!bytes||p<g_in_alias.lo||p-g_in_alias.lo>g_in_alias.hi-g_in_alias.lo||
+       bytes>g_in_alias.hi-p||(p-g_in_alias.lo)%sizeof(float))return nullptr;
+    g_in_alias.hits++;
+    return a->data+(p-g_in_alias.lo)/sizeof(float);}
 #if COLI_DSV4_TC
 static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,"[DSV4 CUDA] %s: cuBLAS status %d\n",s,(int)e);return 0;}
 #endif
@@ -2571,13 +2585,19 @@ extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x
         if(!alloc_ok(cudaHostAlloc(&g_idx_stage,stage,cudaHostAllocPortable),"prompt indexer staging"))return 0;
         g_idx_stage_cap=stage;}
     char*st=(char*)g_idx_stage;
-    memcpy(st,x,xb);memcpy(st+xb,inputs,ib);memcpy(st+xb+ib,cosv,rb);memcpy(st+xb+ib+rb,sinv,rb);
+    /* V4_PREFILL_RESIDENT: the hidden rows from the card, the rest staged */
+    const float*din=in_alias(device,inputs,ib);
+    memcpy(st,x,xb);if(!din)memcpy(st+xb,inputs,ib);memcpy(st+xb+ib,cosv,rb);memcpy(st+xb+ib+rb,sinv,rb);
     memcpy(st+xb+ib+2*rb,counts,cb);
     if(!buf((void**)&c->p1,&c->p1cap,stage)||!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,sb)||
        !buf((void**)&c->aux3,&c->aux3cap,hb))return 0;
-    if(!ok(cudaMemcpyAsync(c->p1,st,stage,cudaMemcpyHostToDevice,c->stream),"prompt indexer upload"))return 0;
+    if(din){   /* the staged block without its hidden rows, which the launch reads in place */
+        if(!ok(cudaMemcpyAsync(c->p1,st,xb,cudaMemcpyHostToDevice,c->stream),"prompt indexer upload")||
+           !ok(cudaMemcpyAsync((char*)c->p1+xb+ib,st+xb+ib,stage-xb-ib,cudaMemcpyHostToDevice,c->stream),
+               "prompt indexer upload"))return 0;
+    }else if(!ok(cudaMemcpyAsync(c->p1,st,stage,cudaMemcpyHostToDevice,c->stream),"prompt indexer upload"))return 0;
     const char*base=(const char*)c->p1;
-    if(!idx_select_launch(c,layer,c->p2,c->aux3,c->p4,(const float*)base,(const float*)(base+xb),
+    if(!idx_select_launch(c,layer,c->p2,c->aux3,c->p4,(const float*)base,din?din:(const float*)(base+xb),
                           (const float*)(base+xb+ib),(const float*)(base+xb+ib+rb),(const int*)(base+xb+ib+2*rb),
                           tokens,heads,dim,rope_dim,hidden,count,had_scale,wscale,rope_fma,hw_fma,nullptr))return 0;
     if(!ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"prompt indexer score download"))return 0;
@@ -3684,15 +3704,21 @@ static int bf16_multi_run(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens
         if(!ts[i]||!ys[i]||ts[i]->fmt!=16||ts[i]->device!=ts[0]->device||ts[i]->I!=ts[0]->I)return 0;
         yb+=(size_t)tokens*ts[i]->O*4;
     }
-    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
-    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 multi upload"))return 0;
+    if(!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    /* V4_PREFILL_RESIDENT: the input read where it already is */
+    const float*dx=in_alias(c->id,x,xb);
+    if(!dx){
+        if(!buf((void**)&c->dx,&c->xcap,xb)||
+           !ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 multi upload"))return 0;
+        dx=c->dx;
+    }
     size_t off=0;
     for(int i=0;i<n;i++){
         size_t ob=(size_t)tokens*ts[i]->O*4;
         float*dy=(float*)((char*)c->dy+off);
-        if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,c->stream);
-        else if(rows&&ts[i]->O%4==0)mm_bf16_batch_rows<4><<<dim3(ts[i]->O/4,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
-        else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,c->dx,dy,ts[i]->O,ts[i]->I,tokens);
+        if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,c->stream);
+        else if(rows&&ts[i]->O%4==0)mm_bf16_batch_rows<4><<<dim3(ts[i]->O/4,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
+        else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
         if(!ok(cudaGetLastError(),"bf16 multi launch")||
            !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;
         off+=ob;
@@ -3938,6 +3964,17 @@ extern "C" void dsv4_cuda_shutdown(void){
 extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!alloc_ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
 extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
+/* V4_PREFILL_RESIDENT: name [host, host + n) as held by `a` (n <= its
+ * elements), or clear the alias (a NULL); returns the uploads the previous
+ * alias served. */
+extern "C" long long dsv4_cuda_input_alias(const Dsv4CudaActivation*a,const float*host,long long n){
+    long long hits=g_in_alias.hits;
+    int on=a&&host&&n>0&&n<=a->elements;
+    g_in_alias.act=on?a:nullptr;
+    g_in_alias.lo=on?(uintptr_t)host:0;
+    g_in_alias.hi=on?(uintptr_t)host+(uintptr_t)n*sizeof(float):0;
+    g_in_alias.hits=0;
+    return hits;}
 extern "C" int dsv4_cuda_activation_download(float*x,const Dsv4CudaActivation*a,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation download device"))return 0;return ok(cudaMemcpyAsync(x,a->data,(size_t)n*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"activation download");}
 extern "C" int dsv4_cuda_activation_copy(Dsv4CudaActivation*dst,const Dsv4CudaActivation*src,long long n){Dev*c=dst?ctx(dst->device):nullptr,*s=src?ctx(src->device):nullptr;if(!c||!s||n<0||n>dst->elements||n>src->elements)return 0;
     if(dst->device==src->device)return ok(cudaSetDevice(dst->device),"select local activation copy")&&ok(cudaMemcpyAsync(dst->data,src->data,(size_t)n*sizeof(float),cudaMemcpyDeviceToDevice,c->stream),"local activation copy");

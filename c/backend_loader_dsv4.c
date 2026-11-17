@@ -187,6 +187,7 @@ typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n
                                                 int tokens, float *const *ys);
 typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
                                                 float *const *ys);
+typedef long long       (*fn_input_alias)(const Dsv4CudaActivation *a, const float *host, long long n);
 typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
 typedef int             (*fn_host_register)(void *p, size_t len);
 typedef void            (*fn_host_unregister)(void *p);
@@ -396,6 +397,7 @@ static struct {
     fn_attn_decode_fused attn_decode_fused;
     fn_matmul_bf16_multi matmul_bf16_multi;
     fn_matmul_bf16_multi matmul_bf16_rows;
+    fn_input_alias input_alias;   /* optional, V4_PREFILL_RESIDENT */
     fn_decode_proj_multi decode_proj_multi;
     fn_indexer_prepare indexer_prepare;
     fn_upload_compressor upload_compressor;
@@ -643,6 +645,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
     g_dsv4.matmul_bf16_multi = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_multi");
     g_dsv4.matmul_bf16_rows = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_rows");
+    g_dsv4.input_alias = (fn_input_alias)GetProcAddress(g_dsv4.dll, "dsv4_cuda_input_alias");
     g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
     g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
     g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
@@ -1073,6 +1076,10 @@ int dsv4_cuda_matmul_bf16_rows(Dsv4CudaTensor *const *ts, int n, const float *x,
                                float *const *ys){
     if(!g_dsv4.available||!g_dsv4.matmul_bf16_rows) return 0;   /* an older DLL: the plain calls */
     return g_dsv4.matmul_bf16_rows(ts, n, x, tokens, ys);
+}
+long long dsv4_cuda_input_alias(const Dsv4CudaActivation *a, const float *host, long long n){
+    if(!g_dsv4.available||!g_dsv4.input_alias) return 0;   /* an older DLL: plain uploads */
+    return g_dsv4.input_alias(a, host, n);
 }
 int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
     if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* a DLL without it: the separate calls */

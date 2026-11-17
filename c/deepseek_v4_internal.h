@@ -1265,6 +1265,14 @@ void coli_v4_gpu_mhc_tags_reset(void);
 /* V4_PREFILL_PIN (opt-in): the prompt's state buffers and the prompt block's
  * per-call arrays in page-locked memory */
 int coli_v4_prefill_pin_on(void);
+/* V4_PREFILL_RESIDENT (opt-in; 2 = verify): around a prompt chunk's attention,
+ * the normalized input the attention hyper-connection step left on the card
+ * (its last coli_v4_gpu_mhc_pre_norm_batch) serves the attention's input
+ * uploads. begin returns 0 when it took (the host array is that call's
+ * output, untouched since); end clears it. */
+int coli_v4_prefill_resident_mode(void);
+int coli_v4_gpu_resident_begin(const float *normalized, long long elements);
+void coli_v4_gpu_resident_end(const ColiDeepSeekV4LayerWeights *weights, int start_position);
 /* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
  * Uses the resident layer's uploaded f32 gate/bias mirrors through
  * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or

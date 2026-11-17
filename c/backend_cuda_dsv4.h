@@ -43,6 +43,11 @@ int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts,int n,const float *x,i
 /* The same with the prompt's row-blocked kernel (V4_PREFILL_PROJ): the same bits. */
 int dsv4_cuda_matmul_bf16_rows(Dsv4CudaTensor *const *ts,int n,const float *x,int tokens,
                                float *const *ys);
+/* V4_PREFILL_RESIDENT: name [host, host + n) as held byte for byte by `a`, so
+ * the bf16 projections and the prompt indexer read their input from it in
+ * place instead of uploading it; a NULL clears it. Returns the uploads the
+ * previous alias spared (0 on an older DLL: nothing aliased). */
+long long dsv4_cuda_input_alias(const Dsv4CudaActivation *a,const float *host,long long n);
 /* one token, one round trip through several mirrors (bf16 / fp8); 0 on an older DLL */
 int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts,int n,const float *x,float *const *ys);
 /* Host-pointer batched sparse window attention (prefill). vals holds
