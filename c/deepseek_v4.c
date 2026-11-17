@@ -15144,6 +15144,62 @@ static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
     return reserve_mb;
 }
 
+/* V4_BANK_READ_LANES (opt-in, 0 = off): the bank prefetch's store lookups
+ * on N reader threads. The worker read the next layer's experts one after the
+ * other and uploaded each before reading the next, so a miss's read had the
+ * drive to itself and nothing else in flight, and the upload waited on it. The
+ * readers claim experts in order, at most `window` ahead of the one the worker
+ * is uploading, and hand each view over; the worker uploads them in order as
+ * before. The lookups are the same uncounted ones; only their overlap
+ * changes. */
+static int v4_bank_read_lanes(void) {
+    static int lanes = -1;
+    if (lanes < 0) {
+        const char *e = getenv("V4_BANK_READ_LANES");
+        lanes = e && *e ? atoi(e) : 0;
+        if (lanes < 0) lanes = 0;
+        if (lanes > 8) lanes = 8;
+    }
+    return lanes;
+}
+static struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    ColiExpertStore *store;
+    int layer, experts;
+    int next;        /* the next expert a reader claims */
+    int consumed;    /* experts the worker has taken, in order */
+    int window;      /* how far past `consumed` the readers may claim */
+    int stop;
+    signed char state[256];   /* 0 pending, 1 read (view held), -1 lookup failed */
+    ColiExpertView views[256];
+} v4_bank_rd = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+static void *v4_bank_reader(void *argument) {
+    (void)argument;
+    pthread_mutex_lock(&v4_bank_rd.mutex);
+    for (;;) {
+        while (!v4_bank_rd.stop && v4_bank_rd.next < v4_bank_rd.experts &&
+               v4_bank_rd.next >= v4_bank_rd.consumed + v4_bank_rd.window)
+            pthread_cond_wait(&v4_bank_rd.cond, &v4_bank_rd.mutex);
+        if (v4_bank_rd.stop || v4_bank_rd.next >= v4_bank_rd.experts) break;
+        int expert = v4_bank_rd.next++;
+        pthread_mutex_unlock(&v4_bank_rd.mutex);
+        ColiExpertView view;
+        memset(&view, 0, sizeof(view));
+        int rc = coli_v4_expert_store_lookup_uncounted(
+            v4_bank_rd.store, (ColiExpertKey){v4_bank_rd.layer, expert}, &view);
+        pthread_mutex_lock(&v4_bank_rd.mutex);
+        v4_bank_rd.views[expert] = view;
+        v4_bank_rd.state[expert] = rc == 0 ? 1 : -1;
+        pthread_cond_broadcast(&v4_bank_rd.cond);
+    }
+    pthread_mutex_unlock(&v4_bank_rd.mutex);
+    return NULL;
+}
+
 static void *v4_bank2_worker(void *argument) {
     (void)argument;
     ColiExpertStore *store = v4_bank2_job.store;
@@ -15151,14 +15207,41 @@ static void *v4_bank2_worker(void *argument) {
     int experts = v4_bank2_job.experts;   /* the model's routed experts, <= 256 */
     memset(v4_bank2_valid, 0, sizeof(v4_bank2_valid));
     int loaded = 0;
+    pthread_t readers[8];
+    int started = 0, lanes = v4_bank_read_lanes();
+    if (lanes > 0 && experts <= 256) {
+        pthread_mutex_lock(&v4_bank_rd.mutex);
+        v4_bank_rd.store = store;
+        v4_bank_rd.layer = layer;
+        v4_bank_rd.experts = experts;
+        v4_bank_rd.next = v4_bank_rd.consumed = 0;
+        v4_bank_rd.window = 2 * lanes;
+        v4_bank_rd.stop = 0;
+        memset(v4_bank_rd.state, 0, sizeof(v4_bank_rd.state));
+        pthread_mutex_unlock(&v4_bank_rd.mutex);
+        for (int i = 0; i < lanes; i++)
+            if (pthread_create(&readers[started], NULL, v4_bank_reader, NULL) == 0) started++;
+    }
     for (int expert = 0; expert < experts; expert++) {
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
-        /* Uncounted, like the refill's reads: the layer's books come from
-         * its routing (coli_v4_expert_store_note_union), not from which
-         * experts a whole-layer prefetch happened to read. */
-        if (coli_v4_expert_store_lookup_uncounted(
+        if (started) {
+            /* the readers' view, in order */
+            pthread_mutex_lock(&v4_bank_rd.mutex);
+            while (!v4_bank_rd.state[expert])
+                pthread_cond_wait(&v4_bank_rd.cond, &v4_bank_rd.mutex);
+            int read = v4_bank_rd.state[expert] > 0;
+            if (read) view = v4_bank_rd.views[expert];
+            v4_bank_rd.state[expert] = 0;
+            v4_bank_rd.consumed = expert + 1;
+            pthread_cond_broadcast(&v4_bank_rd.cond);
+            pthread_mutex_unlock(&v4_bank_rd.mutex);
+            if (!read) continue;
+        } else if (coli_v4_expert_store_lookup_uncounted(
                 store, (ColiExpertKey){layer, expert}, &view) != 0)
+            /* Uncounted, like the refill's reads: the layer's books come from
+             * its routing (coli_v4_expert_store_note_union), not from which
+             * experts a whole-layer prefetch happened to read. */
             continue;
         Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
         int uploaded =
@@ -15189,6 +15272,20 @@ static void *v4_bank2_worker(void *argument) {
              * nothing. Failures AFTER a success keep going: partial banks
              * are profit. */
             break;
+    }
+    if (started) {
+        /* stop the readers (an early break leaves experts unclaimed) and give
+         * back the views read past the last one the worker took */
+        pthread_mutex_lock(&v4_bank_rd.mutex);
+        v4_bank_rd.stop = 1;
+        pthread_cond_broadcast(&v4_bank_rd.cond);
+        pthread_mutex_unlock(&v4_bank_rd.mutex);
+        for (int i = 0; i < started; i++) pthread_join(readers[i], NULL);
+        for (int expert = 0; expert < experts; expert++)
+            if (v4_bank_rd.state[expert] > 0) {
+                coli_expert_release(store, &v4_bank_rd.views[expert]);
+                v4_bank_rd.state[expert] = 0;
+            }
     }
     v4_bank2_prefetched += (unsigned long long)loaded;
     v4_bank2_layer = loaded ? layer : -1;
