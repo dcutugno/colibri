@@ -3858,7 +3858,12 @@ extern "C" long long dsv4_cuda_mirror_check(Dsv4CudaTensor*g,int run,const uint8
     if(!g||!g->block||!g->block2||!src||len<=0||(run!=0&&run!=1))return -2;
     if(len>(run?g->blockcap:g->block2cap))return -2;
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror check device"))return -2;
-    if(!ok(cudaStreamSynchronize(c->stream),"mirror check drain")||!ok(cudaStreamSynchronize(c->aux),"mirror check upload drain"))return -2;
+    /* a read-ahead lane checks while the generation thread may be capturing a graph on the
+     * compute stream: its copies are on the second stream only, so that one is left alone then */
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    if(!ok(cudaStreamIsCapturing(c->stream,&capture),"mirror check capture status"))return -2;
+    if((capture==cudaStreamCaptureStatusNone&&!ok(cudaStreamSynchronize(c->stream),"mirror check drain"))||
+       !ok(cudaStreamSynchronize(c->aux),"mirror check upload drain"))return -2;
     uint8_t*h=(uint8_t*)malloc((size_t)len);if(!h)return -2;
     if(!ok(cudaMemcpy(h,run?g->block:g->block2,(size_t)len,cudaMemcpyDeviceToHost),"mirror check download")){free(h);return -2;}
     long long bad=-1;for(long long i=0;i<len;i++)if(h[(size_t)i]!=src[i]){bad=i;break;}

@@ -1061,6 +1061,18 @@ extern double g_v4_open_index_seconds;
  * computed from VRAM without a store lookup (V4_GPU_RESIDENT_FIRST) or
  * fetched from the store. */
 extern int g_v4_dec_counting;
+/* V4_PRED_NEXT=N (off): the next layer's experts predicted and read ahead
+ * during decode. The decode loop sets the layer after the one it runs (NULL:
+ * none) and the engine quiesces the lanes before it frees its layers, store
+ * and backend, through the hook the decode loop sets (the runtime unit is also
+ * linked without the block unit). Defined in the block unit, in every build;
+ * pred_route (the guess, ids only, in the router's order) in the router's. */
+extern void (*coli_v4_pred_quiesce_hook)(void);
+void coli_v4_pred_next_layer(const ColiDeepSeekV4LayerWeights *next, int token,
+                             ColiExpertStore *store, const ColiDeepSeekV4Config *config);
+void coli_v4_pred_quiesce(void);
+int coli_v4_pred_route(int *ids, const float *hidden, const uint16_t *gate,
+                       const float *bias, int experts, int d, int topk);
 extern unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
 extern double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
 extern unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
@@ -1301,6 +1313,13 @@ void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
 void coli_v4_gpu_pieces_land(void *job, unsigned long long record_offset, size_t length,
                              const unsigned char *bytes);
 void coli_v4_gpu_pieces_end(void *job, int read_ok);
+/* V4_PRED_NEXT: a read-ahead lane's thread reserves mirrors outside the
+ * window (on = 1); after each lookup it waits for its job's copies before it
+ * releases the slab (thread_drain). mirrored: whether a card holds
+ * {layer, expert}, without touching it. */
+void coli_v4_gpu_pieces_thread(int on);
+void coli_v4_gpu_pieces_thread_drain(void);
+int coli_v4_gpu_expert_mirrored(ColiExpertStore *store, ColiExpertKey key);
 extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
 extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;

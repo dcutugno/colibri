@@ -3021,6 +3021,36 @@ static int test_route_bf16_forced_only(void) {
     return failed;
 }
 
+/* V4_PRED_NEXT: the predictor's guess is the router's selection when it
+ * scores the same layer on the same input (ids only, the router's order) */
+static int test_pred_route_matches_router(void) {
+    enum { EXPERTS = 32, DIM = 128, TOPK = 6 };
+    float gate[EXPERTS * DIM], hidden[DIM], bias[EXPERTS], weights[TOPK];
+    uint16_t packed[EXPERTS * DIM];
+    int router_ids[TOPK], guess[TOPK];
+    for (int i = 0; i < EXPERTS * DIM; i++) {
+        gate[i] = ((i * 7) % 29 - 14) * 0.03125f;
+        uint32_t bits; memcpy(&bits, &gate[i], sizeof(bits)); packed[i] = (uint16_t)(bits >> 16);
+    }
+    for (int i = 0; i < DIM; i++) hidden[i] = (i % 17 - 8) * 0.01371f;
+    for (int i = 0; i < EXPERTS; i++) bias[i] = ((i * 11) % EXPERTS) * 0.015625f;
+    for (int with_bias = 0; with_bias < 2; with_bias++) {
+        const float *b = with_bias ? bias : NULL;
+        if (coli_v4_route_bf16(weights, router_ids, hidden, packed, b, NULL,
+                               EXPERTS, DIM, TOPK, 1.5f) ||
+            coli_v4_pred_route(guess, hidden, packed, b, EXPERTS, DIM, TOPK) != TOPK) return 1;
+        for (int i = 0; i < TOPK; i++) {
+            int found = 0;
+            for (int j = 0; j < TOPK; j++) found |= guess[j] == router_ids[i];
+            if (!found) return 1;
+        }
+    }
+    /* out of its bounds: no guess */
+    if (coli_v4_pred_route(guess, hidden, packed, bias, EXPERTS, DIM, EXPERTS + 1) ||
+        coli_v4_pred_route(guess, hidden, NULL, bias, EXPERTS, DIM, TOPK)) return 1;
+    return 0;
+}
+
 static int test_sparse_attention_parallel_order(void) {
     enum { HEADS = 7, DIM = 32, KV = 19, TOPK = 17 };
     float query[HEADS * DIM], kv[KV * DIM], sinks[HEADS];
@@ -3090,6 +3120,7 @@ static int test_fp8_decode_batch_order(void) {
 int main(int argc, char **argv) {
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
         test_route_bf16_parallel_order() || test_route_bf16_forced_only() ||
+        test_pred_route_matches_router() ||
         test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");

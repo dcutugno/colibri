@@ -1065,6 +1065,100 @@ static void test_upload_pieces(void) {
     assert(live_tensors == tensors);
 }
 
+/* V4_PRED_NEXT: a read-ahead lane's jobs, outside the step's window */
+static void *pred_thread_job(void *arg) {
+    void **io = arg;
+    ColiExpertStore *store = io[0];
+    const V4PieceLayout *layout = io[1];
+    static uint8_t slab[4096];
+    coli_v4_gpu_pieces_thread(1);
+    void *job = coli_v4_gpu_pieces_begin(store, (ColiExpertKey){3, 60}, layout, slab, sizeof(slab));
+    io[2] = job;
+    if (job) {
+        coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+        coli_v4_gpu_pieces_end(job, 1);
+    }
+    io[3] = (void *)(intptr_t)fence_drains[2];
+    coli_v4_gpu_pieces_thread_drain();   /* the lane, before it releases the slab */
+    io[4] = (void *)(intptr_t)fence_drains[2];
+    coli_v4_gpu_pieces_thread_drain();   /* once only */
+    io[5] = (void *)(intptr_t)fence_drains[2];
+    return NULL;
+}
+static void test_pred_pieces_thread(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    int tensors = live_tensors;
+    const V4PieceLayout layout = {5, 80, {2, 0, 4}, {32, 0, 64}, {2, 32, 1, 32}};
+    static uint8_t slab[4096];
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    unsetenv("V4_UPLOAD_FENCE");
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    ColiExpertView view;
+    for (int expert = 0; expert < 9; expert++) {   /* the ninth recycles */
+        view = block_view(expert, 0);
+        assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    }
+    assert(cache->recycling);
+    coli_v4_gpu_expert_upload_settle();
+    memset(fences, 0, sizeof(fences));
+    memset(fence_drains, 0, sizeof(fence_drains));
+    /* mirrored: no touch */
+    uint64_t clock = 0;
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].expert == 5) clock = cache->entries[i].clock;
+    assert(coli_v4_gpu_expert_mirrored(&store, (ColiExpertKey){3, 5}));
+    assert(!coli_v4_gpu_expert_mirrored(&store, (ColiExpertKey){3, 60}));
+    assert(!coli_v4_gpu_expert_mirrored(&store, (ColiExpertKey){2, 5}));
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].expert == 5) assert(cache->entries[i].clock == clock);
+    /* the window closed and the thread not a lane's: the usual read */
+    assert(!coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 60}, &layout, slab, sizeof(slab)));
+    /* a lane's thread: an expert a card mirrors is not read into a second mirror */
+    coli_v4_gpu_pieces_thread(1);
+    assert(!coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 5}, &layout, slab, sizeof(slab)));
+    coli_v4_gpu_pieces_thread_drain();   /* nothing copied: no wait */
+    assert(fence_drains[2] == 0);
+    coli_v4_gpu_pieces_thread(0);
+    /* a whole record on a lane's thread, the window closed */
+    void *io[6] = {&store, (void *)&layout, NULL, NULL, NULL, NULL};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, pred_thread_job, io) == 0);
+    pthread_join(thread, NULL);
+    assert(io[2] && !reserved_entries(cache));
+    /* the lane waited for its copies once, before its release */
+    assert((intptr_t)io[3] == 0 && (intptr_t)io[4] == 1 && (intptr_t)io[5] == 1);
+    ColiExpertView probe = {0};
+    probe.key = (ColiExpertKey){3, 60};
+    assert(coli_v4_gpu_expert_peek(&store, &probe) == 0);
+    /* the next step's join fences the card, though no lane of its read */
+    coli_v4_gpu_expert_upload_join();
+    assert(fences[2] == 1);
+    coli_v4_gpu_expert_upload_settle();
+    coli_v4_gpu_expert_upload_join();   /* nothing owed any more */
+    assert(fences[2] == 1);
+    /* a job that ends while a settle has already passed: still noted at its end */
+    coli_v4_gpu_pieces_thread(1);
+    void *job = coli_v4_gpu_pieces_begin(&store, (ColiExpertKey){3, 61}, &layout, slab,
+                                         sizeof(slab));
+    assert(job);
+    coli_v4_gpu_expert_upload_settle();   /* clears what the begin noted */
+    coli_v4_gpu_pieces_land(job, 0, 85, block_record);
+    coli_v4_gpu_pieces_end(job, 1);
+    coli_v4_gpu_pieces_thread_drain();
+    coli_v4_gpu_pieces_thread(0);
+    coli_v4_gpu_expert_upload_join();
+    assert(fences[2] == 2);
+    coli_v4_gpu_expert_upload_settle();
+    unsetenv("V4_UPLOAD_THREAD");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
 /* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
  * created releases the oldest mirrors on its device until it fits. */
 static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
@@ -1259,6 +1353,7 @@ int main(void) {
     test_upload_thread_block();
     test_hot_admission();
     test_upload_pieces();
+    test_pred_pieces_thread();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();

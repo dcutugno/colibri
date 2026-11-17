@@ -129,6 +129,9 @@ typedef hipFuncAttributes cudaFuncAttributes;
 #define cudaStreamNonBlocking    hipStreamNonBlocking
 #define cudaStreamDestroy        hipStreamDestroy
 #define cudaStreamSynchronize    hipStreamSynchronize
+#define cudaStreamIsCapturing    hipStreamIsCapturing
+#define cudaStreamCaptureStatus  hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamWaitEvent      hipStreamWaitEvent
 #define cudaGraph_t              hipGraph_t
 #define cudaGraphExec_t          hipGraphExec_t
