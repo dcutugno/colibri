@@ -1254,6 +1254,13 @@ int coli_v4_gpu_mhc_post_pre_norm_batch(
     float *ffn_post, float *ffn_comb, float *ffn_normalized,
     const float *states, int hc, int hidden, int batch);
 int coli_v4_gpu_mhc_states_fetch(float *states, long long elements);
+/* at a prompt block's start: the device residency tags can only hit within the
+ * block that set them (V4_PREFILL_PIN's scratch keeps the block's pointers
+ * stable from one chunk to the next) */
+void coli_v4_gpu_mhc_tags_reset(void);
+/* V4_PREFILL_PIN (opt-in): the prompt's state buffers and the prompt block's
+ * per-call arrays in page-locked memory */
+int coli_v4_prefill_pin_on(void);
 /* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
  * Uses the resident layer's uploaded f32 gate/bias mirrors through
  * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or

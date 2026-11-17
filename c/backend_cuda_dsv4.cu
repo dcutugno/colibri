@@ -5276,6 +5276,21 @@ static bool host_pinned(const void*p,size_t len){
 /* Drain the device's expert stream: the hybrid decode split enqueues its
  * fill-set uploads asynchronously, computes the CPU subset while the DMA is
  * in flight, and closes the pipeline here before the GPU group runs. */
+/* V4_PREFILL_PIN: page-locked host memory the engine owns. register/unregister
+ * page-lock a range for as long as the engine says (no registry: it unregisters
+ * before it frees or reuses the range); 1 = registered now, 2 = was already
+ * (leave it alone), 0 = refused. alloc/free: page-locked scratch, NULL when
+ * refused. */
+extern "C" int dsv4_cuda_host_register(void*p,size_t len){
+    if(!p||!len)return 0;
+    cudaError_t e=cudaHostRegister(p,len,cudaHostRegisterPortable);
+    if(e==cudaErrorHostMemoryAlreadyRegistered){(void)cudaGetLastError();return 2;}
+    if(e!=cudaSuccess){(void)cudaGetLastError();return 0;}
+    return 1;
+}
+extern "C" void dsv4_cuda_host_unregister(void*p){if(p&&cudaHostUnregister(p)!=cudaSuccess)(void)cudaGetLastError();}
+extern "C" void *dsv4_cuda_host_alloc(size_t n){void*p=nullptr;if(!n||!alloc_ok(cudaHostAlloc(&p,n,cudaHostAllocPortable),"page-locked scratch"))return nullptr;return p;}
+extern "C" void dsv4_cuda_host_free(void*p){if(p)cudaFreeHost(p);}
 extern "C" int dsv4_cuda_stream_drain(int device){
     Dev*c=ctx(device);if(!c)return 0;
     if(!ok(cudaSetDevice(device),"select drain device"))return 0;

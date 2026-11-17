@@ -188,6 +188,10 @@ typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n
 typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
                                                 float *const *ys);
 typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_host_register)(void *p, size_t len);
+typedef void            (*fn_host_unregister)(void *p);
+typedef void *          (*fn_host_alloc)(size_t n);
+typedef void            (*fn_host_free)(void *p);
 typedef int             (*fn_indexer_select_fused)(int device, int layer, const float *x, const float *inputs,
                                                    const float *cosv, const float *sinv, const int *counts,
                                                    int tokens, int heads, int dim, int rope_dim, int hidden,
@@ -384,6 +388,8 @@ static struct {
     /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
     fn_indexer_resident indexer_resident;
     fn_indexer_keys_sync indexer_keys_sync;
+    fn_host_register host_register; fn_host_unregister host_unregister;   /* optional, V4_PREFILL_PIN */
+    fn_host_alloc host_alloc; fn_host_free host_free;
     fn_indexer_select_fused indexer_select_fused;   /* optional, V4_PREFILL_INDEXER */
     fn_attn_decode_chain attn_decode_chain;
     fn_attn_prefill_chain attn_prefill_chain;   /* optional, V4_PREFILL_CHAIN */
@@ -626,6 +632,10 @@ static int dsv4_cuda_resolve(const char *dllname){
      * alive, and the engine keeps the paths it had */
     g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
     g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
+    g_dsv4.host_register = (fn_host_register)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_register");
+    g_dsv4.host_unregister = (fn_host_unregister)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_unregister");
+    g_dsv4.host_alloc = (fn_host_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_alloc");
+    g_dsv4.host_free = (fn_host_free)GetProcAddress(g_dsv4.dll, "dsv4_cuda_host_free");
     g_dsv4.indexer_select_fused = (fn_indexer_select_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_select_fused");
     g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
     g_dsv4.attn_prefill_chain = (fn_attn_prefill_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_prefill_chain");
@@ -1071,6 +1081,22 @@ int dsv4_cuda_indexer_select_fused(int device, int layer, const float *x, const 
     return g_dsv4.indexer_select_fused(device, layer, x, inputs, cosv, sinv, counts, tokens, heads, dim,
                                        rope_dim, hidden, count, had_scale, wscale, rope_fma, hw_fma, scores,
                                        queries_out, head_w_out);
+}
+
+/* a DLL without these: nothing page-locked, the engine's own memory as before */
+int dsv4_cuda_host_register(void *p, size_t len){
+    if(!g_dsv4.available||!g_dsv4.host_register||!g_dsv4.host_unregister) return 0;
+    return g_dsv4.host_register(p, len);
+}
+void dsv4_cuda_host_unregister(void *p){
+    if(p&&g_dsv4.available&&g_dsv4.host_unregister) g_dsv4.host_unregister(p);
+}
+void *dsv4_cuda_host_alloc(size_t n){
+    if(!g_dsv4.available||!g_dsv4.host_alloc||!g_dsv4.host_free) return NULL;
+    return g_dsv4.host_alloc(n);
+}
+void dsv4_cuda_host_free(void *p){
+    if(p&&g_dsv4.available&&g_dsv4.host_free) g_dsv4.host_free(p);
 }
 
 int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){

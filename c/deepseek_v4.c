@@ -7976,6 +7976,10 @@ int coli_v4_moe_routed(float *routed, const ColiDeepSeekV4LayerWeights *weights,
 }
 #endif
 
+#ifdef COLI_V4_GPU_TIER
+extern void *dsv4_cuda_host_alloc(size_t n);   /* backend_cuda_dsv4.h, V4_PREFILL_PIN */
+extern void dsv4_cuda_host_free(void *p);
+#endif
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -7986,23 +7990,69 @@ int coli_v4_block_window_batch_ref(
         !inputs_hc || !tokens || batch < 1 || batch > 128) return -1;
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
-    float *states = malloc((size_t)batch * hd * sizeof(*states));
-    float *normalized = malloc((size_t)batch * d * sizeof(*normalized));
-    float *branches = malloc((size_t)batch * d * sizeof(*branches));
-    float *posts = malloc((size_t)batch * hc * sizeof(*posts));
-    float *combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
-    float *reduced = malloc((size_t)d * sizeof(*reduced));
+    float *states, *normalized, *branches, *posts, *combs, *reduced;
     /* FFN buffers are batch-sized so the MoE can run expert-major over the
      * whole chunk (v4_moe_batch_union) instead of position by position. */
-    float *ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
-    float *ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
-    float *ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
-    float *ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
-    if (!states || !normalized || !branches || !posts || !combs || !reduced ||
-        !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
-        free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
-        free(reduced); free(combs); free(posts); free(branches);
-        free(normalized); free(states); return -1;
+    float *ffn_normalized, *ffn_branch, *ffn_post, *ffn_comb;
+    /* V4_PREFILL_PIN: the ten per-call arrays carved from one persistent
+     * page-locked scratch (grow-only; the single generation thread), so their
+     * copies to and from the card are DMA from pages that are already there */
+    char *pinned_scratch = NULL;
+#ifdef COLI_V4_GPU_TIER
+    if (batch > 1 && coli_v4_prefill_pin_on()) {
+        static char *scratch;
+        static size_t scratch_cap;
+        size_t n_states = (size_t)batch * hd, n_d = (size_t)batch * d,
+               n_hc = (size_t)batch * hc, n_hc2 = (size_t)batch * hc * hc;
+        size_t need = (n_states + 4 * n_d + 2 * n_hc + 2 * n_hc2 + (size_t)d) * sizeof(float) + 10 * 64;
+        if (scratch_cap < need) {
+            size_t want = need < ((size_t)32 << 20) ? ((size_t)32 << 20) : need;
+            char *grown = dsv4_cuda_host_alloc(want);
+            if (grown) {
+                dsv4_cuda_host_free(scratch);
+                scratch = grown;
+                scratch_cap = want;
+            }
+        }
+        if (scratch_cap >= need) {
+            char *carve = scratch;
+#define V4_BLOCK_CARVE(count) \
+            (carve = (char *)(((uintptr_t)carve + 63) & ~(uintptr_t)63), \
+             carve += (count) * sizeof(float), (float *)(carve - (count) * sizeof(float)))
+            states = V4_BLOCK_CARVE(n_states);
+            normalized = V4_BLOCK_CARVE(n_d);
+            branches = V4_BLOCK_CARVE(n_d);
+            posts = V4_BLOCK_CARVE(n_hc);
+            combs = V4_BLOCK_CARVE(n_hc2);
+            reduced = V4_BLOCK_CARVE((size_t)d);
+            ffn_normalized = V4_BLOCK_CARVE(n_d);
+            ffn_branch = V4_BLOCK_CARVE(n_d);
+            ffn_post = V4_BLOCK_CARVE(n_hc);
+            ffn_comb = V4_BLOCK_CARVE(n_hc2);
+#undef V4_BLOCK_CARVE
+            pinned_scratch = scratch;
+        }
+    }
+    /* stable pointers from one chunk to the next: no tag may outlive its block */
+    coli_v4_gpu_mhc_tags_reset();
+#endif
+    if (!pinned_scratch) {
+        states = malloc((size_t)batch * hd * sizeof(*states));
+        normalized = malloc((size_t)batch * d * sizeof(*normalized));
+        branches = malloc((size_t)batch * d * sizeof(*branches));
+        posts = malloc((size_t)batch * hc * sizeof(*posts));
+        combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
+        reduced = malloc((size_t)d * sizeof(*reduced));
+        ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
+        ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
+        ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
+        ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
+        if (!states || !normalized || !branches || !posts || !combs || !reduced ||
+            !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
+            free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
+            free(reduced); free(combs); free(posts); free(branches);
+            free(normalized); free(states); return -1;
+        }
     }
     int result = 0;
     double prof_t = v4_block_prof_enabled() ? v4_block_prof_now() : 0.0;
@@ -8163,9 +8213,11 @@ int coli_v4_block_window_batch_ref(
                 prof_attn * 1e3, prof_hc2 * 1e3, prof_moe * 1e3,
                 prof_hc3 * 1e3);
 #undef V4_BLOCK_PROF_MARK
-    free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
-    free(reduced); free(combs); free(posts); free(branches);
-    free(normalized); free(states);
+    if (!pinned_scratch) {
+        free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
+        free(reduced); free(combs); free(posts); free(branches);
+        free(normalized); free(states);
+    }
     if (!result) return 0;
     if (error && error_size && error[0]) return -1;
     if (moe_reason()[0])
@@ -16659,6 +16711,16 @@ static struct V4GpuMhcTag {
 } v4_gpu_mhc_res_tag, v4_gpu_mhc_state_tag,
   v4_gpu_mhc_pending_tag;   /* V4_HC_FUSED: states on the device only, the host copy not made */
 
+/* V4_PREFILL_PIN (opt-in, 0) */
+int coli_v4_prefill_pin_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_PREFILL_PIN");
+        on = e && *e && atoi(e) != 0 && coli_v4_gpu_attn_batch_wanted();
+    }
+    return on;
+}
+
 static int v4_gpu_mhc_tag_hit(const struct V4GpuMhcTag *tag,
                               const Dsv4CudaActivation *act,
                               const float *host, long long elements) {
@@ -16670,6 +16732,7 @@ static void v4_gpu_mhc_tags_clear(void) {
     v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
     v4_gpu_mhc_pending_tag = (struct V4GpuMhcTag){0};
 }
+void coli_v4_gpu_mhc_tags_reset(void) { v4_gpu_mhc_tags_clear(); }
 
 int coli_v4_gpu_mhc_pre_norm_batch(
     const ColiDeepSeekV4LayerWeights *weights, const char *branch,
@@ -18573,6 +18636,18 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     if (batch > 0) g_v4_prof_forwards += batch;
     return result;
 }
+#ifdef COLI_V4_GPU_TIER
+extern int dsv4_cuda_host_register(void *p, size_t len);   /* backend_cuda_dsv4.h, V4_PREFILL_PIN */
+extern void dsv4_cuda_host_unregister(void *p);
+#endif
+static void v4_prefill_unpin(void *a, void *b) {
+#ifdef COLI_V4_GPU_TIER
+    if (a) dsv4_cuda_host_unregister(a);
+    if (b) dsv4_cuda_host_unregister(b);
+#else
+    (void)a; (void)b;
+#endif
+}
 static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
@@ -18606,12 +18681,25 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
+    /* V4_PREFILL_PIN: the prompt's range of both state buffers page-locked for
+     * this prefill (the block's 8 MB state copies per chunk and layer become
+     * DMA from the pages in place); released on every exit below. Short
+     * prompts (under 256 tokens) are not worth the registration. */
+    void *pin_a = NULL, *pin_b = NULL;
+#ifdef COLI_V4_GPU_TIER
+    if (batch >= 256 && first_layer < config->num_hidden_layers && coli_v4_prefill_pin_on()) {
+        size_t bytes = (size_t)batch * hd * sizeof(float);
+        if (dsv4_cuda_host_register(state, bytes) == 1) pin_a = state;
+        if (dsv4_cuda_host_register(next, bytes) == 1) pin_b = next;
+    }
+#endif
     for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) {
             if (pool_experts)
                 coli_v4_expert_store_prefill_pool(experts, -1);
+            v4_prefill_unpin(pin_a, pin_b);
             return -1;
         }
         /* A true prefill is layer-major: every prompt position crosses this
@@ -18663,6 +18751,7 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
         if (result) {
             if (pool_experts)
                 coli_v4_expert_store_prefill_pool(experts, -1);
+            v4_prefill_unpin(pin_a, pin_b);
             return -1;
         }
         float *swap = state; state = next; next = swap;
@@ -18671,6 +18760,7 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                          (int64_t)start + item);
     }
     if (pool_experts) coli_v4_expert_store_prefill_pool(experts, -1);
+    v4_prefill_unpin(pin_a, pin_b);
     *state_ptr = state;
     *next_ptr = next;
     return 0;

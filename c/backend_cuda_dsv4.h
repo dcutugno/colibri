@@ -170,6 +170,12 @@ int dsv4_cuda_device_unified(int device);
 /* Drain the device's expert stream (hybrid split: async fill DMA is enqueued,
  * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
  * success, 0 when the backend is unavailable. */
+/* V4_PREFILL_PIN: page-lock an engine range until unregistered (1 done, 2
+ * already, 0 refused); page-locked scratch (NULL when refused) */
+int dsv4_cuda_host_register(void *p,size_t len);
+void dsv4_cuda_host_unregister(void *p);
+void *dsv4_cuda_host_alloc(size_t n);
+void dsv4_cuda_host_free(void *p);
 int dsv4_cuda_stream_drain(int device);
 /* V4_UPLOAD_THREAD: dsv4_cuda_tensor_refill_fp4 with sync 2 or 3 copies on
  * the device's second stream (2 drains it, 3 only enqueues). drain=0 orders
