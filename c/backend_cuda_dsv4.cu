@@ -2543,6 +2543,49 @@ static int idx_select_launch(Dev*c,int layer,float*dq,float*dhw,float*dsc,const 
     return ok(cudaGetLastError(),"fused indexer score launch");
 }
 
+/* V4_PREFILL_INDEXER: a prompt chunk's selection over the resident weights and
+ * keys of `layer`. x [tokens][cols] the fp8-qdq'd query ranks, inputs
+ * [tokens][hidden], cosv/sinv [tokens][rope_dim/2], counts[tokens]; scores
+ * [tokens][count] (queries_out [tokens][heads*dim], head_w_out [tokens][heads]:
+ * optional, the verify's downloads). One staged upload from a page-locked
+ * block, the fused decode layer's four launches (idx_select_launch), the
+ * downloads, one sync. 0 = refused. */
+static void *g_idx_stage;static size_t g_idx_stage_cap;
+extern "C" int dsv4_cuda_indexer_select_fused(int device,int layer,const float*x,const float*inputs,const float*cosv,
+        const float*sinv,const int*counts,int tokens,int heads,int dim,int rope_dim,int hidden,int count,
+        float had_scale,float wscale,int rope_fma,int hw_fma,float*scores,float*queries_out,float*head_w_out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_idx_w[layer]||!g_idx_keys[layer]||g_idx_dev[layer]!=device||
+       !x||!inputs||!cosv||!sinv||!counts||!scores||tokens<1||tokens>1024||heads<1||heads>1024||dim<32||dim>1024||
+       (dim&(dim-1))||rope_dim<2||rope_dim>dim||(rope_dim&1)||hidden<1||count<1||count>g_idx_keys_n[layer]||
+       g_idx_keys_dim[layer]!=dim||g_idx_rows[layer]!=heads*dim||g_idx_heads[layer]!=heads||
+       g_idx_hidden[layer]!=hidden)return 0;
+    for(int t=0;t<tokens;t++)if(counts[t]<1||counts[t]>count)return 0;
+    int cols=g_idx_cols[layer],rows=g_idx_rows[layer],pairs=rope_dim/2;
+    size_t xb=(size_t)tokens*cols*4,ib=(size_t)tokens*hidden*4,rb=(size_t)tokens*pairs*4,cb=(size_t)tokens*sizeof(int);
+    size_t stage=xb+ib+2*rb+cb,qb=(size_t)tokens*rows*4,sb=(size_t)tokens*count*4,hb=(size_t)tokens*heads*4,sm=(size_t)rows*4;
+    if(sm>96*1024||!ok(cudaSetDevice(device),"select prompt indexer device"))return 0;
+    if(g_idx_stage_cap<stage){
+        if(g_idx_stage)cudaFreeHost(g_idx_stage);
+        g_idx_stage=NULL;g_idx_stage_cap=0;
+        if(!alloc_ok(cudaHostAlloc(&g_idx_stage,stage,cudaHostAllocPortable),"prompt indexer staging"))return 0;
+        g_idx_stage_cap=stage;}
+    char*st=(char*)g_idx_stage;
+    memcpy(st,x,xb);memcpy(st+xb,inputs,ib);memcpy(st+xb+ib,cosv,rb);memcpy(st+xb+ib+rb,sinv,rb);
+    memcpy(st+xb+ib+2*rb,counts,cb);
+    if(!buf((void**)&c->p1,&c->p1cap,stage)||!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,sb)||
+       !buf((void**)&c->aux3,&c->aux3cap,hb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p1,st,stage,cudaMemcpyHostToDevice,c->stream),"prompt indexer upload"))return 0;
+    const char*base=(const char*)c->p1;
+    if(!idx_select_launch(c,layer,c->p2,c->aux3,c->p4,(const float*)base,(const float*)(base+xb),
+                          (const float*)(base+xb+ib),(const float*)(base+xb+ib+rb),(const int*)(base+xb+ib+2*rb),
+                          tokens,heads,dim,rope_dim,hidden,count,had_scale,wscale,rope_fma,hw_fma,nullptr))return 0;
+    if(!ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"prompt indexer score download"))return 0;
+    if(queries_out&&!ok(cudaMemcpyAsync(queries_out,c->p2,qb,cudaMemcpyDeviceToHost,c->stream),"prompt indexer query download"))return 0;
+    if(head_w_out&&!ok(cudaMemcpyAsync(head_w_out,c->aux3,hb,cudaMemcpyDeviceToHost,c->stream),"prompt indexer head-weight download"))return 0;
+    return ok(cudaStreamSynchronize(c->stream),"prompt indexer sync");
+}
+
 
 /* ---- Decode attention tail on the device (V4_WO_CHAIN) ---------------------
  * One token: the cached sparse attention (ring + compressed prefix, the

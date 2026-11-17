@@ -1116,6 +1116,17 @@ int coli_v4_gpu_decode_proj_multi(const ColiDeepSeekV4LayerWeights *weights,
                                   void *const *fp8_gpu, int nf, const char *const *keys, int nk,
                                   float *const *outs, const float *input);   /* V4_DECODE_PROJ6 */
 int coli_v4_gpu_indexer_fused_wanted(void);
+/* V4_PREFILL_INDEXER (opt-in): a prompt chunk's indexer selection on the card,
+ * projection to scores in one round trip over the resident weights and keys.
+ * scores [tokens][max_count]; queries_out / head_w_out optional (verify).
+ * 0 = done, -1 = declined. */
+int coli_v4_gpu_prefill_indexer_wanted(void);
+int coli_v4_gpu_indexer_select_fused(
+    const ColiDeepSeekV4LayerWeights *weights, int layer, unsigned long long owner,
+    const ColiTensorView *wq, const uint16_t *head_w, int heads, int dim, int rope_dim,
+    int hidden, const float *keys, int key_count, const float *x_qdq,
+    const float *inputs, const float *cosv, const float *sinv, const int *counts,
+    int tokens, int max_count, float *scores, float *queries_out, float *head_w_out);
 int coli_v4_gpu_indexer_resident_prepare(const ColiDeepSeekV4LayerWeights *weights, int device);
 void coli_v4_gpu_indexer_keys_reset(const ColiDeepSeekV4LayerWeights *weights, int layer);
 void coli_v4_gpu_kv_cache_mark(const ColiDeepSeekV4LayerWeights *weights,

@@ -188,6 +188,12 @@ typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n
 typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
                                                 float *const *ys);
 typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_indexer_select_fused)(int device, int layer, const float *x, const float *inputs,
+                                                   const float *cosv, const float *sinv, const int *counts,
+                                                   int tokens, int heads, int dim, int rope_dim, int hidden,
+                                                   int count, float had_scale, float wscale, int rope_fma,
+                                                   int hw_fma, float *scores, float *queries_out,
+                                                   float *head_w_out);
 typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
                                                 int chunk_start, const float *sinks, const int *meta,
                                                 const int *sel, int selstride, int abs_base, int comp_limit,
@@ -378,6 +384,7 @@ static struct {
     /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
     fn_indexer_resident indexer_resident;
     fn_indexer_keys_sync indexer_keys_sync;
+    fn_indexer_select_fused indexer_select_fused;   /* optional, V4_PREFILL_INDEXER */
     fn_attn_decode_chain attn_decode_chain;
     fn_attn_prefill_chain attn_prefill_chain;   /* optional, V4_PREFILL_CHAIN */
     fn_attn_decode_fused attn_decode_fused;
@@ -619,6 +626,7 @@ static int dsv4_cuda_resolve(const char *dllname){
      * alive, and the engine keeps the paths it had */
     g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
     g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
+    g_dsv4.indexer_select_fused = (fn_indexer_select_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_select_fused");
     g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
     g_dsv4.attn_prefill_chain = (fn_attn_prefill_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_prefill_chain");
     g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
@@ -1052,6 +1060,17 @@ int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts, int n, const float *x
 int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
     if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* a DLL without it: the separate calls */
     return g_dsv4.decode_proj_multi(ts, n, x, ys);
+}
+
+int dsv4_cuda_indexer_select_fused(int device, int layer, const float *x, const float *inputs,
+                                   const float *cosv, const float *sinv, const int *counts, int tokens,
+                                   int heads, int dim, int rope_dim, int hidden, int count, float had_scale,
+                                   float wscale, int rope_fma, int hw_fma, float *scores, float *queries_out,
+                                   float *head_w_out){
+    if(!g_dsv4.available||!g_dsv4.indexer_select_fused) return 0;   /* a DLL without it: the host's path */
+    return g_dsv4.indexer_select_fused(device, layer, x, inputs, cosv, sinv, counts, tokens, heads, dim,
+                                       rope_dim, hidden, count, had_scale, wscale, rope_fma, hw_fma, scores,
+                                       queries_out, head_w_out);
 }
 
 int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){

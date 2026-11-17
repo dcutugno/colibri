@@ -945,6 +945,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_NGRAM_PARTIAL_KEEP",            CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"V4_PREFILL_CHAIN", CE_INT, CE_DSV4, 0, NULL},
     {"V4_PREFILL_CHUNK",                 CE_INT   , CE_DSV4                                         , 0             , NULL},
+    {"V4_PREFILL_INDEXER", CE_INT, CE_DSV4, 0, NULL},
     {"V4_PREFILL_SEGMENT",               CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_PREFIX_CKPT",                   CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_PREFIX_CKPT_DISK",              CE_STR   , CE_DSV4                                         , 0             , NULL},

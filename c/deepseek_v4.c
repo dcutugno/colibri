@@ -4957,16 +4957,34 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #endif
     size_t sort_stride = (size_t)max_count * 2 * sizeof(uint64_t);
     size_t sz_ranked = ALIGN32((size_t)sort_threads * sort_stride);
+    static int verify = -1;
+    if (verify < 0) {
+        const char *env = getenv("DSV4_IDX_VERIFY");
+        verify = env && *env && *env != '0';
+    }
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
     size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
+    /* V4_PREFILL_INDEXER: the gathered inputs and per-token RoPE tables go up
+     * with the quantized query ranks; under DSV4_IDX_VERIFY the device's
+     * scores, prepared queries and head weights land beside the host's */
+    int pairs = config->qk_rope_head_dim / 2, hidden = config->hidden_size;
+    int fused_try = need <= 1024 && dimension <= 1024 && pairs >= 1 &&
+                    coli_v4_gpu_prefill_indexer_wanted();
+    size_t sz_xin = fused_try ? ALIGN32((size_t)need * hidden * sizeof(float)) : 0;
+    size_t sz_rope = fused_try ? ALIGN32((size_t)need * pairs * sizeof(float)) : 0;
+    size_t sz_fsc = fused_try && verify ? sz_scores : 0;
+    size_t sz_fsq = fused_try && verify ? sz_sq : 0;
+    size_t sz_fhw = fused_try && verify ? sz_head_weights : 0;
 #else
     size_t sz_xq = 0, sz_yq = 0, sz_xs = 0;
+    size_t sz_xin = 0, sz_rope = 0, sz_fsc = 0, sz_fsq = 0, sz_fhw = 0;
 #endif
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                           sz_scores + sz_ranked + sz_xq + sz_yq + sz_xs + 256;
+                           sz_scores + sz_ranked + sz_xq + sz_yq + sz_xs +
+                           sz_xin + 2 * sz_rope + sz_fsc + sz_fsq + sz_fhw + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
     if (!scratch_ptr || !raw_weights) {
@@ -4985,6 +5003,16 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     char *sort_work = scratch_ptr;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
     int result = 0;
+    /* the scored tokens in order, each with its candidate count */
+    {
+        int s = 0;
+        for (int t = 0; t < batch; t++) {
+            if (selected[t] >= 0) continue;
+            scounts[s] = counts[t];
+            stoken[s] = t;
+            s++;
+        }
+    }
 
     /* Query projection. Preferred: host fp8 activation quantization (the
      * reference qdq, per token) + the GPU replica of the reference matmul —
@@ -4992,7 +5020,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
      * per-token reference matvec. (Measured earlier: the fp8 GEMM mirror is
      * no faster at 8192x1024 and its activation quantization is not bitwise
      * the reference — the top-k boundary then flips.) */
-    int projected = 0;
+    int projected = 0, fused = 0, skip_cpu = 0;
+    float *fscores = NULL, *fsq = NULL, *fhw = NULL;
 #ifdef COLI_V4_GPU_TIER
     if (!result && need <= 1024) {
         float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
@@ -5009,8 +5038,45 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 i++;
             }
         }
-        if (qok && coli_v4_gpu_fp8_ref_matmul(state->weights, &wq, xq, need,
-                                              yq) == 0) {
+        /* V4_PREFILL_INDEXER: projection, prep, head weights and scoring in
+         * one device round trip over the resident weights and keys. Any
+         * refusal falls through to the projection and the host's path below;
+         * under DSV4_IDX_VERIFY both run and are compared after the scoring. */
+        if (qok && fused_try) {
+            float *xin = (float *)scratch_ptr; scratch_ptr += sz_xin;
+            float *cosv = (float *)scratch_ptr; scratch_ptr += sz_rope;
+            float *sinv = (float *)scratch_ptr; scratch_ptr += sz_rope;
+            fscores = scores;
+            if (verify) {
+                fscores = (float *)scratch_ptr; scratch_ptr += sz_fsc;
+                fsq = (float *)scratch_ptr; scratch_ptr += sz_fsq;
+                fhw = (float *)scratch_ptr; scratch_ptr += sz_fhw;
+            }
+            int rok = 1;
+            for (int i = 0; rok && i < need; i++) {
+                int t = stoken[i];
+                memcpy(xin + (size_t)i * hidden, inputs + (size_t)t * hidden,
+                       (size_t)hidden * sizeof(*xin));
+                if (coli_v4_rope_position(
+                        cosv + (size_t)i * pairs, sinv + (size_t)i * pairs,
+                        config->qk_rope_head_dim, start_position + t,
+                        config->original_max_position_embeddings,
+                        config->compress_rope_theta, config->rope_factor,
+                        config->rope_beta_fast, config->rope_beta_slow))
+                    rok = 0;
+            }
+            if (rok && coli_v4_gpu_indexer_select_fused(
+                           state->weights, state->layer,
+                           (unsigned long long)(uintptr_t)state, &wq, raw_weights,
+                           heads, dimension, config->qk_rope_head_dim, hidden,
+                           state->compressed, state->count, xq, xin, cosv, sinv,
+                           scounts, need, max_count, fscores, fsq, fhw) == 0) {
+                fused = 1;
+                skip_cpu = !verify;
+            }
+        }
+        if (qok && !skip_cpu && coli_v4_gpu_fp8_ref_matmul(state->weights, &wq, xq, need,
+                                                           yq) == 0) {
             int i = 0;
             for (int t = 0; t < batch; t++) {
                 if (selected[t] >= 0) continue;
@@ -5077,7 +5143,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         free(xq); free(yq); free(xs);
     }
 #endif
-    if (!result && !projected)
+    if (!result && !projected && !skip_cpu)
         for (int t = 0; !result && t < batch; t++)
             if (selected[t] < 0 &&
                 coli_fp8_matvec_ref(queries + (size_t)t * qn, &wq,
@@ -5085,24 +5151,13 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 result = set_error(error, error_size,
                                    "indexer query projection failed");
     IDX_PROF_MARK(t_proj);
-    static int verify = -1;
-    if (verify < 0) {
-        const char *env = getenv("DSV4_IDX_VERIFY");
-        verify = env && *env && *env != '0';
-    }
     /* Per-token query prep (RoPE, hadamard/fp4 round trip) and head weights
-     * are independent across tokens: assign slots first, then run them in
-     * parallel with per-token scratch. Numerics are per token, unchanged. */
-    int s = 0;
-    for (int t = 0; t < batch; t++) {
-        if (selected[t] >= 0) continue;
-        scounts[s] = counts[t];
-        stoken[s] = t;
-        s++;
-    }
-    int prepared = 0;
+     * are independent across tokens: run them in parallel with per-token
+     * scratch (the slots were assigned above). Numerics are per token,
+     * unchanged. The fused path (skip_cpu) did all of it on the card. */
+    int prepared = skip_cpu;
 #ifdef COLI_V4_GPU_TIER
-    if (!result && batch == 1 && need == 1 &&
+    if (!result && !prepared && batch == 1 && need == 1 &&
         coli_v4_layer_gpu(state->weights, "attn.indexer.weights_proj")) {
         memcpy(sq, queries, qn * sizeof(*sq));
         coli_bf16_round_array(sq, qn);
@@ -5166,7 +5221,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         if (prep_failed)
             result = set_error(error, error_size, "indexer query prep failed");
     }
-    if (!result && prepared && verify) {
+    if (!result && prepared && !skip_cpu && verify) {
         float *reference = malloc(qn * sizeof(*reference));
         float *reference_hw = malloc((size_t)heads * sizeof(*reference_hw));
         float qdq[512];
@@ -5196,9 +5251,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         free(reference);
     }
     IDX_PROF_MARK(t_prep);
-    int gpu_scored = 0;
+    int gpu_scored = skip_cpu;
 #ifdef COLI_V4_GPU_TIER
-    if (!result &&
+    if (!result && !skip_cpu &&
         coli_v4_gpu_indexer_score_batch(state->weights, scores, sq,
                                         state->compressed, head_weights,
                                         scounts, need, heads, dimension,
@@ -5228,6 +5283,22 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
             }
         fprintf(stderr, "idxverify layer=%d start=%d scored=%d mismatches=%lld max=%g\n",
                 state->layer, start_position, need, bad, worst);
+    }
+    if (!result && fused && verify && fscores && fsq && fhw) {
+        /* V4_PREFILL_INDEXER under DSV4_IDX_VERIFY: the device's prepared
+         * queries, head weights and scores against the host's (which are kept) */
+        long long bq = 0, bh = 0, bs = 0;
+        for (size_t i = 0; i < (size_t)need * qn; i++) bq += memcmp(&fsq[i], &sq[i], sizeof(float)) != 0;
+        for (size_t i = 0; i < (size_t)need * heads; i++)
+            bh += memcmp(&fhw[i], &head_weights[i], sizeof(float)) != 0;
+        for (int i = 0; i < need; i++)
+            for (int candidate = 0; candidate < scounts[i]; candidate++) {
+                size_t k = (size_t)i * max_count + candidate;
+                bs += memcmp(&fscores[k], &scores[k], sizeof(float)) != 0;
+            }
+        fprintf(stderr, "idxfused layer=%d start=%d scored=%d cand=%d query-mismatches=%lld "
+                "head-mismatches=%lld score-mismatches=%lld\n",
+                state->layer, start_position, need, max_count, bq, bh, bs);
     }
     if (!result && indexer_fast_wanted()) {
         /* v4_topk_desc: exact radix top-k, indices and order equal to the qsort
@@ -5274,7 +5345,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 "proj=%.3f prep=%.3f score=%.3f sort=%.3f ms%s\n",
                 state->layer, start_position, need, max_count, t_proj * 1e3,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
-                gpu_scored ? "" : " (cpu-score)");
+                fused && skip_cpu ? " (fused)" : gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK
     __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
     return result;
@@ -16205,6 +16276,51 @@ int coli_v4_gpu_indexer_fused_wanted(void) {
              coli_v4_gpu_attn_batch_wanted();
     }
     return on;
+}
+
+
+/* V4_PREFILL_INDEXER (opt-in, 0): a prompt chunk's indexer selection on the
+ * card (coli_v4_indexer_select_batch's fused path). */
+int coli_v4_gpu_prefill_indexer_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_PREFILL_INDEXER");
+        on = e && *e && atoi(e) != 0 && coli_v4_gpu_attn_batch_wanted();
+    }
+    return on;
+}
+
+int coli_v4_gpu_indexer_select_fused(
+    const ColiDeepSeekV4LayerWeights *weights, int layer, unsigned long long owner,
+    const ColiTensorView *wq, const uint16_t *head_w, int heads, int dim, int rope_dim,
+    int hidden, const float *keys, int key_count, const float *x_qdq,
+    const float *inputs, const float *cosv, const float *sinv, const int *counts,
+    int tokens, int max_count, float *scores, float *queries_out, float *head_w_out) {
+    if (!coli_v4_gpu_prefill_indexer_wanted() || !weights || !wq || !head_w ||
+        !keys || !x_qdq || !inputs || !cosv || !sinv || !counts || !scores ||
+        tokens < 1 || tokens > 1024 || key_count < 1 || max_count < 1 ||
+        max_count > key_count || wq->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        wq->scale_format != COLI_SCALE_F32 ||
+        (wq->block_rows != 128 && wq->block_rows != 8) ||
+        wq->block_columns != 128 || wq->columns % 128 ||
+        (size_t)wq->rows != (size_t)heads * dim) return -1;
+    int device = v4_gpu_layer_device(weights);
+    if (device < 0) return -1;
+    if (!dsv4_cuda_indexer_resident(device, layer, (const uint8_t *)wq->data,
+                                    (const float *)wq->scales, (int)wq->rows,
+                                    (int)wq->columns, wq->block_rows == 8,
+                                    head_w, heads, hidden)) return -1;
+    if (!dsv4_cuda_indexer_keys_sync(device, layer, owner, keys, key_count, dim))
+        return -1;
+    /* the expressions the host evaluates (coli_hadamard_bf16_ref,
+     * indexer_head_weights) and the fma forms the decode layer passes */
+    float had_scale = 1.0f / sqrtf((float)dim);
+    float weight_scale = 1.0f / sqrtf((float)(dim * heads));
+    return dsv4_cuda_indexer_select_fused(
+               device, layer, x_qdq, inputs, cosv, sinv, counts, tokens, heads,
+               dim, rope_dim, hidden, max_count, had_scale, weight_scale, 1, 1,
+               scores, queries_out, head_w_out)
+        ? 0 : -1;
 }
 
 

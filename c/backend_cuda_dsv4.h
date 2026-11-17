@@ -91,6 +91,13 @@ int dsv4_cuda_indexer_resident(int device,int layer,const uint8_t *w,const float
                                int heads,int hidden);
 int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
                                 const float *keys,int count,int dim);
+/* V4_PREFILL_INDEXER: a prompt chunk's selection on the card over the resident
+ * weights and keys (projection -> prep -> head weights -> scoring), one round
+ * trip. 0 = refused. */
+int dsv4_cuda_indexer_select_fused(int device,int layer,const float *x,const float *inputs,const float *cosv,
+                                   const float *sinv,const int *counts,int tokens,int heads,int dim,int rope_dim,
+                                   int hidden,int count,float had_scale,float wscale,int rope_fma,int hw_fma,
+                                   float *scores,float *queries_out,float *head_w_out);
 /* Decode attention tail on the device: cached sparse attention (sel NULL =
  * every compressed row) -> inverse RoPE + bf16 round -> grouped wo_a (mv
  * kernel) -> bf16 round -> wo_b (mv kernel over its mirror) -> bf16-rounded
