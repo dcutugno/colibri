@@ -877,6 +877,25 @@ time to the first token 27.4 → 25.6 s, the step 3.6 → 1.4 s, the same text; 
 verify found no difference over the prompt's 1,118 chunk-layers. The record is in
 `docs/experiments/v4-hc-fused-2026-11-17/`.
 
+### A prompt's host copies from page-locked memory (`V4_PREFILL_PIN`, opt-in)
+
+The prompt block's copies to and from the card came from pageable memory: the
+prompt's state buffers (8 MB each way per 128-token chunk and layer) and the
+block's own arrays, ten fresh mallocs per chunk and layer. With
+`V4_PREFILL_PIN=1` a prefill of at least 256 tokens page-locks the prompt's
+range of both state buffers for its duration and releases them on every exit,
+and the block carves its arrays from one persistent page-locked scratch; with
+those pointers stable from chunk to chunk the device residency tags are reset at
+each block's start. Only where the bytes sit changes.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt, with
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2 V4_PREFILL_INDEXER=1 V4_IDX_FAST=1
+V4_HC_FUSED=1`): time to the first token 26.0 → 22.3 s, the same text. Over the
+prompt the three hyper-connection steps go from 5.4 to 2.4 s and the compressor
+stage from 3.6 to 2.2 s (its projections upload the block's normalized inputs).
+The record is in `docs/experiments/v4-prefill-pin-2026-11-17/`, with the profiled
+runs of both arms.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1129,6 +1148,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_BANK_READ_LANES` (0) | reader threads for the prompt bank's prefetch (at most 8; see above) |
 | `V4_PREFILL_INDEXER` (0) | `1` = a prompt chunk's indexer selection on the card (see above); `DSV4_IDX_VERIFY=1` compares it with the host's |
 | `V4_HC_FUSED` (0) | `1` = the prompt block's attention post and FFN pre/norm as one device pass, the states kept on the card; `2` = verify against the two-step path (`hcfused`) |
+| `V4_PREFILL_PIN` (0) | `1` = the prompt's state buffers and the prompt block's arrays in page-locked memory (see above) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |

@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "hypothesis": "The prompt block's copies to and from the card come from pageable memory: the prompt's state buffers (8 MB each way per chunk and layer) and the block's own arrays, freshly malloc'd per chunk and layer. Page-locking the prompt's range of the state buffers for the prefill and carving the block's arrays from one persistent page-locked scratch turns those copies into direct DMA and removes the page faults, and shortens the time to the first token.",
+  "commit": "af7798d46a204af9e3b852a35ea5ee75cf9e9f41",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; the arms alternate (baseline, trial) three times on one binary; tok_s = 3278 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--memory-gb 16)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "V4_PREFILL_PIN"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_BANK_READ_LANES": "2",
+      "V4_PREFILL_INDEXER": "1",
+      "V4_IDX_FAST": "1",
+      "V4_HC_FUSED": "1",
+      "V4_PREFILL_PIN": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        126.1497,
+        126.0285,
+        125.1002
+      ]
+    },
+    "median_tok_s": 126.0285,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-pin-2026-11-17/baseline_runs.txt",
+      "sha256": "3c4e22b90683c5a2370cc0451a5557ad7f933414357c447bb38af021b38713c8"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_BANK_READ_LANES": "2",
+      "V4_PREFILL_INDEXER": "1",
+      "V4_IDX_FAST": "1",
+      "V4_HC_FUSED": "1",
+      "V4_PREFILL_PIN": "1"
+    },
+    "samples": {
+      "tok_s": [
+        146.9757,
+        146.9757,
+        147.6377
+      ]
+    },
+    "median_tok_s": 146.9757,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); only where the bytes sit changes, not the arithmetic; measured on a build of 8c85e650, the same tree as this commit",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-pin-2026-11-17/trial_runs.txt",
+      "sha256": "2134f358a375a22d6452fe4a546d110c5c09ebbcb79dee78b85fa7f8f026576c"
+    }
+  },
+  "outcome": "improvement"
+}
