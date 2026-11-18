@@ -3507,6 +3507,17 @@ static int v4_prefill_chain_mode(void) {
     }
     return mode;
 }
+/* V4_PREFILL_LAZY_ZERO (opt-in, with V4_PREFILL_CHAIN=1): the host's query,
+ * attended and wo_a buffers, which the chain replaces, are zeroed only once a
+ * host path needs them instead of on every call (~37 MB per chunk and layer). */
+static int v4_prefill_lazy_zero_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_PREFILL_LAZY_ZERO");
+        on = e && *e && atoi(e) == 1;
+    }
+    return on;
+}
 /* the prompt chunk's query on the host (wq_b, bf16 round, per-head rmsnorm,
  * RoPE): what the chain does on the card, for a chunk it declined */
 static int v4_prefill_q_host(float *q, const ColiTensorView *wq_b, const float *qa, int batch,
@@ -3562,10 +3573,12 @@ int coli_v4_attention_window_batch_ref(
         return set_error(error, error_size, "missing batched attention tensor");
 
     float *qa = v4_attn_scratch(0, (size_t)batch * q_rank * sizeof(*qa), 1);
-    float *q = v4_attn_scratch(1, (size_t)batch * q_width * sizeof(*q), 1);
+    /* q, attended and oa are zeroed below, once it is known whether the
+     * prompt chain replaces them (V4_PREFILL_LAZY_ZERO) */
+    float *q = v4_attn_scratch(1, (size_t)batch * q_width * sizeof(*q), 0);
     float *kv = v4_attn_scratch(2, (size_t)batch * head_dim * sizeof(*kv), 1);
-    float *attended = v4_attn_scratch(3, (size_t)batch * q_width * sizeof(*attended), 1);
-    float *oa = v4_attn_scratch(4, (size_t)batch * oa_width * sizeof(*oa), 1);
+    float *attended = v4_attn_scratch(3, (size_t)batch * q_width * sizeof(*attended), 0);
+    float *oa = v4_attn_scratch(4, (size_t)batch * oa_width * sizeof(*oa), 0);
     float *norm = v4_attn_scratch(5, (size_t)(q_rank > head_dim ? q_rank : head_dim) *
                                   sizeof(*norm), 0);
     int *selected_counts = v4_attn_scratch(6, (size_t)batch * sizeof(*selected_counts), 1);
@@ -3768,6 +3781,18 @@ int coli_v4_attention_window_batch_ref(
         ? v4_prefill_chain_mode() : 0;
     q_defer = chain_mode == 1;
 #endif
+    /* The query, the attended and wo_a's outputs start zeroed. With
+     * V4_PREFILL_LAZY_ZERO=1 and the chain able to take the chunk (q_defer)
+     * they are zeroed only once the host's path needs them: the chain reads
+     * none of them. Every host path below zeroes them first, as here. */
+    int q_dirty = 1, attended_dirty = 1, oa_dirty = 1;
+#define V4_ATTN_ZERO(buf, count) do { if (buf##_dirty) { \
+        memset((buf), 0, (count) * sizeof(*(buf))); buf##_dirty = 0; } } while (0)
+    if (!q_defer || !v4_prefill_lazy_zero_on()) {
+        V4_ATTN_ZERO(q, (size_t)batch * q_width);
+        V4_ATTN_ZERO(attended, (size_t)batch * q_width);
+        V4_ATTN_ZERO(oa, (size_t)batch * oa_width);
+    }
     if (!result && !q_defer) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
     if (!result && !q_defer) coli_bf16_round_array(q, (size_t)batch * q_width);
     for (int item = 0; !result && !q_defer && item < batch; item++)
@@ -3899,12 +3924,14 @@ int coli_v4_attention_window_batch_ref(
                         }
                     }
                     if (!chain_done && q_defer) {
+                        V4_ATTN_ZERO(q, (size_t)batch * q_width);
                         result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim,
                                                    rope_dim, config->rms_norm_eps,
                                                    cosines, sines);
                         q_defer = 0;
                     }
                 }
+                if (!chain_done) V4_ATTN_ZERO(attended, (size_t)batch * q_width);
                 if (chain_done || result) {
                     /* the chain took the chunk, or its host query failed */
                 } else if ((use_idx
@@ -3927,6 +3954,7 @@ int coli_v4_attention_window_batch_ref(
             }
             if (!result && q_defer) {
                 /* no device cache for the chunk, so no chain: the host's query */
+                V4_ATTN_ZERO(q, (size_t)batch * q_width);
                 result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim, rope_dim,
                                            config->rms_norm_eps, cosines, sines);
                 q_defer = 0;
@@ -3937,6 +3965,7 @@ int coli_v4_attention_window_batch_ref(
                 : v4_attn_scratch(19, (size_t)value_rows * head_dim *
                                   sizeof(*values), 0);
             if (!gpu_attn_done && !use_idx && values && meta) {
+                V4_ATTN_ZERO(attended, (size_t)batch * q_width);
                 for (int p = first; p < start_position; p++)
                     memcpy(values + (size_t)(p - first) * head_dim,
                            state->kv +
@@ -3958,6 +3987,7 @@ int coli_v4_attention_window_batch_ref(
     }
     if (!result && q_defer) {
         /* the chain never ran (no device cache for the chunk): the host's query */
+        V4_ATTN_ZERO(q, (size_t)batch * q_width);
         result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim, rope_dim,
                                    config->rms_norm_eps, cosines, sines);
         q_defer = 0;
@@ -3984,6 +4014,10 @@ int coli_v4_attention_window_batch_ref(
         }
     }
 #endif
+    if (!gpu_attn_done) {
+        V4_ATTN_ZERO(q, (size_t)batch * q_width);   /* a no-op once the host made it */
+        V4_ATTN_ZERO(attended, (size_t)batch * q_width);
+    }
     if (!gpu_attn_done)
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
@@ -4046,6 +4080,7 @@ int coli_v4_attention_window_batch_ref(
     int scale_columns = (group_width + 127) / 128;
     int scale_rows = (o_rank + 127) / 128;
     int gpu_wo_done = chain_done;
+    if (!chain_done) V4_ATTN_ZERO(attended, (size_t)batch * q_width);   /* a no-op once written */
 #ifdef COLI_V4_GPU_TIER
     /* Whole-chunk grouped wo_a + wo_b on the GPU (fp8-bf16 wo_a mirror). The
      * backend rounds through bf16 between the two GEMMs exactly where the CPU
@@ -4058,6 +4093,7 @@ int coli_v4_attention_window_batch_ref(
     }
 #endif
     int wo_a_done = gpu_wo_done;
+    if (!gpu_wo_done) V4_ATTN_ZERO(oa, (size_t)batch * oa_width);
     if (!result && !wo_a_done && batch == 1 &&
         wo_a.rows == (int64_t)groups * o_rank && wo_a.columns == group_width &&
         coli_fp8_grouped_matvec_ref(oa, &wo_a, attended, groups) == 0)
@@ -4140,6 +4176,7 @@ int coli_v4_attention_window_batch_ref(
                 prof_rope * 1e3, (prof_attn + prof_sync + prof_chain + prof_adv) * 1e3,
                 prof_wo * 1e3, prof_sync * 1e3, prof_chain * 1e3, prof_adv * 1e3);
 #undef V4_ATTN_PROF_MARK
+#undef V4_ATTN_ZERO
 
     free(inputs_act_scales); free(inputs_act);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
