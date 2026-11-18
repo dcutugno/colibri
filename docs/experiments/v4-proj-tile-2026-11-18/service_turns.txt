@@ -1,0 +1,24 @@
+Five 3.3k-token turns (prompt3k.txt prefixed with "Request N. ", max_tokens 36, temperature 0) against a
+fresh `coli serve` per arm: the deployment's serve.sh at RAM_GB=80 (every prompt switch of the stack below this
+one on, V4_PREFILL_RESIDENT=1), the engine built from this branch, DSV4_PROJ_TILE unset (svt_0_*) or 1 (svt_1_*).
+Arms in the order 1 0 0 1 1 0. Each line: the service's tag, then the five requests' wall times in seconds (curl
+time_total, prompt and 36 generated tokens).
+
+svt_1_30601: 70.553177 29.854872 27.914192 27.451869 26.244440
+svt_0_29447: 33.036460 28.652242 27.210069 26.328551 25.437939
+svt_0_23902: 33.441810 28.998101 27.576299 26.741332 25.784910
+svt_1_23029: 33.112782 28.604469 27.193341 26.322725 25.221262
+svt_1_30396: 33.240960 29.038877 27.469994 26.419883 25.548326
+svt_0_326: 33.264979 28.941636 27.379611 26.449625 25.396867
+svc-finished
+
+The first service (svt_1_30601) started right after the CLI runs with a cold expert cache: its first turn read
+the experts from disk (70.6 s) and is left out of the comparison below.
+
+Mean per turn, the other five services:
+  unset (3 services):            33.25 28.86 27.39 26.51 25.54
+  DSV4_PROJ_TILE=1 (2 services): 33.18 28.82 27.33 26.37 25.39
+0.04-0.15 s per turn, inside the spread between services of the same arm (up to 0.4 s): no measurable
+difference at this RAM size.
+
+Every service gave the same five replies (md5 of the message content): 90e4c559 90e4c559 856a25bd c64688e2 2d78fec6.

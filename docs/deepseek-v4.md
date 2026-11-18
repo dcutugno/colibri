@@ -959,6 +959,49 @@ service at `--ram 80` saves 0.3–0.4 s on each of five 3.3k-token turns, with
 the same replies. The verify found no difference over 1,118 calls. The record
 is in `docs/experiments/v4-prefill-resident-2026-11-18/`.
 
+### The prompt's bf16 projections as one tiled launch (`DSV4_PROJ_TILE`, opt-in)
+
+A prompt chunk's compressor and indexer-compressor projections are four bf16
+matrices on a ratio-4 layer (2,560 rows × 4,096 over 128 tokens). They ran one
+launch per matrix (`mm_bf16_batch`, or `mm_bf16_batch_rows` with
+`V4_PREFILL_PROJ`), and in those kernels a block reduced every output through
+shared memory: about 0.7 ms of kernel time per chunk and layer on the RTX 5080,
+most of it the reduction.
+
+With `DSV4_PROJ_TILE=1` (read by the backend at every call) a multi-token call
+computes all its matrices in one launch, `mm_bf16_tile`, with the old kernels'
+arithmetic kept exactly:
+
+- An output of `mm_bf16_batch` is 256 partial sums added by a fixed tree:
+  partial j is an fma chain over the columns j, j+256, …, and the tree adds j
+  and j+128, then j+64, and so on down to j+1.
+- In `mm_bf16_tile` a lane owns the eight partials j = lane + 32h. It builds
+  each chain in the same order and adds them in the tree's first three levels
+  in registers. The last five levels are shuffles between the lanes.
+
+The operations and operands are the same, so the bits are the same. A warp
+computes 8 rows × 4 tokens. The kernel time for the four matrices of a
+128-token chunk goes from 684 to 192 µs, and for 3 tokens from 107 to 15 µs.
+
+The tiled launch needs the input width to be a multiple of 256 and every row
+count a multiple of 16; other shapes keep the old kernels, as do one-token
+calls. `DSV4_PROJ_TILE=2` runs both and compares the outputs on the card
+(`projtile verify` lines). `tests/test_dsv4_proj_tile_cuda.c` checks the
+compressor shapes from 128 tokens down to 1.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt, with
+the switches of the previous sections and `V4_PREFILL_RESIDENT=1`):
+
+- **Time to the first token:** 21.24 → 21.01 s (medians of three alternating
+  runs), the same text.
+- **The compressor stage over the prompt:** 1.77 → 1.55 s. Part of the gain
+  becomes wait for the expert bank, as with the previous step.
+- **Verify:** no difference over 1,032 calls (234 million outputs).
+- **The service at `--ram 80`:** 0.04–0.15 s per turn over five 3.3k-token
+  turns, inside the spread between services. The replies are the same.
+
+The record is in `docs/experiments/v4-proj-tile-2026-11-18/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1214,6 +1257,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_PREFILL_PIN` (0) | `1` = the prompt's state buffers and the prompt block's arrays in page-locked memory (see above) |
 | `V4_PREFILL_PROJ` (0) | `1` = a prompt chunk's input projections without the host's redundant work (see above); `2` = verify the one-call projections against the separate calls (`pfproj`) |
 | `V4_PREFILL_RESIDENT` (0) | `1` = a prompt chunk's normalized input read where the attention hyper-connection step left it on the card (see above); `2` = check the device copy against the host array around each attention call (`pfresident`) |
+| `DSV4_PROJ_TILE` (0, `.cu`) | `1` = a multi-token bf16 projection call (the compressor and indexer-compressor projections) as one register-tiled launch, the same bits (see above); `2` = run both kernels and compare on the card (`projtile verify`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
