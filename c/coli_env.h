@@ -593,6 +593,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_PF_KPROF", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_PROJ_KPROF", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_PROJ_ONEDL", CE_INT, CE_DSV4, 0, NULL},
+    {"DSV4_PROJ_TILE", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_SATTN_HPB", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_SATTN_HPB_PF", CE_INT, CE_DSV4, 0, NULL},
     {"DSV4_SATTN_SPLIT", CE_INT, CE_DSV4, 0, NULL},

@@ -1528,6 +1528,14 @@ dsv4-prefill-resident-test: tests/test_dsv4_prefill_resident_cuda.c backend_cuda
 		-o dsv4_prefill_resident_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_prefill_resident_cuda_test$(EXE)
 
+# DSV4_PROJ_TILE: the register-tiled bf16 projection kernel against the per-matrix
+# kernels, bit for bit. Needs a GPU.
+.PHONY: dsv4-proj-tile-test
+dsv4-proj-tile-test: tests/test_dsv4_proj_tile_cuda.c backend_cuda_dsv4.h $(if $(IS_WIN),,$(DSV4_CUDA_OBJ))
+	$(CC) $(CFLAGS) tests/test_dsv4_proj_tile_cuda.c $(if $(IS_WIN),backend_loader_dsv4.c,$(DSV4_CUDA_OBJ)) \
+		-o dsv4_proj_tile_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_proj_tile_cuda_test$(EXE)
+
 # V4_ATTN_BATCH_PROJ: dsv4_cuda_proj_batch against per-call matvec, bit for bit (needs a GPU).
 # Windows: the DLL is loaded at run time and must sit next to the test binary (make
 # cuda-dsv4-dll first). On Linux build with CUDA=1: it links backend_cuda_dsv4.o, like

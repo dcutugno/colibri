@@ -3594,6 +3594,96 @@ template<int R> __global__ void mm_bf16_batch_rows(const __nv_bfloat16*w,const f
         __syncthreads();
     }
 }
+/* DSV4_PROJ_TILE: mm_bf16_batch's sums, register-tiled, for every matrix of a
+ * call in one launch. mm_bf16_batch gives an output (row, token) 256 partial
+ * sums (thread j: an fma chain over the columns j, j+256, ... in that order)
+ * added by a fixed tree (j with j+128, then j+64, ... j+1). Here a lane owns
+ * the eight partials j = lane + 32h: it builds each chain the same way, adds
+ * them in the tree's first three levels ((h0+h4)+(h2+h6))+((h1+h5)+(h3+h7)),
+ * and the last five levels (j+16 .. j+1) are shuffles between the lanes. The
+ * same operations on the same operands, so the same bits, but a warp computes
+ * 8 rows x 4 tokens from registers instead of a block reducing every output
+ * through shared memory. A block is 2 x 2 warps (16 rows x 8 tokens). Needs
+ * I % 256 == 0 and every O % 16 == 0. */
+enum { PT_R = 8, PT_T = 4, PT_WR = 2, PT_WT = 2, PT_ROWS = PT_R * PT_WR, PT_TOKS = PT_T * PT_WT };
+struct PtArgs{const __nv_bfloat16*w[8];float*y[8];int O[8];int blk0[9];int n;};
+__device__ __forceinline__ void pt_chain(float (&acc)[PT_R][PT_T],const __nv_bfloat16*const(&wp)[PT_R],
+                                         const float*const(&xp)[PT_T],int K,int h){
+    #pragma unroll
+    for(int r=0;r<PT_R;r++)
+        #pragma unroll
+        for(int t=0;t<PT_T;t++)acc[r][t]=0.f;
+    #pragma unroll 4
+    for(int k=0;k<K;k++){int col=32*h+256*k;float wv[PT_R],xv[PT_T];
+        #pragma unroll
+        for(int r=0;r<PT_R;r++)wv[r]=__bfloat162float(wp[r][col]);
+        #pragma unroll
+        for(int t=0;t<PT_T;t++)xv[t]=xp[t][col];
+        #pragma unroll
+        for(int r=0;r<PT_R;r++)
+            #pragma unroll
+            for(int t=0;t<PT_T;t++)acc[r][t]=__fmaf_rn(xv[t],wv[r],acc[r][t]);}
+}
+__device__ __forceinline__ void pt_add(float (&a)[PT_R][PT_T],const float (&b)[PT_R][PT_T]){
+    #pragma unroll
+    for(int r=0;r<PT_R;r++)
+        #pragma unroll
+        for(int t=0;t<PT_T;t++)a[r][t]=__fadd_rn(a[r][t],b[r][t]);}
+__global__ void __launch_bounds__(32*PT_WR*PT_WT) mm_bf16_tile(PtArgs a,const float*x,int I,int tokens){
+    int b=blockIdx.x,m=0;while(m+1<a.n&&b>=a.blk0[m+1])m++;
+    int O=a.O[m],warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o0=(b-a.blk0[m])*PT_ROWS+(warp%PT_WR)*PT_R,t0=blockIdx.y*PT_TOKS+(warp/PT_WR)*PT_T;
+    if(t0>=tokens||o0>=O)return;
+    /* tokens past the chunk read its last row (their sums are not stored) */
+    int tl=tokens-1-t0,K=I/256;
+    const __nv_bfloat16*wp[PT_R];const float*xp[PT_T];
+    #pragma unroll
+    for(int r=0;r<PT_R;r++)wp[r]=a.w[m]+(long long)(o0+r)*I+lane;
+    #pragma unroll
+    for(int t=0;t<PT_T;t++)xp[t]=x+(long long)(t0+min(t,tl))*I+lane;
+    float A[PT_R][PT_T],B[PT_R][PT_T],C[PT_R][PT_T],S[PT_R][PT_T];
+    pt_chain(A,wp,xp,K,0);pt_chain(S,wp,xp,K,4);pt_add(A,S);
+    pt_chain(B,wp,xp,K,2);pt_chain(S,wp,xp,K,6);pt_add(B,S);pt_add(A,B);
+    pt_chain(B,wp,xp,K,1);pt_chain(S,wp,xp,K,5);pt_add(B,S);
+    pt_chain(C,wp,xp,K,3);pt_chain(S,wp,xp,K,7);pt_add(C,S);pt_add(B,C);pt_add(A,B);
+    #pragma unroll
+    for(int r=0;r<PT_R;r++)
+        #pragma unroll
+        for(int t=0;t<PT_T;t++){float v=A[r][t];
+            #pragma unroll
+            for(int n=16;n;n>>=1)v=__fadd_rn(v,__shfl_down_sync(0xffffffffu,v,n));
+            A[r][t]=v;}
+    if(!lane){float*y=a.y[m];
+        #pragma unroll
+        for(int r=0;r<PT_R;r++)
+            #pragma unroll
+            for(int t=0;t<PT_T;t++)if(t<=tl)y[(long long)(t0+t)*O+o0+r]=A[r][t];}
+}
+/* DSV4_PROJ_TILE: 0 (default) the per-matrix kernels; 1 mm_bf16_tile for a
+ * multi-token call; 2 both, the outputs compared bit for bit on the device
+ * ("projtile verify" lines on stderr). Read at every call. */
+static int proj_tile_mode(void){const char*e=getenv("DSV4_PROJ_TILE");int m=e&&*e?atoi(e):0;return m==1||m==2?m:0;}
+__global__ void pt_compare(const unsigned*a,const unsigned*b,long long n,unsigned long long*count){
+    long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&a[i]!=b[i])atomicAdd(count,1ull);}
+static struct{float*ref[16];size_t cap[16];unsigned long long*count[16];long long calls,outputs,mismatched;}g_pt_verify;
+template<class F> static int proj_tile_check(Dev*c,size_t yb,F&plain){
+    int d=c->id;if(d<0||d>=16)return 1;
+    if(!buf((void**)&g_pt_verify.ref[d],&g_pt_verify.cap[d],yb))return 0;
+    if(!g_pt_verify.count[d]&&!alloc_ok(cudaMalloc(&g_pt_verify.count[d],8),"bf16 tile verify counter"))return 0;
+    long long n=(long long)(yb/4);
+    if(!ok(cudaMemsetAsync(g_pt_verify.count[d],0,8,c->stream),"bf16 tile verify reset")||!plain(g_pt_verify.ref[d]))return 0;
+    pt_compare<<<(unsigned)((n+255)/256),256,0,c->stream>>>((const unsigned*)c->dy,(const unsigned*)g_pt_verify.ref[d],n,g_pt_verify.count[d]);
+    return ok(cudaGetLastError(),"bf16 tile verify launch");
+}
+static void proj_tile_report(Dev*c,size_t yb){
+    int d=c->id;unsigned long long bad=0;if(d<0||d>=16||!g_pt_verify.count[d])return;
+    if(!ok(cudaMemcpy(&bad,g_pt_verify.count[d],8,cudaMemcpyDeviceToHost),"bf16 tile verify count"))return;
+    g_pt_verify.calls++;g_pt_verify.outputs+=(long long)(yb/4);g_pt_verify.mismatched+=(long long)bad;
+    if(bad)fprintf(stderr,"projtile MISMATCH call=%lld outputs=%lld differ=%llu\n",g_pt_verify.calls,(long long)(yb/4),bad);
+    if(bad||g_pt_verify.calls%43==0)
+        fprintf(stderr,"projtile verify calls=%lld outputs=%lld mismatched=%lld\n",
+                g_pt_verify.calls,g_pt_verify.outputs,g_pt_verify.mismatched);
+}
 /* One lane owns one output row, preserving the decode reference's column
  * order and fused fp32 accumulation. Rows32 packing coalesces weight reads. */
 __global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bfloat16 *gate,
@@ -3712,18 +3802,42 @@ static int bf16_multi_run(Dsv4CudaTensor*const*ts,int n,const float*x,int tokens
            !ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 multi upload"))return 0;
         dx=c->dx;
     }
+    /* the per-matrix kernels, into out (the call's output layout) */
+    auto plain=[&](float*out)->int{
+        size_t o=0;
+        for(int i=0;i<n;i++){
+            float*dy=(float*)((char*)out+o);
+            if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,c->stream);
+            else if(rows&&ts[i]->O%4==0)mm_bf16_batch_rows<4><<<dim3(ts[i]->O/4,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
+            else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
+            if(!ok(cudaGetLastError(),"bf16 multi launch"))return 0;
+            o+=(size_t)tokens*ts[i]->O*4;
+        }
+        return 1;
+    };
+    /* DSV4_PROJ_TILE: every matrix in one register-tiled launch, the same bits */
+    int tile=tokens>1?proj_tile_mode():0;
+    for(int i=0;tile&&i<n;i++)if(ts[i]->I%256||ts[i]->O%PT_ROWS)tile=0;
+    if(tile){
+        PtArgs a{};a.n=n;int blk=0;size_t o=0;
+        for(int i=0;i<n;i++){
+            a.w[i]=(const __nv_bfloat16*)ts[i]->w;a.y[i]=(float*)((char*)c->dy+o);a.O[i]=ts[i]->O;
+            a.blk0[i]=blk;blk+=ts[i]->O/PT_ROWS;o+=(size_t)tokens*ts[i]->O*4;
+        }
+        a.blk0[n]=blk;
+        mm_bf16_tile<<<dim3(blk,(tokens+PT_TOKS-1)/PT_TOKS),32*PT_WR*PT_WT,0,c->stream>>>(a,dx,ts[0]->I,tokens);
+        if(!ok(cudaGetLastError(),"bf16 tile launch"))return 0;
+        if(tile==2&&!proj_tile_check(c,yb,plain))return 0;
+    }else if(!plain(c->dy))return 0;
     size_t off=0;
     for(int i=0;i<n;i++){
         size_t ob=(size_t)tokens*ts[i]->O*4;
-        float*dy=(float*)((char*)c->dy+off);
-        if(tokens==1)launch_bf16_one((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,c->stream);
-        else if(rows&&ts[i]->O%4==0)mm_bf16_batch_rows<4><<<dim3(ts[i]->O/4,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
-        else mm_bf16_batch<<<dim3(ts[i]->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)ts[i]->w,dx,dy,ts[i]->O,ts[i]->I,tokens);
-        if(!ok(cudaGetLastError(),"bf16 multi launch")||
-           !ok(cudaMemcpyAsync(ys[i],dy,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;
+        if(!ok(cudaMemcpyAsync(ys[i],(char*)c->dy+off,ob,cudaMemcpyDeviceToHost,c->stream),"bf16 multi download"))return 0;
         off+=ob;
     }
-    return ok(cudaStreamSynchronize(c->stream),"bf16 multi sync");
+    if(!ok(cudaStreamSynchronize(c->stream),"bf16 multi sync"))return 0;
+    if(tile==2)proj_tile_report(c,yb);
+    return 1;
 }
 __device__ __forceinline__ int decode_pos(const int *state){return state[1];}
 __device__ __forceinline__ int compression_ready(const int *state,int ratio){return ratio&&decode_pos(state)%ratio==ratio-1;}
