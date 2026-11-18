@@ -820,6 +820,30 @@ The record is in `docs/experiments/v4-prefill-chain-2026-11-17/`, with the two
 profiled runs (`DSV4_ATTN_PROF=1 V4_MOE_BATCH_PROF=1`, this change's parent and the
 chain) beside the timed ones.
 
+### The chain's host scratch zeroed when needed (`V4_PREFILL_LAZY_ZERO`, opt-in)
+
+The batched attention zeroed its query, attended and wo_a buffers on every
+call: about 37 MB of memset per 128-token chunk and layer, ~2.5 ms on the
+Ryzen 9 3900X. With `V4_PREFILL_CHAIN=1` the chain does that stretch on the
+card and reads none of them. `V4_PREFILL_LAZY_ZERO=1` zeroes each one just
+before the first host path that fills or reads it (the host query, the cached
+or slab sparse attention, the per-token loop, the GPU wo batch, the host
+wo_a), so every path sees zeroed buffers as before and the outputs are the
+same bits; a chunk the chain takes touches none of them. Without the chain the
+switch changes nothing.
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt,
+`V4_PREFILL_CHAIN=1` and the merged decode switches, three alternated runs per
+arm, one binary): time to the first token 35.27 → 34.40 s, the same text in
+every run. Profiled, the attention stage drops 17.3 → 15.5 s and about 1 s of
+that goes to the wait for the expert bank (`moebprof`'s `switch` 7.1 → 8.1 s).
+With the rest of the prompt stack on the same machine the attention saves
+2.8 s, the time to the first token goes 20.99 → 19.85 s, and a `coli serve
+--ram 80` service answers five 3.3k-token turns 1.2–1.5 s faster each, with
+the same replies. The record is in
+`docs/experiments/v4-prefill-lazy-zero-2026-11-18/` (the stack's runs and the
+service turns in `stack_runs.txt` and `service_turns.txt`).
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1069,6 +1093,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `V4_PREFILL_CHAIN` (0) | `1` = a prompt chunk's attention after the indexer as one device chain (see above); `2` = run the chain beside the host's path and compare every output (`pfchain verify`) |
 | `DSV4_PF_KPROF` (0, `.cu`) | `1` = the prompt chain's stage times per call (`pfkprof`) |
+| `V4_PREFILL_LAZY_ZERO` (0) | `1` = with the chain, zero the host's query/attended/wo_a scratch only when a host path needs it (see above) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |

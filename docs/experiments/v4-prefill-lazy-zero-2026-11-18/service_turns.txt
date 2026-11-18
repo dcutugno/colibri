@@ -1,0 +1,24 @@
+The whole prompt stack this piece sits under in a deployment (V4_PREFILL_CHAIN with the bank's read lanes,
+the prompt indexer, V4_HC_FUSED, V4_PREFILL_PIN, V4_PREFILL_PROJ, V4_PREFILL_RESIDENT, V4_COMP_BATCH,
+DSV4_PROJ_TILE and the decode pieces), as a service: `coli serve --ram 80`, five 3.3k-token turns
+(prompt3k.txt prefixed with "Request N. ", max_tokens 36, temperature 0), a fresh service per line.
+svc_base_*: the stack before this change (no lazy zeroing); svc_new_*: the stack with it, zeroing lazily
+(this comparison ran before the switch existed: the two builds differ only by this commit, the switch's
+`1` behaviour). Arms in the order new base base new new base. Each line: the five requests' wall times in
+seconds (curl time_total, prompt and 36 generated tokens) and the md5 of each reply's content.
+
+svc_new_21569: 31.450164 26.977400 25.323485 23.890483 23.088782 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+svc_base_5146: 37.093747 45.143159 28.366616 25.325342 24.450270 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+svc_base_6945: 32.207514 27.793195 26.382579 25.121808 24.227539 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+svc_new_1815: 31.203677 26.919384 25.141157 24.131481 23.048765 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+svc_new_426: 31.205145 26.832973 25.358451 24.016118 23.098852 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+svc_base_20255: 32.718963 28.379340 26.495782 25.396493 24.453803 replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+
+Median per turn, three services each:
+  before: 32.72 28.38 26.50 25.33 24.45
+  after:  31.21 26.92 25.32 24.02 23.09
+1.2-1.5 s off every turn. svc_base_5146's first two turns (37.1, 45.1 s) are outliers whose cause was not
+found; the medians are not moved by them. Every service gave the same five replies.
+
+The same stack on the CLI (stack_runs.txt, one binary, V4_PREFILL_LAZY_ZERO unset vs 1, three alternated
+rounds, --memory-gb 16): time to the first token 20.99 20.99 21.05 -> 19.80 19.85 19.94 s, the same text.

@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "hypothesis": "With V4_PREFILL_CHAIN=1 a prompt chunk's query, attention and wo run on the card and the host's query, attended and wo_a buffers are never read, yet the batched attention zeroes all three on every call: about 37 MB of memset per chunk and layer (128 tokens x 64 heads x 512 floats, twice, plus wo_a's outputs). Profiling the service showed the attention block about 2.5 ms per chunk-layer longer than the sum of its stages, the same in every layer. Zeroing those buffers only when a host path is about to fill or read them leaves every path's inputs as they were, so the outputs are the same bits, and takes that time off the prompt.",
+  "commit": "dbd96f5142bb2e6698fda59b6119fc484c1a3d9a",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; the arms alternate (baseline, trial) three times on one binary; tok_s = 3278 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--memory-gb 16)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "V4_PREFILL_LAZY_ZERO"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_PREFILL_LAZY_ZERO": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        92.8796,
+        92.9428,
+        93.284
+      ]
+    },
+    "median_tok_s": 92.9428,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-lazy-zero-2026-11-18/baseline_runs.txt",
+      "sha256": "4c7200f70e8bca1f03d4bede3e2eab0fc9a434f6713db43a9bd380668ac308ea"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1",
+      "V4_PREFILL_LAZY_ZERO": "1"
+    },
+    "samples": {
+      "tok_s": [
+        95.0834,
+        95.3267,
+        95.2824
+      ]
+    },
+    "median_tok_s": 95.2824,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); no verify mode: every host path zeroes the buffers before it fills or reads them, as before, so equal bits follow from construction; the deployed stack's five-turn service comparison gave the same replies",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-lazy-zero-2026-11-18/trial_runs.txt",
+      "sha256": "394d7b30deacbcc2fdbe4084a1a289f61df2186ca6af9f6be4c92dee20622ca5"
+    }
+  },
+  "outcome": "improvement"
+}
