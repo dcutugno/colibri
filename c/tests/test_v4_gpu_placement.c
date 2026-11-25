@@ -117,8 +117,11 @@ int dsv4_cuda_mirror_point(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTen
     piece_points++;
     return 1;
 }
+static const void *host_pin_last;
+static long long host_pin_last_len;
 int dsv4_cuda_host_pin(const void *p, long long len) {
     host_pins++;
+    host_pin_last = p; host_pin_last_len = len;
     return host_pin_ok && p && len > 0;
 }
 /* V4_MIRROR_BLOCK: one allocation call makes the three tensors, one refill
@@ -912,6 +915,28 @@ static int reserved_entries(const V4GpuExpertMirrorCache *cache) {
         reserved += cache->entries[i].clock == UINT64_MAX;
     return reserved;
 }
+/* V4_SLAB_PIN: a new slab goes to the backend whole; a refusal is counted and
+ * said once; nothing for a NULL slab or no bytes */
+static void test_slab_pin(void) {
+    static unsigned char slab[8192];
+    setenv("V4_SLAB_PIN", "1", 1);
+    int before = host_pins;
+    host_pin_ok = 1;
+    assert(coli_v4_gpu_slab_pin(slab, sizeof(slab)) == 1);
+    assert(host_pins == before + 1 && host_pin_last == slab &&
+           host_pin_last_len == (long long)sizeof(slab));
+    host_pin_ok = 0;
+    assert(coli_v4_gpu_slab_pin(slab, sizeof(slab)) == 0);
+    assert(coli_v4_gpu_slab_pin(slab, sizeof(slab)) == 0);
+    assert(g_v4_slab_pins == 1 && g_v4_slab_pin_refused == 2);
+    host_pin_ok = 1;
+    before = host_pins;
+    assert(coli_v4_gpu_slab_pin(NULL, sizeof(slab)) == 0 && coli_v4_gpu_slab_pin(slab, 0) == 0);
+    assert(host_pins == before);
+    unsetenv("V4_SLAB_PIN");
+    puts("slab pin: ok");
+}
+
 static void test_upload_pieces(void) {
     V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
     cache->first_layer = 0; cache->end_layer = 4;
@@ -1259,6 +1284,7 @@ int main(void) {
     test_upload_thread_block();
     test_hot_admission();
     test_upload_pieces();
+    test_slab_pin();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();

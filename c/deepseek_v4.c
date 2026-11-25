@@ -11517,8 +11517,10 @@ retry_lookup:
         memset(view, 0, sizeof(*view));
         return -1;
     }
+    int fresh_slab = 0;
     if (!slot->slab) {
         size_t capacity = (size_t)state->record_bytes + COLI_V4_EXPERT_SLAB_SLACK;
+        fresh_slab = 1;
         if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
@@ -11540,6 +11542,15 @@ retry_lookup:
     if (cold) cold_lru_slot(state, slot);
     else touch_lru_slot(state, slot);
     pthread_mutex_unlock(&state->mutex);
+#ifdef COLI_V4_GPU_TIER
+    /* V4_SLAB_PIN: a new slab is page-locked whole before its first read; the
+     * slot's lease keeps it ours until then */
+    if (fresh_slab && store->gpu)
+        coli_v4_gpu_slab_pin(slot->slab,
+                             (size_t)state->record_bytes + COLI_V4_EXPERT_SLAB_SLACK);
+#else
+    (void)fresh_slab;
+#endif
     int rep = coli_st_expert_route(key.layer, key.expert);
     struct timespec disk_t0;
     clock_gettime(CLOCK_MONOTONIC, &disk_t0);
@@ -15322,6 +15333,33 @@ static int g_v4_pieces_window;
 
 void coli_v4_gpu_pieces_window(int on) {
     __atomic_store_n(&g_v4_pieces_window, on, __ATOMIC_RELEASE);
+}
+
+/* V4_SLAB_PIN (off): page-lock a RAM-cache slab whole when the store
+ * allocates it, before any read lands in it. The prompt bank's uploads
+ * (dsv4_cuda_expert_bank_upload*) never page-lock their source, so a slab
+ * that no decode upload had locked went through the driver's pageable staging
+ * at about half the link's rate, and the next layer's bank was late. Locked
+ * at allocation, the whole slab is one registration for the process's life:
+ * every record that later lands in it, at whatever shift, is inside it, so
+ * the registry never re-registers a range the drives or the copies are using.
+ * The cap (DSV4_CUDA_PIN_CAP_GB) still holds: past it a slab stays pageable,
+ * said once. Returns 1 when the slab is locked. */
+static unsigned long long g_v4_slab_pins, g_v4_slab_pin_refused;
+int coli_v4_gpu_slab_pin(const void *slab, size_t bytes) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("V4_SLAB_PIN"); on = e && *e && atoi(e) == 1; }
+    if (!on || !slab || !bytes || dsv4_cuda_lost()) return 0;
+    if (dsv4_cuda_host_pin(slab, (long long)bytes)) {
+        __atomic_add_fetch(&g_v4_slab_pins, 1, __ATOMIC_RELAXED);
+        return 1;
+    }
+    if (__atomic_add_fetch(&g_v4_slab_pin_refused, 1, __ATOMIC_RELAXED) == 1)
+        fprintf(stderr, "v4_gpu slab-pin: a slab was not page-locked after %llu were "
+                        "(DSV4_CUDA_PIN_CAP_GB, or the backend refused); later ones may "
+                        "stay pageable\n",
+                __atomic_load_n(&g_v4_slab_pins, __ATOMIC_RELAXED));
+    return 0;
 }
 
 void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,

@@ -1295,6 +1295,8 @@ typedef struct {
  * lands, in any order, and pieces_end closes the job (read_ok 0, or anything
  * short of the whole record landed, leaves the mirror empty). */
 void coli_v4_gpu_pieces_window(int on);
+/* V4_SLAB_PIN: page-lock a new RAM-cache slab whole before its first read */
+int coli_v4_gpu_slab_pin(const void *slab, size_t bytes);
 void *coli_v4_gpu_pieces_begin(ColiExpertStore *store, ColiExpertKey key,
                                const V4PieceLayout *layout, const void *slab,
                                size_t slab_bytes);
