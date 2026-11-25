@@ -564,7 +564,12 @@ thirds of what it is with the copies to the card under the read. The
 attention rises by a few milliseconds a token beside the lanes' copies and
 threads. With `--memory-gb 80` from a cold start: 13.38 s against 13.99 (+4.6 %; the first run without it took 43.9 s and stays in that median). The verifier
 (`V4_MIRROR_BLOCK_VERIFY=1`) read back 5,972 piece-filled mirrors, the
-read-ahead's among them, with no difference. The record is in
+read-ahead's among them, with no difference. Re-checked on dev b1f53353 after
+the rebase, with dev's other merged switches on (`V4_LAYER_FUSED`,
+`DSV4_CUDA_MOE_FUSED6`, `V4_IDX_FAST`) and two pieces in both arms, three
+alternated runs per arm: 9.25 s unset, 8.84 s with two lanes (+4.7 % tok/s),
+the same text, 72.9 % of the guesses right; the verifier read 5,832 mirrors
+back, no difference. The record is in
 `docs/experiments/v4-pred-next-2026-11-17/`.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels

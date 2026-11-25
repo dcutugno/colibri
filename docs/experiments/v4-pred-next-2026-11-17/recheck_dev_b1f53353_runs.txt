@@ -1,0 +1,22 @@
+Re-check on dev b1f53353 (2026-11-25) after the rebase onto the rebased V4_UPLOAD_PIECES branch: one binary,
+V4_UPLOAD_PIECES=2 in both arms, V4_PRED_NEXT unset (=0, ab*_n0) and =2 (ab*_n2), alternated three times.
+deepseek_v4 <model> --prompt-file prompt3k.txt (3,278 tokens) --max-tokens 36 --memory-gb 16 with COLI_CUDA=1
+COLI_GPU=0 CUDA_DENSE=1 COLI_CUDA_PIPE=2 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1
+V4_MOE_REFILL_GROUP=12 V4_LOADER_LANES=3 V4_PREFIX_CKPT=0 COLI_V4_SAVE_USAGE=0 DSV4_DECODE_PROF=1
+V4_BANK_MAKE_ROOM=1 V4_UPLOAD_THREAD=1 V4_MIRROR_BLOCK=1 V4_LAYER_FUSED=1 DSV4_CUDA_MOE_FUSED6=1 V4_IDX_FAST=1.
+Each line: the engine's timing line (after_first = the 35 tokens after the first) and the md5 of stdout
+without the 'TUNE decode' line.
+
+ab1_n0 exit=0 timing time_to_first_token=42.612s after_first=9.288s text=9b6266c1f1ef
+ab2_n2 exit=0 timing time_to_first_token=42.229s after_first=8.829s text=9b6266c1f1ef
+ab3_n2 exit=0 timing time_to_first_token=43.116s after_first=8.839s text=9b6266c1f1ef
+ab4_n0 exit=0 timing time_to_first_token=42.564s after_first=9.248s text=9b6266c1f1ef
+ab5_n0 exit=0 timing time_to_first_token=42.526s after_first=9.252s text=9b6266c1f1ef
+ab6_n2 exit=0 timing time_to_first_token=42.613s after_first=8.844s text=9b6266c1f1ef
+
+Verify run (V4_PRED_NEXT=2 V4_MIRROR_BLOCK_VERIFY=1: every mirror read back against its slab; the read-backs
+slow the run down):
+verify time_to_first_token=42.420s after_first=27.736s
+v4_pred: lanes=2 handed=1400 predicted=8820 mirrored=3277 queued=5543 dup=0 dropped=0 read=5543 failed=0 hit=72.9% of 8820
+v4_gpu pieces: reserved=5832 mirrored=5832 abandoned=0 copies=17513 verified=5832 mismatches=0
+v4_gpu mirror-block device=0 made=533 refills=6985 three-tensor=0 verified=1686 mismatches=0
