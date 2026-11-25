@@ -1,0 +1,48 @@
+The deployed stack (upstream dev of 2026-11-16 + the local prompt and decode pieces, serve.sh enabling all of
+them, --ram 80), built from an experiment branch that adds timing lines to the prompt bank's prefetch worker
+(V4_BANK_PROF=1: per layer, its wall time, the time it waited for the readers, the time it spent uploading,
+the readers' lookup time and how many lookups took over 2 ms, i.e. came from disk). The profilers of
+svc_prof.sh were on (DSV4_ATTN_PROF, V4_MOE_BATCH_PROF, DSV4_DECODE_PROF). Per turn: request seconds, the
+bank sums in seconds, switch = the prompt's wait for the next layer's bank (moebprof), moe/attn = blockprof
+sums, dec_moe = decode MoE seconds (decprof). One service each.
+
+-- no pin (the deployed engine of that day)
+turn 1 30.00s bank wall=18.02 wait=0.13 upload=15.19 lookup=11.35 slow=2.22 switch=5.12 moe=9.54 attn=7.47 dec_moe=9.06
+turn 2 22.54s bank wall=15.78 wait=0.28 upload=12.86 lookup=11.60 slow=2.19 switch=4.11 moe=8.43 attn=6.49 dec_moe=4.47
+turn 3 22.11s bank wall=15.27 wait=0.25 upload=12.26 lookup=11.45 slow=2.11 switch=3.52 moe=7.88 attn=6.48 dec_moe=4.37
+turn 4 21.40s bank wall=14.74 wait=0.36 upload=11.56 lookup=11.65 slow=2.19 switch=2.89 moe=7.23 attn=6.53 dec_moe=4.38
+turn 5 21.65s bank wall=14.67 wait=0.36 upload=11.44 lookup=11.74 slow=2.28 switch=2.82 moe=7.16 attn=6.51 dec_moe=4.69
+replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+
+-- V4_SLAB_PIN=1, first service
+turn 1 20.49s bank wall=13.03 wait=2.48 upload=7.87 lookup=16.49 slow=4.32 switch=0.84 moe=5.21 attn=7.04 dec_moe=4.33
+turn 2 18.55s bank wall=11.57 wait=0.97 upload=7.46 lookup=12.16 slow=2.73 switch=0.47 moe=4.88 attn=6.17 dec_moe=4.11
+turn 3 18.66s bank wall=11.47 wait=0.92 upload=7.46 lookup=11.84 slow=2.58 switch=0.50 moe=4.93 attn=6.17 dec_moe=4.14
+turn 4 18.68s bank wall=11.44 wait=0.87 upload=7.50 lookup=11.77 slow=2.55 switch=0.50 moe=4.92 attn=6.19 dec_moe=4.19
+turn 5 18.56s bank wall=11.53 wait=0.89 upload=7.45 lookup=11.82 slow=2.62 switch=0.46 moe=4.88 attn=6.15 dec_moe=4.22
+replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+
+-- V4_SLAB_PIN=1, second service
+turn 1 19.94s bank wall=11.88 wait=1.06 upload=7.55 lookup=12.60 slow=2.94 switch=0.33 moe=4.72 attn=6.95 dec_moe=4.31
+turn 2 18.53s bank wall=11.50 wait=0.87 upload=7.44 lookup=11.72 slow=2.54 switch=0.40 moe=4.86 attn=6.18 dec_moe=4.12
+turn 3 18.64s bank wall=11.56 wait=0.91 upload=7.41 lookup=11.80 slow=2.60 switch=0.53 moe=4.95 attn=6.16 dec_moe=4.10
+turn 4 18.67s bank wall=11.42 wait=0.79 upload=7.45 lookup=11.63 slow=2.48 switch=0.47 moe=4.89 attn=6.22 dec_moe=4.17
+turn 5 18.64s bank wall=11.44 wait=0.90 upload=7.43 lookup=11.81 slow=2.57 switch=0.49 moe=4.91 attn=6.17 dec_moe=4.24
+replies: 4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0
+
+A first attempt page-locked each record's span inside the bank upload instead (not part of this change).
+A record does not sit at the same offset of its slab every time, so the pin registry released
+registrations and registered larger ones while the cache was in use; that is the likely cause of what
+follows (not investigated further). Its first service changed the first reply; its second ended with the
+engine exiting during the second turn:
+-- per-record pin, first service
+turn 1 32.27s bank wall=22.69 wait=0.77 upload=19.92 lookup=15.18 slow=3.98 switch=0.87 moe=6.91 attn=11.98 dec_moe=5.98
+turn 2 18.89s bank wall=11.78 wait=1.16 upload=7.59 lookup=12.76 slow=2.94 switch=0.59 moe=5.02 attn=6.20 dec_moe=4.23
+turn 3 18.83s bank wall=11.63 wait=1.00 upload=7.49 lookup=12.10 slow=2.70 switch=0.56 moe=4.97 attn=6.17 dec_moe=4.21
+turn 4 18.73s bank wall=11.57 wait=0.88 upload=7.51 lookup=11.83 slow=2.56 switch=0.52 moe=4.94 attn=6.17 dec_moe=4.23
+turn 5 18.81s bank wall=11.57 wait=0.91 upload=7.48 lookup=11.78 slow=2.62 switch=0.47 moe=4.92 attn=6.18 dec_moe=4.34
+replies: f00fc315 4bde9ac6 7350cbc3 9b552609 ac7686b0
+-- per-record pin, second service
+turn 1 27.81s bank wall=19.01 wait=0.41 upload=16.19 lookup=11.85 slow=2.30 switch=0.80 moe=6.42 attn=10.01 dec_moe=0.00
+replies: error error error error error
+(turns 2-5 of that service returned engine errors)

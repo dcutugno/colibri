@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "hypothesis": "With COLI_CUDA_MOE_DOUBLE=1 the prompt bank's prefetch worker uploads the next layer's 256 experts from the RAM cache's slabs, and those uploads never page-lock their source: a slab no decode upload had locked goes through the driver's pageable staging at about half the link's rate, so the next layer's bank is late and the prompt waits at the layer switch. Page-locking every slab whole when the store allocates it, before its first read, makes every upload from it direct; one registration per slab for the process's life never has to be released or extended while the cache is in use. Only how the bytes travel changes, so the outputs are the same bits.",
+  "commit": "2b7e5c2c2eaeff74d39fbe40333baba199f9903b",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; coli serve --ram 80 --ctx 20000 with the environment in config; five requests per service (prompt3k.txt prefixed with 'Request N. ', max_tokens 36, temperature 0); a fresh service per sample set, the arms alternated three times; tok_s = the prompt's 3,282 tokens / (request seconds - the engine's decode seconds) for each of the five turns (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--ram 80: 133 expert slots per layer, 71.2 GiB of expert cache)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe striped in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB, PCIe 4.0 x16"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "V4_SLAB_PIN"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "80",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "V4_RAM_PROMPT_COLD": "1",
+      "V4_ROUTE_FORCED_ONLY": "1",
+      "V4_UPLOAD_PIECES": "2",
+      "V4_SERVE_STATS_LOG": "1",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "coli serve --model <model> --ram 80 --ctx 20000",
+      "V4_SLAB_PIN": "0"
+    },
+    "samples": {
+      "tok_s": [
+        81.8,
+        69.72,
+        69.88,
+        69.69,
+        70.32,
+        81.95,
+        69.74,
+        69.75,
+        70.12,
+        70.24,
+        81.02,
+        68.99,
+        69.22,
+        69.44,
+        69.71
+      ]
+    },
+    "median_tok_s": 69.75,
+    "quality": {
+      "method": "the five replies' md5 identical across the arm's services and identical to the trial's",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-slab-pin-2026-11-25/dev_service_turns.txt",
+      "sha256": "9b198a3c332a6ff61da8c55d951398618bf5bd99eea06ed3f5818454e80b712a"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "DSV4_CUDA_PIN_CAP_GB": "80",
+      "V4_LAYER_FUSED": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_IDX_FAST": "1",
+      "V4_RAM_PROMPT_COLD": "1",
+      "V4_ROUTE_FORCED_ONLY": "1",
+      "V4_UPLOAD_PIECES": "2",
+      "V4_SERVE_STATS_LOG": "1",
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native, one binary for both arms",
+      "args": "coli serve --model <model> --ram 80 --ctx 20000",
+      "V4_SLAB_PIN": "1"
+    },
+    "samples": {
+      "tok_s": [
+        88.1,
+        72.23,
+        72.06,
+        71.74,
+        71.63,
+        89.2,
+        72.95,
+        71.69,
+        72.38,
+        72.53,
+        89.05,
+        72.69,
+        72.52,
+        72.39,
+        72.39
+      ]
+    },
+    "median_tok_s": 72.39,
+    "quality": {
+      "method": "the five replies' md5 identical across the arm's services and identical to the baseline's; no verify mode: the change decides whether a slab is page-locked, never what is read, uploaded or computed",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-slab-pin-2026-11-25/dev_service_turns.txt",
+      "sha256": "9b198a3c332a6ff61da8c55d951398618bf5bd99eea06ed3f5818454e80b712a"
+    }
+  },
+  "outcome": "improvement"
+}

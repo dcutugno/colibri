@@ -1,0 +1,57 @@
+Upstream dev b1f53353 + V4_UPLOAD_PIECES (JustVugg/colibri#3078, which this needs) + this change, one binary;
+V4_SLAB_PIN=0 (pin0_*) and =1 (pin1_*). The switches serve.sh sets that this build reads: COLI_CUDA=1
+COLI_GPU=0 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1 V4_MOE_REFILL_GROUP=12
+V4_LOADER_LANES=3 DSV4_CUDA_PIN_CAP_GB=80 V4_LAYER_FUSED=1 V4_MIRROR_BLOCK=1 V4_BANK_MAKE_ROOM=1
+V4_UPLOAD_THREAD=1 DSV4_CUDA_MOE_FUSED6=1 V4_IDX_FAST=1 V4_RAM_PROMPT_COLD=1 V4_ROUTE_FORCED_ONLY=1
+V4_UPLOAD_PIECES=2 (the others it sets belong to changes not in dev and are not read).
+
+Five 3.3k-token turns per service: `coli serve --ram 80 --ctx 20000` (the deployment's serve.sh: the page-lock
+cap DSV4_CUDA_PIN_CAP_GB follows --ram), prompt3k.txt prefixed with "Request N. ", max_tokens 36, temperature 0,
+a fresh service per line, the arms alternated (off on off on off on). Each service line: the five requests'
+wall times in seconds (curl time_total), the engine's decode seconds and RAM-cache hit rate per turn
+(v4_serve_turn, V4_SERVE_STATS_LOG=1) and the md5 of each reply's content. Below, each service's v4_serve_turn
+lines as the engine printed them.
+
+pin0_18722: 48.322653 51.956562 51.887906 51.923510 51.731017 decode_s: 8.20 4.88 4.92 4.83 5.06  hit: 69.1 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+pin1_17545: 42.501194 50.196155 50.333902 50.537240 50.629617 decode_s: 5.25 4.76 4.79 4.79 4.81  hit: 69.1 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+pin0_30527: 48.438202 51.952287 51.992048 51.637813 51.782220 decode_s: 8.39 4.89 4.94 4.83 5.06  hit: 69.1 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+pin1_4963: 42.062698 49.761206 50.572375 50.121417 50.059696 decode_s: 5.27 4.77 4.79 4.78 4.81  hit: 69.0 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+pin0_13688: 48.836083 52.470337 52.367030 52.032051 52.108343 decode_s: 8.33 4.90 4.95 4.77 5.03  hit: 69.0 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+pin1_19188: 42.106267 49.819538 50.048291 50.128759 50.167356 decode_s: 5.25 4.67 4.79 4.79 4.83  hit: 69.1 72.3 72.3 72.4 71.5  replies=4bde9ac6 4bde9ac6 7350cbc3 9b552609 ac7686b0 
+
+== pin0_18722
+v4_serve_turn prompt=3282 completion=36 decode_s=8.20 tok_s=4.390 hit=69.1% expert_disk_s=13.91 expert_wait_s=2.69 expert_matmul_s=0.00 attention_s=45.20 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.88 tok_s=7.376 hit=72.3% expert_disk_s=10.82 expert_wait_s=0.58 expert_matmul_s=0.00 attention_s=51.10 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.92 tok_s=7.112 hit=72.3% expert_disk_s=10.37 expert_wait_s=0.57 expert_matmul_s=0.00 attention_s=51.05 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.83 tok_s=7.240 hit=72.4% expert_disk_s=10.36 expert_wait_s=0.54 expert_matmul_s=0.00 attention_s=51.11 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=5.06 tok_s=7.117 hit=71.5% expert_disk_s=10.93 expert_wait_s=0.86 expert_matmul_s=0.00 attention_s=50.62 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44064
+== pin1_17545
+v4_serve_turn prompt=3282 completion=36 decode_s=5.25 tok_s=6.860 hit=69.1% expert_disk_s=12.15 expert_wait_s=1.51 expert_matmul_s=0.00 attention_s=40.55 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.76 tok_s=7.563 hit=72.3% expert_disk_s=10.35 expert_wait_s=0.51 expert_matmul_s=0.00 attention_s=49.41 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.79 tok_s=7.311 hit=72.3% expert_disk_s=10.20 expert_wait_s=0.51 expert_matmul_s=0.00 attention_s=49.56 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.79 tok_s=7.312 hit=72.4% expert_disk_s=10.19 expert_wait_s=0.51 expert_matmul_s=0.00 attention_s=49.76 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=4.81 tok_s=7.482 hit=71.5% expert_disk_s=10.57 expert_wait_s=0.75 expert_matmul_s=0.00 attention_s=49.63 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44070
+== pin0_30527
+v4_serve_turn prompt=3282 completion=36 decode_s=8.39 tok_s=4.289 hit=69.1% expert_disk_s=13.76 expert_wait_s=2.88 expert_matmul_s=0.00 attention_s=45.14 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.89 tok_s=7.369 hit=72.3% expert_disk_s=10.52 expert_wait_s=0.57 expert_matmul_s=0.00 attention_s=51.11 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.94 tok_s=7.088 hit=72.3% expert_disk_s=10.41 expert_wait_s=0.58 expert_matmul_s=0.00 attention_s=51.14 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.83 tok_s=7.251 hit=72.4% expert_disk_s=10.38 expert_wait_s=0.52 expert_matmul_s=0.00 attention_s=50.85 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=5.06 tok_s=7.109 hit=71.5% expert_disk_s=10.85 expert_wait_s=0.87 expert_matmul_s=0.00 attention_s=50.66 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44064
+== pin1_4963
+v4_serve_turn prompt=3282 completion=36 decode_s=5.27 tok_s=6.836 hit=69.0% expert_disk_s=11.79 expert_wait_s=1.53 expert_matmul_s=0.00 attention_s=40.10 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.77 tok_s=7.545 hit=72.3% expert_disk_s=10.24 expert_wait_s=0.52 expert_matmul_s=0.00 attention_s=48.97 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.79 tok_s=7.300 hit=72.3% expert_disk_s=10.20 expert_wait_s=0.52 expert_matmul_s=0.00 attention_s=49.79 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.78 tok_s=7.319 hit=72.4% expert_disk_s=10.23 expert_wait_s=0.51 expert_matmul_s=0.00 attention_s=49.34 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=4.81 tok_s=7.477 hit=71.5% expert_disk_s=10.56 expert_wait_s=0.75 expert_matmul_s=0.00 attention_s=49.06 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44070
+== pin0_13688
+v4_serve_turn prompt=3282 completion=36 decode_s=8.33 tok_s=4.322 hit=69.0% expert_disk_s=13.64 expert_wait_s=2.82 expert_matmul_s=0.00 attention_s=45.60 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.90 tok_s=7.341 hit=72.3% expert_disk_s=10.44 expert_wait_s=0.57 expert_matmul_s=0.00 attention_s=51.63 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.95 tok_s=7.073 hit=72.3% expert_disk_s=10.47 expert_wait_s=0.58 expert_matmul_s=0.00 attention_s=51.51 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.77 tok_s=7.343 hit=72.4% expert_disk_s=10.95 expert_wait_s=0.45 expert_matmul_s=0.00 attention_s=51.31 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=5.03 tok_s=7.163 hit=71.5% expert_disk_s=10.53 expert_wait_s=0.79 expert_matmul_s=0.00 attention_s=51.07 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44064
+== pin1_19188
+v4_serve_turn prompt=3282 completion=36 decode_s=5.25 tok_s=6.859 hit=69.1% expert_disk_s=11.47 expert_wait_s=1.50 expert_matmul_s=0.00 attention_s=40.18 rss_gb=79.8 vram_first_hits_total=0 store_fetches_total=8772
+v4_serve_turn prompt=3282 completion=36 decode_s=4.67 tok_s=7.708 hit=72.3% expert_disk_s=9.92 expert_wait_s=0.42 expert_matmul_s=0.00 attention_s=49.14 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=17586
+v4_serve_turn prompt=3282 completion=35 decode_s=4.79 tok_s=7.303 hit=72.3% expert_disk_s=10.06 expert_wait_s=0.50 expert_matmul_s=0.00 attention_s=49.28 rss_gb=79.9 vram_first_hits_total=0 store_fetches_total=26412
+v4_serve_turn prompt=3282 completion=35 decode_s=4.79 tok_s=7.313 hit=72.4% expert_disk_s=10.20 expert_wait_s=0.50 expert_matmul_s=0.00 attention_s=49.35 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=35250
+v4_serve_turn prompt=3282 completion=36 decode_s=4.83 tok_s=7.460 hit=71.5% expert_disk_s=10.55 expert_wait_s=0.75 expert_matmul_s=0.00 attention_s=49.16 rss_gb=80.0 vram_first_hits_total=0 store_fetches_total=44070

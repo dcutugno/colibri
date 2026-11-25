@@ -512,6 +512,56 @@ runs per arm: 9.37 s unset, 9.23 s with two pieces (+1.6 % tok/s), the same
 text; the verifier read 4,066 piece-filled mirrors back, no difference. The
 record is in `docs/experiments/v4-upload-pieces-2026-11-16/`.
 
+### RAM-cache slabs page-locked when they are allocated (`V4_SLAB_PIN`, opt-in)
+
+With `COLI_CUDA_MOE_DOUBLE=1` the prompt bank's prefetch worker uploads the
+next layer's 256 experts from the RAM cache's slabs while the current layer
+computes. Those uploads never page-lock their source; only decode's uploads
+do. So a slab that no decode upload had locked went through the driver's
+pageable staging. Timed on the RTX 5080 server, the worker spent 11.4 s of a
+warm 3.3k-token turn uploading, about 12 GB/s. It hardly ever waited for its
+readers (0.4 s), and the prompt waited 2.8 s per turn for the next layer's
+bank.
+
+With `V4_SLAB_PIN=1` the hot store page-locks each slab whole right after it
+allocates it, outside the store's mutex and before the first read lands in
+it; the slot's lease keeps the slab the reader's until then. One registration
+per slab lasts the process's life, and every record later read into the
+slab, at whatever offset, lies inside it. The pin registry therefore never
+has to release a registration or register a larger one while the cache is in
+use. A first attempt page-locked each record's span inside the bank upload,
+and it did have to: one service changed its first reply, another ended with
+the engine exiting. The cap `DSV4_CUDA_PIN_CAP_GB` (20 by default) still
+applies, so set it to at least `--ram` for every slab to be locked; the first
+slab past it is reported once. It needs the backend's `dsv4_cuda_host_pin`
+export and the locked pin registry (`V4_UPLOAD_PIECES`'s change). Only how
+the bytes travel changes: the replies are the same.
+
+Measured on the RTX 5080 server (`coli serve --ram 80 --ctx 20000` with the
+cap at 80, five 3,282-token turns per service, `max_tokens` 36, three
+services per arm alternating, medians; the replies are the same in all six
+services). On upstream dev with `V4_UPLOAD_PIECES` and the switches the
+deployment's serve.sh sets that dev reads:
+
+| turn | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| request (s), unset | 48.44 | 51.96 | 51.99 | 51.92 | 51.78 |
+| request (s), `V4_SLAB_PIN=1` | 42.11 | 49.82 | 50.33 | 50.13 | 50.17 |
+| decode (s), unset | 8.33 | 4.89 | 4.94 | 4.83 | 5.06 |
+| decode (s), `=1` | 5.25 | 4.76 | 4.79 | 4.79 | 4.81 |
+
+Prompt throughput (3,282 tokens over the request less its decode, all five
+turns): 69.75 -> 72.39 tokens per second (+3.8 %). The first turn gains the
+most: its decode no longer locks pages as it goes. With the local
+deployment's faster prompt path in front (same box, same service, one
+service each, with timing lines on), the worker's uploads fall from 11.4 to
+7.5 s per warm turn and the switch wait from 2.8 to 0.5 s. Its turns go from
+30.0 22.5 22.1 21.4 21.7 s to 20.5 18.6 18.7 18.7 18.6 s (a second service:
+19.9 18.5 18.6 18.7 18.6).
+
+Not measured: Windows, HIP, a cap below the cache. The record is in
+`docs/experiments/v4-slab-pin-2026-11-25/`.
+
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
@@ -1268,6 +1318,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
 | `V4_RAM_PROMPT_COLD` (0) | `1` = while a prompt is read, the expert bank's reads go to the oldest end of the RAM cache's recency list, so the sweep over every expert keeps what RAM held and decode finds its experts (see [A prompt's expert reads at the cold end of the RAM cache](#a-prompts-expert-reads-at-the-cold-end-of-the-ram-cache-v4_ram_prompt_cold-opt-in)) |
 | `V4_ROUTE_FORCED_ONLY` (0) | `1` = a hash layer's router computes only the forced experts' gate dot products (same bits); `2` = also the full set, compared (`routeforced verify` lines) (see [A hash layer's router computes only its experts' gate scores](#a-hash-layers-router-computes-only-its-experts-gate-scores-v4_route_forced_only-opt-in)) |
+| `V4_SLAB_PIN` (0) | `1` = each RAM-cache slab is page-locked whole when the store allocates it, before its first read, so the prompt bank's uploads from it are direct; within `DSV4_CUDA_PIN_CAP_GB` (see [RAM-cache slabs page-locked when they are allocated](#ram-cache-slabs-page-locked-when-they-are-allocated-v4_slab_pin-opt-in)) |
 | `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
